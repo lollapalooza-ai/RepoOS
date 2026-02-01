@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import builtins
@@ -18,6 +19,25 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
 # Cache builtins for filtering
 PYTHON_BUILTINS = set(dir(builtins))
+
+# --- NEW INFRASTRUCTURE PATTERNS ---
+SQL_PATTERN = re.compile(r"(SELECT|INSERT|UPDATE|DELETE)\s+.*?\s+FROM\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
+
+INFRA_KEYWORDS = {
+    "boto3.client": "AWS",
+    "KafkaProducer": "Kafka",
+    "redis.Redis": "Redis",
+    "psycopg2": "Postgres",
+    "pymongo": "MongoDB",
+    "requests.get": "HTTP_API",
+    "requests.post": "HTTP_API",
+    "requests.put": "HTTP_API",
+    "requests.delete": "HTTP_API",
+    "httpx.get": "HTTP_API",
+    "httpx.post": "HTTP_API",
+    "httpx.put": "HTTP_API",
+    "httpx.delete": "HTTP_API"
+}
 
 # --- QUERIES ---
 # Find top-level function definitions (global functions)
@@ -122,6 +142,35 @@ def create_dependency(caller_name, callee_name):
     with driver.session() as session:
         session.run(query, caller=caller_name, callee=callee_name)
 
+def create_infra_node(func_or_method_name, infra_type, infra_name):
+    """
+    (:Function)-[:TOUCHES]->(:Infrastructure)
+    """
+    query = """
+    MATCH (f:Function {name: $func_or_method_name})
+    MERGE (i:Infrastructure {name: $infra_name, type: $infra_type})
+    MERGE (f)-[:TOUCHES]->(i)
+    """
+    with driver.session() as session:
+        session.run(query, func_or_method_name=func_or_method_name, infra_name=infra_name, infra_type=infra_type)
+        print(f"   ⚡ Found Infra: {func_or_method_name} -> {infra_type} ({infra_name})")
+
+def analyze_infra_usage(func_or_method_name, code_snippet):
+    """
+    Scans code body for Infrastructure signals (SQL, AWS, Kafka, Redis, etc.).
+    """
+    # Check for SQL
+    for match in SQL_PATTERN.finditer(code_snippet):
+        table_name = match.group(2)
+        if table_name:
+            create_infra_node(func_or_method_name, "Database", table_name)
+
+    # Check for Libs/APIs
+    for keyword, infra_type in INFRA_KEYWORDS.items():
+        if keyword in code_snippet:
+            # For now, use the keyword itself as the 'name' for simplicity
+            create_infra_node(func_or_method_name, infra_type, keyword)
+
 def process_file(file_path):
     """Parses a single file and pushes it to the Graph."""
     print(f"📄 Scanning: {file_path}")
@@ -155,6 +204,9 @@ def process_file(file_path):
 
             # Find inherited classes
             class_def_node = node.parent
+            # Need to get the full source code for this class definition node to scan for infra
+            class_def_source = source_code[class_def_node.start_byte:class_def_node.end_byte]
+
             base_class_captures = CLASS_DEF_QUERY.captures(class_def_node)
 
             if isinstance(base_class_captures, dict):
@@ -189,8 +241,11 @@ def process_file(file_path):
                     create_has_method_relationship(class_name, full_method_name)
                     print(f"      - Method: {full_method_name}")
 
-                    # Look for calls inside this method
+                    # Get the source code for the method definition for infra analysis
                     method_def_node = method_node.parent
+                    method_source_code = source_code[method_def_node.start_byte:method_def_node.end_byte]
+                    analyze_infra_usage(full_method_name, method_source_code) # Analyze infra usage for methods
+                    
                     call_captures = CALL_QUERY.captures(method_def_node)
                     
                     if isinstance(call_captures, dict):
@@ -225,8 +280,11 @@ def process_file(file_path):
             write_function_node(func_name, file_path, node_type='function')
             print(f"   ➕ Function: {func_name}")
             
-            # Look for dependencies inside this function
             func_def_node = node.parent
+            func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
+            analyze_infra_usage(func_name, func_source_code) # Analyze infra usage for global functions
+
+            # Look for dependencies inside this function
             call_captures = CALL_QUERY.captures(func_def_node)
             
             if isinstance(call_captures, dict):
