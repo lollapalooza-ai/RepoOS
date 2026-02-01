@@ -2,11 +2,12 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Debug ingest.py",
+            "name": "Python: Debug ingest2.py",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/ingest.py",
-            "console": "integratedTerminal"
+            "program": "${workspaceFolder}/ingest2.py",
+            "console": "integratedTerminal",
+            "args": ["--arg1", "testRepo"]
         }
     ]
 }
