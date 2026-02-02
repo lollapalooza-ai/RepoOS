@@ -20,23 +20,37 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 # Cache builtins for filtering
 PYTHON_BUILTINS = set(dir(builtins))
 
-# --- NEW INFRASTRUCTURE PATTERNS ---
-SQL_PATTERN = re.compile(r"(SELECT|INSERT|UPDATE|DELETE)\s+.*?\s+FROM\s+([a-zA-Z0-9_]+)", re.IGNORECASE)
-
-INFRA_KEYWORDS = {
-    "boto3.client": "AWS",
-    "KafkaProducer": "Kafka",
-    "redis.Redis": "Redis",
-    "psycopg2": "Postgres",
-    "pymongo": "MongoDB",
-    "requests.get": "HTTP_API",
-    "requests.post": "HTTP_API",
-    "requests.put": "HTTP_API",
-    "requests.delete": "HTTP_API",
-    "httpx.get": "HTTP_API",
-    "httpx.post": "HTTP_API",
-    "httpx.put": "HTTP_API",
-    "httpx.delete": "HTTP_API"
+# --- NEW INFRASTRUCTURE PATTERNS (v3) ---
+# This dictionary holds regex patterns to detect various infrastructure interactions.
+# Each pattern uses named capture groups to extract specific details.
+INFRASTRUCTURE_PATTERNS = {
+    'SQL_QUERY': re.compile(
+        r"(?P<operation>SELECT|UPDATE|DELETE)\s+.*\s+FROM\s+(?P<table>[a-zA-Z0-9_]+)",
+        re.IGNORECASE
+    ),
+    'SQL_INSERT': re.compile(
+        r"(?P<operation>INSERT)\s+INTO\s+(?P<table>[a-zA-Z0-9_]+)",
+        re.IGNORECASE
+    ),
+    'API_REQUESTS': re.compile(
+        r"requests\.(?P<method>get|post|put|delete)\(\s*f?[\"'](?P<endpoint>[^\"']+)[\"']",
+        re.IGNORECASE
+    ),
+    'API_HTTPX': re.compile(
+        r"httpx\.(?P<method>get|post|put|delete)\(\s*f?[\"'](?P<endpoint>[^\"']+)[\"']",
+        re.IGNORECASE
+    ),
+    'BOTO3': re.compile(
+        r"boto3\.(?:client|resource)\(\s*[\"'](?P<service>[a-zA-Z0-9_-]+)[\"']",
+        re.IGNORECASE
+    ),
+    'KAFKA': re.compile(
+        r"\.(?P<operation>send|poll)\(\s*[\"'](?P<topic>[a-zA-Z0-9_-]+)[\"']",
+        re.IGNORECASE
+    ),
+    # A simple keyword-based detection for other infra types
+    'REDIS': re.compile(r"redis\.Redis"),
+    'MONGO': re.compile(r"pymongo\.MongoClient"),
 }
 
 # --- QUERIES ---
@@ -142,34 +156,135 @@ def create_dependency(caller_name, callee_name):
     with driver.session() as session:
         session.run(query, caller=caller_name, callee=callee_name)
 
-def create_infra_node(func_or_method_name, infra_type, infra_name):
+def create_sql_touch_relationship(func_name, operation, table):
     """
-    (:Function)-[:TOUCHES]->(:Infrastructure)
+    (:Function)-[:TOUCHES {operation, table}]->(:Infrastructure {type: 'SQL'})
     """
     query = """
-    MATCH (f:Function {name: $func_or_method_name})
-    MERGE (i:Infrastructure {name: $infra_name, type: $infra_type})
+    MATCH (f:Function {name: $func_name})
+    MERGE (i:Infrastructure {type: 'SQL'})
+    MERGE (f)-[r:TOUCHES]->(i)
+    ON CREATE SET r.operation = $operation, r.table = $table
+    ON MATCH SET r.operation = $operation, r.table = $table
+    """
+    with driver.session() as session:
+        session.run(query, func_name=func_name, operation=operation, table=table)
+        print(f"   ⚡ Found SQL: {func_name} -> {operation} on {table}")
+
+def create_api_call_relationship(func_name, method, endpoint):
+    """
+    (:Function)-[:CALLS_API {method, endpoint}]->(:Infrastructure {type: 'ExternalAPI'})
+    """
+    query = """
+    MATCH (f:Function {name: $func_name})
+    MERGE (i:Infrastructure {type: 'ExternalAPI'})
+    MERGE (f)-[r:CALLS_API]->(i)
+    ON CREATE SET r.method = $method, r.endpoint = $endpoint
+    ON MATCH SET r.method = $method, r.endpoint = $endpoint
+    """
+    with driver.session() as session:
+        session.run(query, func_name=func_name, method=method, endpoint=endpoint)
+        print(f"   ⚡ Found API Call: {func_name} -> {method} {endpoint}")
+
+def create_aws_touch_relationship(func_name, service):
+    """
+    (:Function)-[:TOUCHES {service}]->(:Infrastructure {type: 'AWS'})
+    """
+    query = """
+    MATCH (f:Function {name: $func_name})
+    MERGE (i:Infrastructure {type: 'AWS'})
+    MERGE (f)-[r:TOUCHES]->(i)
+    ON CREATE SET r.service = $service
+    ON MATCH SET r.service = $service
+    """
+    with driver.session() as session:
+        session.run(query, func_name=func_name, service=service)
+        print(f"   ⚡ Found AWS: {func_name} -> service: {service}")
+
+def create_kafka_touch_relationship(func_name, operation, topic):
+    """
+    (:Function)-[:TOUCHES {operation, topic}]->(:Infrastructure {type: 'Kafka'})
+    """
+    query = """
+    MATCH (f:Function {name: $func_name})
+    MERGE (i:Infrastructure {type: 'Kafka'})
+    MERGE (f)-[r:TOUCHES]->(i)
+    ON CREATE SET r.operation = $operation, r.topic = $topic
+    ON MATCH SET r.operation = $operation, r.topic = $topic
+    """
+    with driver.session() as session:
+        session.run(query, func_name=func_name, operation=operation, topic=topic)
+        print(f"   ⚡ Found Kafka: {func_name} -> {operation} on topic: {topic}")
+
+def create_other_infra_relationship(func_name, infra_type):
+    """
+    Creates a generic relationship for other infra types like Boto3, Kafka, etc.
+    (:Function)-[:TOUCHES]->(:Infrastructure {type: 'AWS'})
+    """
+    query = """
+    MATCH (f:Function {name: $func_name})
+    MERGE (i:Infrastructure {type: $infra_type})
     MERGE (f)-[:TOUCHES]->(i)
     """
     with driver.session() as session:
-        session.run(query, func_or_method_name=func_or_method_name, infra_name=infra_name, infra_type=infra_type)
-        print(f"   ⚡ Found Infra: {func_or_method_name} -> {infra_type} ({infra_name})")
+        session.run(query, func_name=func_name, infra_type=infra_type)
+        print(f"   ⚡ Found Infra: {func_name} -> {infra_type}")
 
 def analyze_infra_usage(func_or_method_name, code_snippet):
     """
-    Scans code body for Infrastructure signals (SQL, AWS, Kafka, Redis, etc.).
+    Scans code body for Infrastructure signals using the new patterns.
     """
-    # Check for SQL
-    for match in SQL_PATTERN.finditer(code_snippet):
-        table_name = match.group(2)
-        if table_name:
-            create_infra_node(func_or_method_name, "Database", table_name)
+    # SQL Detection
+    for pattern_name in ['SQL_QUERY', 'SQL_INSERT']:
+        for match in INFRASTRUCTURE_PATTERNS[pattern_name].finditer(code_snippet):
+            details = match.groupdict()
+            create_sql_touch_relationship(
+                func_or_method_name,
+                details.get('operation', 'UNKNOWN').upper(),
+                details.get('table', 'UNKNOWN')
+            )
 
-    # Check for Libs/APIs
-    for keyword, infra_type in INFRA_KEYWORDS.items():
-        if keyword in code_snippet:
-            # For now, use the keyword itself as the 'name' for simplicity
-            create_infra_node(func_or_method_name, infra_type, keyword)
+    # API Detection (Requests)
+    for match in INFRASTRUCTURE_PATTERNS['API_REQUESTS'].finditer(code_snippet):
+        details = match.groupdict()
+        create_api_call_relationship(
+            func_or_method_name,
+            details.get('method', 'UNKNOWN').upper(),
+            details.get('endpoint', 'UNKNOWN')
+        )
+
+    # API Detection (HTTPX)
+    for match in INFRASTRUCTURE_PATTERNS['API_HTTPX'].finditer(code_snippet):
+        details = match.groupdict()
+        create_api_call_relationship(
+            func_or_method_name,
+            details.get('method', 'UNKNOWN').upper(),
+            details.get('endpoint', 'UNKNOWN')
+        )
+
+    # AWS Boto3 Detection
+    for match in INFRASTRUCTURE_PATTERNS['BOTO3'].finditer(code_snippet):
+        details = match.groupdict()
+        create_aws_touch_relationship(
+            func_or_method_name,
+            details.get('service', 'UNKNOWN')
+        )
+
+    # Kafka Detection
+    for match in INFRASTRUCTURE_PATTERNS['KAFKA'].finditer(code_snippet):
+        details = match.groupdict()
+        create_kafka_touch_relationship(
+            func_or_method_name,
+            details.get('operation', 'UNKNOWN'),
+            details.get('topic', 'UNKNOWN')
+        )
+    
+    # Other keyword-based infrastructure
+    other_infra = ['REDIS', 'MONGO']
+    for infra_key in other_infra:
+        if INFRASTRUCTURE_PATTERNS[infra_key].search(code_snippet):
+            # We use the key as the type, e.g., 'REDIS' becomes type 'REDIS'
+            create_other_infra_relationship(func_or_method_name, infra_key)
 
 def process_file(file_path):
     """Parses a single file and pushes it to the Graph."""

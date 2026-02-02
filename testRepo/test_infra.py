@@ -32,3 +32,10 @@ class InfraManager:
 
     def upload_file(self, bucket, key, data):
         self.client.put_object(Bucket=bucket, Key=key, Body=data)
+
+def publish_kafka_event(event_data):
+    # Simulating a Kafka producer sending an event
+    producer = KafkaProducer(bootstrap_servers='localhost:9092')
+    producer.send('user-events', value=event_data)
+    producer.flush()
+    return "Event published"
