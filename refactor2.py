@@ -1,188 +1,162 @@
 import os
 import sys
+import json
 import ollama
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 
 # --- CONFIGURATION ---
-# The "Brain" constraints
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
-# Your Mac's specialized coder
-MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M" 
+MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
 
-# --- INITIALIZATION ---
-try:
-    # Setup the "Right Brain" (Parser)
-    PY_LANGUAGE = Language(tspython.language())
-    parser = Parser(PY_LANGUAGE)
+driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+PY_LANGUAGE = Language(tspython.language())
+parser = Parser(PY_LANGUAGE)
+
+def get_blast_radius(target_name):
+    """
+    Fetches the 'Center' node and everything connected to it using a more
+    sophisticated graph traversal query.
+    """
+    print(f"📡 Calculating Blast Radius for '{target_name}'...")
+
+    # This query is more sophisticated. It finds:
+    # 1. The target itself.
+    # 2. Upstream callers.
+    # 3. The parent class of the target method.
+    # 4. All subclasses of the parent class (to find overriding methods).
+    # 5. Downstream callees for context.
+    query = """
+    MATCH (target {name: $name})
+
+    // Find direct callers of the target
+    OPTIONAL MATCH (caller)-[:CALLS]->(target)
+
+    // Find the parent class and any subclasses
+    OPTIONAL MATCH (parent_class)-[:HAS_METHOD]->(target)
+    OPTIONAL MATCH (subclass)-[:IMPLEMENTS*]->(parent_class)
+
+    // Find downstream dependencies for context
+    OPTIONAL MATCH (target)-[:CALLS]->(downstream)
+
+    // Collect all unique nodes that have a file path
+    WITH collect(DISTINCT target) + collect(DISTINCT caller) + collect(DISTINCT subclass) + collect(DISTINCT downstream) as nodes
+    UNWIND nodes as n
+    WITH n WHERE n.file IS NOT NULL
+    RETURN n.file as file_path, collect(DISTINCT n.name) as relevant_items
+    """
     
-    # Setup the "Left Brain" (Graph DB)
-    driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-except Exception as e:
-    print(f"❌ Initialization Failed: {e}")
-    sys.exit(1)
+    context_map = {}
+    with driver.session() as session:
+        result = session.run(query, name=target_name)
+        for record in result:
+            file_path = record["file_path"]
+            items = record["relevant_items"]
+            if file_path not in context_map:
+                context_map[file_path] = []
+            for item in items:
+                if item not in context_map[file_path]:
+                    context_map[file_path].append(item)
+        
+    if not context_map:
+        return None, "Target not found or has no file associations in Graph."
+        
+    return context_map, None
 
-# --- CORE LOGIC ---
-
-def fetch_function_source(file_path, func_name):
-    """
-    Reads the file from disk and finds the function FRESH.
-    This solves the 'Index Drift' problem where line numbers in DB might be stale.
-    """
-    if not os.path.exists(file_path):
-        return None, f"File not found: {file_path}"
-
+def fetch_file_content(file_path):
+    """Reads full file content."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            code = f.read()
-    except UnicodeDecodeError:
-        return None, f"Could not decode file: {file_path}"
+            return f.read()
+    except FileNotFoundError:
+        return None
 
-    # Fast Re-parse (On M4, this takes milliseconds)
-    tree = parser.parse(bytes(code, "utf8"))
-    
-    # Tree-Sitter Query to find the specific function definition
-    # This searches the structure, not just string matching
-    query = PY_LANGUAGE.query(f"""
-    (function_definition
-      name: (identifier) @name
-      (#eq? @name "{func_name}")
-    ) @def
-    """)
-    
-    captures = query.captures(tree.root_node)
-    
-    # FIX: Handle API difference between tree-sitter versions
-    if isinstance(captures, dict):
-        flat_captures = []
-        for name, nodes in captures.items():
-            for node in nodes:
-                flat_captures.append((node, name))
-        captures = flat_captures
-    
-    for node, name in captures:
-        if name == 'def':
-            # We found the function node! Return the text.
-            return code[node.start_byte:node.end_byte], None
-        
-    return None, f"Function '{func_name}' not found in {file_path} (Has it been renamed?)"
-
-def get_context_from_graph(target_func_name):
+def apply_updates(file_updates):
     """
-    1. Ask Neo4j for the File Path and Dependency Names.
-    2. Read the actual code from Disk.
+    Writes changes to disk. 
+    REAL WORLD: This should create a Git Branch or a .patch file.
+    MVP: Overwrites files (Dangerous but effective).
     """
-    print(f"🔍 Querying Graph for '{target_func_name}' metadata...")
-    
-    # Cypher: Only get metadata (file path), not the body
-    query = """
-    MATCH (t:Function {name: $name})
-    OPTIONAL MATCH (t)-[:CALLS]->(d:Function)
-    RETURN 
-        t.file as file_path, 
-        collect({name: d.name, file: d.file}) as dependencies
-    """
-    
-    with driver.session() as session:
-        result = session.run(query, name=target_func_name).single()
-        
-    if not result:
-        return None, "Function not found in Graph index."
+    print("\n💾 Applying Changes to Disk...")
+    for file_path, new_content in file_updates.items():
+        print(f"   Writing: {file_path}")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
 
-    target_path = result["file_path"]
-    dependencies = result["dependencies"]
-
-    if not target_path:
-        return None, "Graph node exists but has no file path (Corrupted ingestion?)."
-
-    # --- HYBRID FETCH ---
-    print(f"📂 Reading '{target_func_name}' from disk: {target_path}...")
-    
-    # 1. Get Target Code (Fresh from disk)
-    target_code, error = fetch_function_source(target_path, target_func_name)
+def orchestrate_refactor(target_name, instruction):
+    # 1. Get the Blast Radius
+    files_to_context, error = get_blast_radius(target_name)
     if error:
-        return None, error
-
-    # 2. Get Dependency Signatures (Fresh from disk)
-    # This prevents hallucinating APIs if they changed recently
-    dep_context_str = ""
-    if dependencies:
-        print(f"🔗 Resolving {len(dependencies)} dependencies...")
-        dep_context_str = "\n\nDependencies (Available APIs):\n"
-        for dep in dependencies:
-            d_name = dep.get('name')
-            d_file = dep.get('file')
-            
-            if d_name and d_file:
-                d_code, _ = fetch_function_source(d_file, d_name)
-                if d_code:
-                    # OPTIMIZATION: Just grab the first line (def name(...):)
-                    # This saves context window tokens while giving the LLM the signature.
-                    signature = d_code.split('\n')[0] 
-                    dep_context_str += f"- {signature} # from {os.path.basename(d_file)}\n"
-                else:
-                    # Fallback if we can't parse the dependency
-                    dep_context_str += f"- def {d_name}(...): # Source unavailable\n"
-    
-    final_context = f"TARGET CODE:\n```python\n{target_code}\n```\n{dep_context_str}"
-    return final_context, None
-
-def generate_refactor_proposal(func_name, instruction):
-    # 1. Build the Context
-    context_str, error = get_context_from_graph(func_name)
-    
-    if error:
-        print(f"❌ Error: {error}")
+        print(f"❌ {error}")
         return
 
-    # 2. Construct the Prompt
-    full_prompt = f"""
-    You are a Senior Python Engineer. Refactor the code below based on the instruction.
+    # 2. Build the "Mega-Prompt"
+    # We feed the LLM the FULL content of relevant files.
+    # Note: For 14B model, we must be careful with context size.
+    # If files are huge, we'd need to only extract relevant functions.
     
-    CONTEXT:
-    {context_str}
-    
-    INSTRUCTION:
-    {instruction}
+    system_prompt = """
+    You are the Repo OS Kernel. You are an expert AI Engineer.
+    You are Refactoring a specific part of the system.
     
     RULES:
-    1. Output ONLY the refactored code for '{func_name}'.
-    2. Do not include markdown '```python' wrappers unless necessary.
-    3. Use the provided dependencies correctly.
+    1. You will receive multiple files.
+    2. You must output a JSON object where keys are filenames and values are the NEW full content of that file.
+    3. If a file needs no changes, do not include it in the JSON.
+    4. Ensure all function calls match new signatures across files.
     """
-
-    # 3. Call the "Right Brain" (LLM)
-    print(f"🧠 Reasoning with {MODEL_NAME}...")
     
-    # Streaming response for better UX (feels faster on M4)
-    stream = ollama.chat(
-        model=MODEL_NAME, 
-        messages=[{'role': 'user', 'content': full_prompt}],
-        stream=True
+    user_content = f"Instruction: {instruction}\n\n=== CODEBASE ===\n"
+    
+    original_files = {} # Keep backup
+    
+    for file_path, relevant_items in files_to_context.items():
+        content = fetch_file_content(file_path)
+        if content:
+            original_files[file_path] = content
+            user_content += f"\n--- FILE: {file_path} ---\n{content}\n"
+            user_content += f"Relevant Items in this file: {', '.join(relevant_items)}\n"
+
+    # 3. The Inference
+    print(f"🧠 Reasoning across {len(original_files)} files...")
+    
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_content}
+        ],
+        format='json', # Force JSON output for easier parsing
+        options={'temperature': 0.2} # Low temp for precision
     )
 
-    print("\n" + "="*40)
-    print("      PROPOSED REFACTOR")
-    print("="*40 + "\n")
-    
-    full_response = ""
-    for chunk in stream:
-        content = chunk['message']['content']
-        print(content, end='', flush=True)
-        full_response += content
+    # 4. Parse and Apply
+    try:
+        response_json = json.loads(response['message']['content'])
         
-    print("\n\n" + "="*40)
-    return full_response
+        print("\n--- PROPOSED PLAN ---")
+        for f, content in response_json.items():
+            print(f"📝 Modifying: {f}")
+            
+        confirm = input("\nProceed with write? (y/n): ")
+        if confirm.lower() == 'y':
+            apply_updates(response_json)
+            print("✅ Refactor Complete.")
+        else:
+            print("🛑 Aborted.")
+            
+    except json.JSONDecodeError:
+        print("❌ AI output invalid JSON. Raw output:")
+        print(response['message']['content'])
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        print("Raw response content:", response['message']['content'])
 
-# --- CLI ENTRY POINT ---
+
 if __name__ == "__main__":
-    # if len(sys.argv) < 3:
-    #     print("Usage: python refactor.py <function_name> <instruction>")
-    #     print('Example: python refactor.py process_payment "Add error handling"')
-    # else:
-    #     fn_name = sys.argv[1]
-    #     instr = " ".join(sys.argv[2:])
-    #     generate_refactor_proposal(fn_name, instr)
-    generate_refactor_proposal("process_payment", "Add error handling")
+    if len(sys.argv) < 3:
+        print("Usage: python refactor2.py <target_name> \"<instruction>\"")
+    else:
+        orchestrate_refactor(sys.argv[1], " ".join(sys.argv[2:]))
