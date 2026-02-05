@@ -17,7 +17,7 @@ class Tesla(Car):
         super().__init__("Tesla", model, year)
         self.battery_level = battery_level
 
-    def ignite_engine(self):
+    def start(self):
         """
         Starts the Tesla. Teslas are always "on" but this will engage the drive system.
         """

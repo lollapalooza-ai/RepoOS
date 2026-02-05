@@ -18,7 +18,7 @@ class Car:
         self.is_started = False
         self.speed = 0
 
-    def ignite_engine(self):
+    def start(self):
         """
         Starts the car's engine.
         """
