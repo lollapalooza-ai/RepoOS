@@ -1,7 +1,10 @@
 import ast
 import io
 import sys
-from flake8.api import legacy as flake8
+import os
+import subprocess # Import subprocess for calling flake8
+# from flake8.api import legacy as flake8 # No longer needed for this approach
+# from flake8.main import application as flake8_application # No longer needed for this approach
 
 def validate_code(code_string: str) -> list:
     """
@@ -25,33 +28,44 @@ def validate_code(code_string: str) -> list:
         return errors
 
     # 2. Flake8 Linting for style and common errors
-    # We use a custom stdout capture to get flake8's report as a string
-    # since the legacy API prints directly to stdout.
-    old_stdout = sys.stdout
-    sys.stdout = captured_output = io.StringIO()
+    try:
+        # Use subprocess to call flake8 on the code string passed via stdin
+        # --exit-zero: always exit with 0 even if errors are found, so we check stdout/stderr
+        # --isolated: Don't load any config files, use only command line options
+        # --stdin-display-filename: Use a consistent filename in error reports
+        flake8_command = [
+            sys.executable, "-m", "flake8", 
+            "--exit-zero", 
+            "--isolated", 
+            "--stdin-display-filename", "temp_code_to_validate.py",
+            "-" # Tells flake8 to read from stdin
+        ]
+        
+        process = subprocess.run(
+            flake8_command,
+            input=code_string, # Pass code string directly (text=True handles encoding)
+            capture_output=True,
+            text=True, # Decode stdout/stderr as text
+            check=False # Don't raise an exception for non-zero exit codes
+        )
 
-    # Create a StyleGuide and run checks on the code string
-    style_guide = flake8.StyleGuide(quiet=False, show_source=True)
-    report = style_guide.check_application(code=code_string)
-
-    # Restore stdout
-    sys.stdout = old_stdout
-    output = captured_output.getvalue()
-
-    # Process the report if there are errors
-    if report.total_errors > 0:
-        # We process the raw output string from flake8
-        lines = output.strip().splitlines()
-        # The output includes the source code, followed by the errors.
-        # We only need the error lines.
-        error_lines = [line for line in lines if 'stdin:' in line]
-        for line in error_lines:
-            # Flake8 output is typically './stdin:line:col: CODE message'
-            parts = line.split(':')
-            if len(parts) >= 4:
-                error_code = parts[3].strip()
-                error_message = ":".join(parts[4:]).strip()
-                errors.append(f"Linting Error on line {parts[1]}: [{error_code}] {error_message}")
+        output = process.stdout # Flake8 writes errors to stdout by default
+        
+        if output: # If there's any output, it means there are errors
+            for line in output.strip().splitlines():
+                # Flake8 output format: 'filename:line:col: CODE message'
+                parts = line.split(':')
+                if len(parts) >= 4:
+                    # Adjusting the filename part as it will be 'temp_code_to_validate.py'
+                    error_line = parts[1].strip()
+                    error_code = parts[3].strip()
+                    error_message = ":".join(parts[4:]).strip()
+                    errors.append(f"Linting Error on line {error_line}: [{error_code}] {error_message}")
+        
+    except FileNotFoundError:
+        errors.append("Error: flake8 command not found. Please ensure flake8 is installed and in your PATH.")
+    except Exception as e:
+        errors.append(f"Validator internal error during Flake8 linting: {e}")
 
     return errors
 

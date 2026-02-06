@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug ingest2.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/ingest2.py",
+            "console": "integratedTerminal",
+            "args": ["--arg1", "testRepo"]
+        },
+        {
+            "name": "Python: Debug refactor2.py (Interactive)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/refactor2.py",
+            "console": "integratedTerminal",
+            "args": [
+                "Car.start",
+                "Rename the start method to ignite_engine, and apply this change to all subclasses as well. Ensure all Python syntax and linting rules are followed strictly."
+            ]
+        },
+        {
+            "name": "Python: Debug refactor2.py (Auto-Confirm)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/refactor2.py",
+            "console": "integratedTerminal",
+            "args": [
+                "Car.start",
+                "Rename the start method to ignite_engine, and apply this change to all subclasses as well. Ensure all Python syntax and linting rules are followed strictly.",
+                "--yes"
+            ]
+        }
+    ]
+}

@@ -1,3 +1,4 @@
+import argparse # Import argparse
 import os
 import sys
 import json
@@ -163,10 +164,18 @@ def apply_updates(file_updates):
     MVP: Overwrites files (Dangerous but effective).
     """
     print("\n💾 Applying Changes to Disk...")
+    if not file_updates:
+        print("   No file updates to apply.")
+        return
+
     for file_path, new_content in file_updates.items():
-        print(f"   Writing: {file_path}")
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
+        print(f"   Writing to: {file_path}")
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            print(f"   Successfully wrote to {file_path}")
+        except Exception as e:
+            print(f"   ❌ Error writing to {file_path}: {e}")
 
 def generate_with_retries(system_prompt, initial_user_content, original_files_full_content, max_retries=MAX_RETRIES):
     """
@@ -246,7 +255,7 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
     return None
 
-def orchestrate_refactor(target_name, instruction):
+def orchestrate_refactor(target_name, instruction, auto_confirm=False):
     # 1. Get the Blast Radius
     files_to_context, error = get_blast_radius(target_name)
     if error:
@@ -302,7 +311,11 @@ def orchestrate_refactor(target_name, instruction):
         print("❌ Refactor process failed after multiple attempts.")
         
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python refactor2.py <target_name> \"<instruction>\"")
-    else:
-        orchestrate_refactor(sys.argv[1], " ".join(sys.argv[2:]))
+    parser = argparse.ArgumentParser(description="Repo OS Refactoring Orchestrator.")
+    parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
+    parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
+    parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
+
+    args = parser.parse_args()
+
+    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes)
