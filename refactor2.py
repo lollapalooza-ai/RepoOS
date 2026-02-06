@@ -1,3 +1,5 @@
+import difflib # Import difflib
+import difflib # Import difflib
 import argparse # Import argparse
 import os
 import sys
@@ -7,6 +9,98 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from validator import validate_code # Import the validator
+
+# --- ANSI COLORS ---
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+def review_changes(original_files, proposed_changes):
+    """
+    Shows a 'git diff' style view in the terminal.
+    """
+    print(f"\n{Colors.BOLD}🔍 REVIEW PROPOSED CHANGES:{Colors.RESET}")
+    
+    for filename, new_content in proposed_changes.items():
+        print(f"\n{Colors.CYAN}--- File: {filename} ---{Colors.RESET}")
+        
+        # Get old content (handle new files case)
+        old_content = original_files.get(filename, "")
+        old_lines = old_content.splitlines(keepends=True)
+        new_lines = new_content.splitlines(keepends=True)
+        
+        # Generate Unified Diff
+        diff = difflib.unified_diff(
+            old_lines, new_lines, 
+            fromfile=f"a/{filename}", 
+            tofile=f"b/{filename}",
+            lineterm=""
+        )
+        
+        # Print with Color
+        diff_empty = True
+        for line in diff:
+            diff_empty = False
+            if line.startswith('+') and not line.startswith('+++'):
+                print(f"{Colors.GREEN}{line.rstrip()}{Colors.RESET}")
+            elif line.startswith('-') and not line.startswith('---'):
+                print(f"{Colors.RED}{line.rstrip()}{Colors.RESET}")
+            elif line.startswith('@@'): # Context markers
+                print(f"{Colors.BOLD}{line.rstrip()}{Colors.RESET}")
+            else:
+                print(line.rstrip())
+        
+        if diff_empty:
+            print(f"{Colors.BOLD}(No semantic changes detected - maybe just formatting?){Colors.RESET}")
+
+# --- ANSI COLORS ---
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+def review_changes(original_files, proposed_changes):
+    """
+    Shows a 'git diff' style view in the terminal.
+    """
+    print(f"\n{Colors.BOLD}🔍 REVIEW PROPOSED CHANGES:{Colors.RESET}")
+    
+    for filename, new_content in proposed_changes.items():
+        print(f"\n{Colors.CYAN}--- File: {filename} ---{Colors.RESET}")
+        
+        # Get old content (handle new files case)
+        old_content = original_files.get(filename, "")
+        old_lines = old_content.splitlines(keepends=True)
+        new_lines = new_content.splitlines(keepends=True)
+        
+        # Generate Unified Diff
+        diff = difflib.unified_diff(
+            old_lines, new_lines, 
+            fromfile=f"a/{filename}", 
+            tofile=f"b/{filename}",
+            lineterm=""
+        )
+        
+        # Print with Color
+        diff_empty = True
+        for line in diff:
+            diff_empty = False
+            if line.startswith('+') and not line.startswith('+++'):
+                print(f"{Colors.GREEN}{line.rstrip()}{Colors.RESET}")
+            elif line.startswith('-') and not line.startswith('---'):
+                print(f"{Colors.RED}{line.rstrip()}{Colors.RESET}")
+            elif line.startswith('@@'): # Context markers
+                print(f"{Colors.BOLD}{line.rstrip()}{Colors.RESET}")
+            else:
+                print(line.rstrip())
+        
+        if diff_empty:
+            print(f"{Colors.BOLD}(No semantic changes detected - maybe just formatting?){Colors.RESET}")
 
 # --- CONFIGURATION ---
 NEO4J_URI = "bolt://localhost:7687"
@@ -301,12 +395,22 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False):
         for f in final_plan:
             print(f"📝 Modifying: {f}")
         
-        confirm = input("\nProceed with write? (y/n): ")
-        if confirm.lower() == 'y':
+        # --- NEW: VISUALIZATION STEP ---
+        if not auto_confirm:
+            review_changes(original_files_full_content, final_plan)
+        
+        # Check auto_confirm flag
+        if auto_confirm:
+            print(f"\n{Colors.BOLD}Auto-confirming write operation (--yes flag detected).{Colors.RESET}")
             apply_updates(final_plan)
             print("✅ Refactor Complete.")
         else:
-            print("🛑 Aborted.")
+            confirm = input(f"\n{Colors.BOLD}Apply these changes to disk? (y/n): {Colors.RESET}")
+            if confirm.lower() == 'y':
+                apply_updates(final_plan)
+                print("✅ Refactor Complete.")
+            else:
+                print("🛑 Aborted. Changes discarded.")
     else:
         print("❌ Refactor process failed after multiple attempts.")
         
