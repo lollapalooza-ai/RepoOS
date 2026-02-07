@@ -378,8 +378,6 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
         else:
             print(f"⚠️ Warning: Could not read full content for {file_path}. Skipping.")
 
-    final_plan = {}
-    
     # 3. Topological Sort (Optional but Smart)
     # Ideally, you want to refactor the 'Dependency' (utils.py) before the 'Dependent' (main.py)
     # For MVP, we'll just process them in the order provided or simple alphabetical
@@ -387,47 +385,56 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
     
     print(f"📋 Sequential Plan: {sorted_files}")
     
+    applied_files_content = {} # To store content of files already processed and applied
+
     for filename in sorted_files:
         content = original_files_full_content[filename]
-        
+
         # 4. Dynamic Context Building
         # The 'dependencies' context could essentially be the *new* code of files we just finished!
         # This allows 'main.py' to see the *updated* 'utils.py' immediately.
         current_context_str = "Recently Updated Files:\n"
-        for finished_file, new_content in final_plan.items():
-            # Only include signatures to save tokens
+        for finished_file, new_content_for_context in applied_files_content.items():
             current_context_str += f"- {finished_file} (Refactored)\n"
-            
+
         # 5. Execute
         new_code = process_single_file_sync(filename, content, instruction, current_context_str)
-        
+
         if new_code:
-            final_plan[filename] = new_code
-            # Simulate a brief cooldown if needed for thermal management
-            time.sleep(0.5) 
+            print(f"\n--- PROPOSED CHANGE FOR: {filename} ---")
             
-    # 6. Apply
-    if final_plan:
-        print("\n--- FINAL SEQUENTIAL PLAN ---")
-        for f in final_plan:
-            print(f"📝 Modifying: {f}")
-        
-        if not auto_confirm:
-            review_changes(original_files_full_content, final_plan)
-        
-        if auto_confirm:
-            print(f"\n{Colors.BOLD}Auto-confirming write operation (--yes flag detected).{Colors.RESET}")
-            apply_updates(final_plan)
-            print("✅ Refactor Complete.")
-        else:
-            confirm = input(f"\n{Colors.BOLD}Apply these changes to disk? (y/n): {Colors.RESET}")
-            if confirm.lower() == 'y':
-                apply_updates(final_plan)
-                print("✅ Refactor Complete.")
+            # Create a temporary dict for review_changes to show only this file's change
+            single_file_original = {filename: original_files_full_content[filename]}
+            single_file_proposed = {filename: new_code}
+
+            if not auto_confirm:
+                review_changes(single_file_original, single_file_proposed)
+
+            should_apply = auto_confirm
+            if not auto_confirm:
+                confirm = input(f"\n{Colors.BOLD}Apply changes to {filename}? (y/n): {Colors.RESET}")
+                if confirm.lower() == 'y':
+                    should_apply = True
+                else:
+                    should_apply = False
+                    print(f"🛑 Aborted changes for {filename}. Moving to next file.")
+
+            if should_apply:
+                apply_updates(single_file_proposed) # Apply only the current file's change
+                applied_files_content[filename] = new_code # Add to applied for context in next iteration
+                print(f"✅ Changes for {filename} applied.")
+                # Simulate a brief cooldown if needed for thermal management
+                time.sleep(0.5) 
             else:
-                print("🛑 Aborted. Changes discarded.")
-    else:
-        print("❌ Refactor process failed.")
+                # If not applied, the original content persists for subsequent context if needed,
+                # but for simplicity, we just won't add it to applied_files_content.
+                pass # Already printed "Aborted"
+
+        else:
+            print(f"❌ Failed to refactor {filename}. Aborting sequential refactoring.")
+            return # Exit the function immediately
+
+    print("\n--- SEQUENTIAL REFACTORING PROCESS COMPLETE ---")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Repo OS Sequential Refactoring Orchestrator.")
