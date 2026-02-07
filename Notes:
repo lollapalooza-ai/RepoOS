@@ -4,3 +4,5 @@ cd /Users/yeshr/Applications/Program1/legacy_shop && source venv/bin/activate &&
 
 source venv/bin/activate
 refactor2.py 
+
+Run this command and validate the results. "source venv/bin/activate && python clear_neo4j.py && python ingest2.py legacy_shop && python refactor2.py process_checkout "The database layer is unsafe. Replace the raw SQL update for inventory with a safe call to db.run_raw_sql using parameterized queries if possible, or just fix the SQL injection in the string construction."

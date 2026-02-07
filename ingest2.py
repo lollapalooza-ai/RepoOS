@@ -443,11 +443,11 @@ def ingest_folder(folder_path):
     print(f"\n✅ Ingestion Complete. Processed {file_count} files.")
 
 if __name__ == "__main__":
-    # if len(sys.argv) < 2:
-    #     print("Usage: python ingest.py <path_to_repo>")
-    # else:
-    #     target_folder = sys.argv[1]
-    #     ingest_folder(target_folder)
-    #     driver.close()
-    #     sys.exit(0)
-    ingest_folder("testRepo")
+    if len(sys.argv) < 2:
+        print("Usage: python ingest.py <path_to_repo>")
+    else:
+        target_folder = sys.argv[1]
+        ingest_folder(target_folder)
+        driver.close()
+        sys.exit(0)
+    # ingest_folder("testRepo")
