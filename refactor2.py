@@ -1,60 +1,14 @@
 import difflib # Import difflib
-import difflib # Import difflib
 import argparse # Import argparse
 import os
 import sys
 import json
+import time # Import time for sequential processing
 import ollama
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from validator import validate_code # Import the validator
-
-# --- ANSI COLORS ---
-class Colors:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    CYAN = '\033[96m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-
-def review_changes(original_files, proposed_changes):
-    """
-    Shows a 'git diff' style view in the terminal.
-    """
-    print(f"\n{Colors.BOLD}🔍 REVIEW PROPOSED CHANGES:{Colors.RESET}")
-    
-    for filename, new_content in proposed_changes.items():
-        print(f"\n{Colors.CYAN}--- File: {filename} ---{Colors.RESET}")
-        
-        # Get old content (handle new files case)
-        old_content = original_files.get(filename, "")
-        old_lines = old_content.splitlines(keepends=True)
-        new_lines = new_content.splitlines(keepends=True)
-        
-        # Generate Unified Diff
-        diff = difflib.unified_diff(
-            old_lines, new_lines, 
-            fromfile=f"a/{filename}", 
-            tofile=f"b/{filename}",
-            lineterm=""
-        )
-        
-        # Print with Color
-        diff_empty = True
-        for line in diff:
-            diff_empty = False
-            if line.startswith('+') and not line.startswith('+++'):
-                print(f"{Colors.GREEN}{line.rstrip()}{Colors.RESET}")
-            elif line.startswith('-') and not line.startswith('---'):
-                print(f"{Colors.RED}{line.rstrip()}{Colors.RESET}")
-            elif line.startswith('@@'): # Context markers
-                print(f"{Colors.BOLD}{line.rstrip()}{Colors.RESET}")
-            else:
-                print(line.rstrip())
-        
-        if diff_empty:
-            print(f"{Colors.BOLD}(No semantic changes detected - maybe just formatting?){Colors.RESET}")
 
 # --- ANSI COLORS ---
 class Colors:
@@ -349,57 +303,118 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
     return None
 
-def orchestrate_refactor(target_name, instruction, auto_confirm=False):
+def process_single_file_sync(filename, file_content, instruction, dependencies):
+    """
+    Synchronous Worker. Refactors ONE file and returns the result.
+    """
+    print(f"\n🚀 Starting Task: {filename}")
+    
+    # Specialized Prompt
+    system_prompt = f"""
+    You are a Refactoring Unit.
+    Task: Refactor '{filename}' based on the instruction.
+    Context: {dependencies}
+    Output: Provide ONLY the raw python code for this file. DO NOT include any markdown ```python wrappers, explanations, comments, or any other text. JUST THE CODE.
+    """
+    
+    # Retry Loop (Self-Correction)
+    for attempt in range(3):
+        # We use standard synchronous chat here
+        response = ollama.chat(
+            model=MODEL_NAME,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': f"CODE:\n{file_content}\n\nINSTRUCTION:\n{instruction}"}
+            ],
+            options={'temperature': 0.1} # Low temp for precision
+        )
+        
+        # Extract only the code from the response.
+        # This is a more robust extraction, handling cases where the LLM might still
+        # include markdown wrappers despite strict instructions.
+        new_code = response['message']['content'].strip()
+        if new_code.startswith("```python"):
+            new_code = new_code[len("```python"):].strip()
+            if new_code.endswith("```"):
+                new_code = new_code[:-len("```")].strip()
+        elif new_code.startswith("```"): # Generic markdown
+            new_code = new_code[len("```"):].strip()
+            if new_code.endswith("```"):
+                new_code = new_code[:-len("```")].strip()
+
+
+        
+        # Validation
+        errors = validate_code(new_code)
+        if not errors:
+            print(f"   ✅ Finished: {filename}")
+            return new_code
+        else:
+            print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
+            # In a real app, you'd feed the error back to the LLM here
+            
+    print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
+    return None
+
+def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False):
+    """
+    The Sequential Manager.
+    1. Analyze dependencies.
+    2. Sort tasks (Critical dependencies first).
+    3. Execute one by one.
+    """
     # 1. Get the Blast Radius
     files_to_context, error = get_blast_radius(target_name)
     if error:
         print(f"❌ {error}")
         return
 
-    # 2. Build the "Mega-Prompt" with full file content
-    system_prompt = """
-    You are the Repo OS Kernel. You are an expert AI Engineer.
-    You are Refactoring a specific part of the system.
-    
-    RULES:
-    1. You will receive the FULL content of multiple files.
-    2. You must output a JSON object where keys are filenames and values are the NEW *full content* of that file.
-    3. If a file needs no changes, you MUST return its original full content in the JSON.
-    4. Ensure all function calls match new signatures across files.
-    5. The values in the JSON object (the file contents) MUST be raw code, not wrapped in markdown code blocks (e.g., DO NOT use ```python ... ``` within the JSON values).
-    6. ONLY output the JSON object. Do not include any other text or markdown outside the JSON.
-    """
-    
-    initial_user_content = f"Instruction: {instruction}\n\n=== CODEBASE FILES ===\n"
-    
-    # Store full original file contents for validation and rewrite
+    # 2. Load initial file contents
     original_files_full_content = {} 
-    
-    for file_path, relevant_items in files_to_context.items():
+    for file_path in files_to_context.keys():
         full_content = fetch_file_content(file_path)
         if full_content:
             original_files_full_content[file_path] = full_content
-            initial_user_content += f"\n--- FILE: {file_path} ---\n{full_content}\n"
-            # Highlight relevant items for the LLM within the full file context
-            initial_user_content += f"--- Relevant Items in {os.path.basename(file_path)}: {', '.join(relevant_items)} ---\n"
         else:
             print(f"⚠️ Warning: Could not read full content for {file_path}. Skipping.")
 
-
-    # 3. ENTER THE SELF-HEALING LOOP
-    final_plan = generate_with_retries(system_prompt, initial_user_content, original_files_full_content)
-
-    # 4. Apply
+    final_plan = {}
+    
+    # 3. Topological Sort (Optional but Smart)
+    # Ideally, you want to refactor the 'Dependency' (utils.py) before the 'Dependent' (main.py)
+    # For MVP, we'll just process them in the order provided or simple alphabetical
+    sorted_files = sorted(original_files_full_content.keys()) 
+    
+    print(f"📋 Sequential Plan: {sorted_files}")
+    
+    for filename in sorted_files:
+        content = original_files_full_content[filename]
+        
+        # 4. Dynamic Context Building
+        # The 'dependencies' context could essentially be the *new* code of files we just finished!
+        # This allows 'main.py' to see the *updated* 'utils.py' immediately.
+        current_context_str = "Recently Updated Files:\n"
+        for finished_file, new_content in final_plan.items():
+            # Only include signatures to save tokens
+            current_context_str += f"- {finished_file} (Refactored)\n"
+            
+        # 5. Execute
+        new_code = process_single_file_sync(filename, content, instruction, current_context_str)
+        
+        if new_code:
+            final_plan[filename] = new_code
+            # Simulate a brief cooldown if needed for thermal management
+            time.sleep(0.5) 
+            
+    # 6. Apply
     if final_plan:
-        print("\n--- FINAL VALIDATED PLAN ---")
+        print("\n--- FINAL SEQUENTIAL PLAN ---")
         for f in final_plan:
             print(f"📝 Modifying: {f}")
         
-        # --- NEW: VISUALIZATION STEP ---
         if not auto_confirm:
             review_changes(original_files_full_content, final_plan)
         
-        # Check auto_confirm flag
         if auto_confirm:
             print(f"\n{Colors.BOLD}Auto-confirming write operation (--yes flag detected).{Colors.RESET}")
             apply_updates(final_plan)
@@ -412,14 +427,14 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False):
             else:
                 print("🛑 Aborted. Changes discarded.")
     else:
-        print("❌ Refactor process failed after multiple attempts.")
+        print("❌ Refactor process failed.")
         
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Repo OS Refactoring Orchestrator.")
+    parser = argparse.ArgumentParser(description="Repo OS Sequential Refactoring Orchestrator.")
     parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
     parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
     parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
 
     args = parser.parse_args()
 
-    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes)
+    orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes)
