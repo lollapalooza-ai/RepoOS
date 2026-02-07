@@ -1,0 +1,6 @@
+Notes:
+cd /Users/yeshr/Applications/Program1/legacy_shop && source venv/bin/activate && pip install -r requirements.txt && python3 -m unittest test_e2e.py
+
+
+source venv/bin/activate
+refactor2.py 

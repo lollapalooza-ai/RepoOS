@@ -28,9 +28,9 @@ class Helper:
             return False
             
         # 20% chance of random failure
-        if random.random() < 0.2:
-            print("Stripe Connection Timed Out")
-            return False
+        # if random.random() < 0.2:
+        #     print("Stripe Connection Timed Out")
+        #     return False
             
         self.log("Charged " + str(amount))
         return True
