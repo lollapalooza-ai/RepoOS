@@ -352,6 +352,8 @@ def process_file(file_path):
                 if method_name_capture == 'method.name':
                     method_name = source_code[method_node.start_byte:method_node.end_byte]
                     full_method_name = f"{class_name}.{method_name}" # e.g., MyClass.my_method
+                    method_def_node = method_node.parent
+                    method_source_code = source_code[method_def_node.start_byte:method_def_node.end_byte]
                     write_function_node(full_method_name, file_path, node_type='method')
                     create_has_method_relationship(class_name, full_method_name)
                     print(f"      - Method: {full_method_name}")
@@ -391,6 +393,8 @@ def process_file(file_path):
         if name == 'func.name':
             func_name = source_code[node.start_byte:node.end_byte]
             
+            func_def_node = node.parent
+            func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
             # Claim this function in the graph
             write_function_node(func_name, file_path, node_type='function')
             print(f"   ➕ Function: {func_name}")

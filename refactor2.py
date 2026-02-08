@@ -18,6 +18,27 @@ class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
+def extract_constraints(instruction):
+    """
+    Uses a small, fast prompt to identify 'Must Haves' in the user instruction.
+    """
+    sys_prompt = """
+    You are a Technical Project Manager. 
+    Extract specific function calls, libraries, or patterns the user EXPLICITLY requested.
+    Output JSON: {"must_use_functions": [], "must_use_libraries": [], "architectural_notes": ""}
+    """
+    
+    response = ollama.chat(
+        model=MODEL_NAME_FOR_CONSTRAINTS,
+        messages=[
+            {'role': 'system', 'content': sys_prompt},
+            {'role': 'user', 'content': instruction}
+        ],
+        format='json',
+        options={'temperature': 0.0}
+    )
+    return json.loads(response['message']['content'])
+
 def review_changes(original_files, proposed_changes):
     """
     Shows a 'git diff' style view in the terminal.
@@ -60,6 +81,7 @@ def review_changes(original_files, proposed_changes):
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
+MODEL_NAME_FOR_CONSTRAINTS = MODEL_NAME # Using the main model name for consistency
 MAX_RETRIES = 3 # Max attempts for the self-healing loop
 
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
@@ -115,6 +137,45 @@ def get_blast_radius(target_name):
         return None, "Target not found or has no file associations in Graph."
         
     return context_map, None
+
+def fetch_mandated_tools(constraints):
+    """
+    If the user asked for 'db.run_raw_sql', we fetch its signature from the Graph
+    and tag it as MANDATORY in the context.
+    """
+    tool_context = ""
+    
+    # 1. Look for requested functions
+    for func_name in constraints.get('must_use_functions', []):
+        # Handle 'module.function' format
+        clean_name = func_name.split('.')[-1] 
+        
+        # Query Graph for this specific function
+        query = """
+        MATCH (f:Function {name: $name})
+        RETURN f.name, f.file
+        """
+        with driver.session() as session:
+            result = session.run(query, name=clean_name).single()
+            
+        if result:
+            function_name = result['f.name']
+            file_path = result['f.file']
+            
+            # Dynamically fetch the function body using get_code_snippet
+            function_body, error = get_code_snippet(file_path, function_name)
+            
+            if function_body:
+                tool_context += f"\n!!! MANDATORY TOOL !!!\n"
+                tool_context += f"You MUST use the function '{function_name}' defined in '{file_path}':\n"
+                # Optimization: Only show signature + docstring, not full body if too large
+                tool_context += f"```python\n{function_body[:500]}...\n```\n"
+            else:
+                print(f"⚠️ Warning: User asked for '{func_name}' but its code could not be retrieved from '{file_path}': {error}")
+        else:
+            print(f"⚠️ Warning: User asked for '{func_name}' but it was not found in the Graph.")
+            
+    return tool_context
 
 def fetch_file_content(file_path):
     """Reads full file content."""
@@ -303,18 +364,40 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
     return None
 
-def process_single_file_sync(filename, file_content, instruction, dependencies):
+def process_single_file_sync(filename, file_content, instruction, dependencies, constraints, tool_context):
     """
     Synchronous Worker. Refactors ONE file and returns the result.
     """
     print(f"\n🚀 Starting Task: {filename}")
-    
-    # Specialized Prompt
+
+    constraint_str = ""
+    if constraints.get('must_use_functions'):
+        constraint_str += f"MANDATORY: You must implement the solution using: {', '.join(constraints['must_use_functions'])}. "
+    if constraints.get('must_use_libraries'):
+        constraint_str += f"MANDATORY: You must use the following libraries: {', '.join(constraints['must_use_libraries'])}."
+    if constraints.get('architectural_notes'):
+        constraint_str += f"ARCHITECTURAL NOTE: {constraints['architectural_notes']}."
+
     system_prompt = f"""
-    You are a Refactoring Unit.
-    Task: Refactor '{filename}' based on the instruction.
-    Context: {dependencies}
-    Output: Provide ONLY the raw python code for this file. DO NOT include any markdown ```python wrappers, explanations, comments, or any other text. JUST THE CODE.
+    You are a Principal Engineer. Refactor the code for {filename}.
+
+    CRITICAL RULES:
+    {constraint_str} (These are hard constraints. You will be penalized for ignoring them.)
+    Output a JSON object with TWO fields:
+       - "plan_report": A brief explanation of how you satisfied the specific constraints for {filename}.
+       - "file_changes": A dictionary with one entry: {{"{filename}": "new_code_for_{filename}"}}.
+
+    Example Output:
+    {{
+      "plan_report": "I fixed the SQL injection in {filename} by using db.run_raw_sql as requested.",
+      "file_changes": {{ "{filename}": "..." }}
+    }}
+
+    Context for mandatory tools:
+    {tool_context}
+
+    Additional context from dependent files:
+    {dependencies}
     """
     
     # Retry Loop (Self-Correction)
@@ -324,35 +407,50 @@ def process_single_file_sync(filename, file_content, instruction, dependencies):
             model=MODEL_NAME,
             messages=[
                 {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': f"CODE:\n{file_content}\n\nINSTRUCTION:\n{instruction}"}
+                {'role': 'user', 'content': f"CODE for {filename}:\n{file_content}\n\nINSTRUCTION:\n{instruction}"}
             ],
             options={'temperature': 0.1} # Low temp for precision
         )
         
-        # Extract only the code from the response.
-        # This is a more robust extraction, handling cases where the LLM might still
-        # include markdown wrappers despite strict instructions.
-        new_code = response['message']['content'].strip()
-        if new_code.startswith("```python"):
-            new_code = new_code[len("```python"):].strip()
-            if new_code.endswith("```"):
-                new_code = new_code[:-len("```")].strip()
-        elif new_code.startswith("```"): # Generic markdown
-            new_code = new_code[len("```"):].strip()
-            if new_code.endswith("```"):
-                new_code = new_code[:-len("```")].strip()
+        # Parse the JSON response
+        try:
+            raw_llm_response_content = response['message']['content'].strip()
+            # Attempt to strip markdown code block wrappers
+            if raw_llm_response_content.startswith("```json"):
+                raw_llm_response_content = raw_llm_response_content[len("```json"):].strip()
+                if raw_llm_response_content.endswith("```"):
+                    raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
+            elif raw_llm_response_content.startswith("```"): # Generic markdown
+                raw_llm_response_content = raw_llm_response_content[len("```"):].strip()
+                if raw_llm_response_content.endswith("```"):
+                    raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
 
+            response_json = json.loads(raw_llm_response_content)
+            plan_report = response_json.get('plan_report', 'No report generated.')
+            file_changes = response_json.get('file_changes', {})
 
-        
-        # Validation
-        errors = validate_code(new_code)
-        if not errors:
-            print(f"   ✅ Finished: {filename}")
-            return new_code
-        else:
-            print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
-            # In a real app, you'd feed the error back to the LLM here
+            new_code = file_changes.get(filename)
             
+            if new_code:
+                errors = validate_code(new_code)
+                if not errors:
+                    print(f"   ✅ Finished: {filename}")
+                    print(f"   📋 Plan Report for {filename}: {plan_report}")
+                    return new_code
+                else:
+                    print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
+                    # In a real app, you'd feed the error back to the LLM here
+            else:
+                print(f"   ❌ No changes returned for {filename} in file_changes (Attempt {attempt+1}).")
+
+        except json.JSONDecodeError:
+            print(f"   ❌ Attempt {attempt + 1} failed: AI output invalid JSON.")
+            print(f"   Raw LLM Response (Attempt {attempt + 1}):\n{response['message']['content']}")
+            # For self-correction, append feedback to the next user message,
+            # but for this retry loop, we just log and continue.
+        except Exception as e:
+            print(f"   An unexpected error occurred during processing LLM response (Attempt {attempt+1}): {e}")
+
     print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
     return None
 
@@ -363,13 +461,27 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
     2. Sort tasks (Critical dependencies first).
     3. Execute one by one.
     """
-    # 1. Get the Blast Radius
+    # 1. EXTRACT CONSTRAINTS
+    print("🕵️ Analyzing Instructions...")
+    constraints = extract_constraints(instruction)
+    
+    if constraints.get('must_use_functions'):
+        print(f"🔒 Constraints Detected: Must use functions: {constraints['must_use_functions']}")
+    if constraints.get('must_use_libraries'):
+        print(f"🔒 Constraints Detected: Must use libraries: {constraints['must_use_libraries']}")
+    if constraints.get('architectural_notes'):
+        print(f"🔒 Constraints Detected: Architectural notes: {constraints['architectural_notes']}")
+
+    # 2. Get the Blast Radius
     files_to_context, error = get_blast_radius(target_name)
     if error:
         print(f"❌ {error}")
         return
 
-    # 2. Load initial file contents
+    # 2. FETCH MANDATORY TOOL CONTEXT
+    tool_context = fetch_mandated_tools(constraints)
+
+    # 3. Load initial file contents
     original_files_full_content = {} 
     for file_path in files_to_context.keys():
         full_content = fetch_file_content(file_path)
@@ -398,7 +510,7 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
             current_context_str += f"- {finished_file} (Refactored)\n"
 
         # 5. Execute
-        new_code = process_single_file_sync(filename, content, instruction, current_context_str)
+        new_code = process_single_file_sync(filename, content, instruction, current_context_str, constraints, tool_context)
 
         if new_code:
             print(f"\n--- PROPOSED CHANGE FOR: {filename} ---")
@@ -437,11 +549,11 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
     print("\n--- SEQUENTIAL REFACTORING PROCESS COMPLETE ---")
         
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Repo OS Sequential Refactoring Orchestrator.")
-    parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
-    parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
-    parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
+    arg_parser = argparse.ArgumentParser(description="Repo OS Sequential Refactoring Orchestrator.")
+    arg_parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
+    arg_parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
+    arg_parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
 
-    args = parser.parse_args()
+    args = arg_parser.parse_args()
 
     orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes)
