@@ -1,9 +1,14 @@
 Notes:
-cd /Users/yeshr/Applications/Program1/legacy_shop && source venv/bin/activate && pip install -r requirements.txt && python3 -m unittest test_e2e.py
+cd /Users/yeshr/Applications/Program1/legacy_shop && source .venv/bin/activate && pip install -r requirements.txt && python3 -m unittest test_e2e.py
 
 
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 refactor2.py 
 
 Run this command and validate the results:
 source venv/bin/activate && python clear_neo4j.py && python ingest2.py legacy_shop && python refactor2.py process_checkout "The database layer is unsafe. Replace the raw SQL update for inventory with a safe call to db.run_raw_sql using parameterized queries if possible, or just fix the SQL injection in the string construction."
+
+
+Now lets test and verify how RepoOS to refactor Repo1's app.py search_monolith. I've already installed the requirements and set up the virtual environment. We'll run the following command to refactor the code:
+source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && pyhton ingest2.py Repo2 && python refactor2.py search_monolith "The API is a monolith that does several sub fuctions. Refactor the API to make them more modular and easier to maintain. Identify the different sub functions and break them into separate microservices. Ensure that the refactored code maintains the same functionality and performance as the original monolith."

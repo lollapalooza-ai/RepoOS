@@ -1,4 +1,3 @@
-# app.py - Created by "Dave" in 2015 (Do not touch!!)
 from flask import Flask, request, jsonify
 import os
 import sqlite3
@@ -17,7 +16,6 @@ app = Flask(__name__)
 app.secret_key = "super_secret_key_12345"
 STRIPE_API_KEY = "sk_test_4eC39HqLyjWDarjtT1zdp7dc"
 
-# Dave: I couldn't get the ORM to work so I wrote raw SQL. It's faster.
 def get_db():
     conn = sqlite3.connect('legacy_shop.db')
     return conn
@@ -39,10 +37,10 @@ def login():
     
     # CRITICAL: This is a classic SQL Injection vulnerability
     # Repo OS should detect this as a "Infrastructure: SQL" usage
-    query = "SELECT * FROM users WHERE username = '" + username + "'"
+    query = "SELECT * FROM users WHERE username = ?"
     print("Running query: " + query)
     
-    c.execute(query)
+    c.execute(query, (username,))
     user = c.fetchone()
     
     if user:
@@ -77,9 +75,9 @@ def process_checkout():
     conn = get_db()
     for item in cart:
         # Infrastructure Touch: Updates 'products' table
-        sql = "UPDATE products SET stock = stock - " + str(item['qty']) + " WHERE id = " + str(item['id'])
-        conn.execute(sql)
-        
+        sql = "UPDATE products SET stock = stock - ? WHERE id = ?"
+        db.run_raw_sql(sql, (item['qty'], item['id']))
+    
     conn.commit()
     
     # 4. Process Payment
@@ -99,7 +97,7 @@ def process_checkout():
     except Exception as e:
         print("Error happened: " + str(e))
         pass # Just ignore it so the user doesn't see the error
-        
+    
     return jsonify({"status": "error"}), 500
 
 @app.route('/admin/users')
