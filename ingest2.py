@@ -173,18 +173,48 @@ def create_sql_touch_relationship(func_name, operation, table):
 
 def create_api_call_relationship(func_name, method, endpoint):
     """
-    (:Function)-[:CALLS_API {method, endpoint}]->(:Infrastructure {type: 'ExternalAPI'})
+    Tries to resolve an API endpoint to a specific function in the graph.
+    If successful, creates a direct [:CALLS] relationship.
+    Otherwise, creates a generic [:CALLS_API] relationship to an Infrastructure node.
     """
-    query = """
-    MATCH (f:Function {name: $func_name})
-    MERGE (i:Infrastructure {type: 'ExternalAPI'})
-    MERGE (f)-[r:CALLS_API]->(i)
-    ON CREATE SET r.method = $method, r.endpoint = $endpoint
-    ON MATCH SET r.method = $method, r.endpoint = $endpoint
+    # Extract the path from a potentially complex URL string
+    path_match = re.search(r"/(?P<path>[a-zA-Z0-9_-]+)$", endpoint)
+    if not path_match:
+        # Fallback for non-standard or unresolved paths
+        query = """
+        MATCH (f:Function {name: $func_name})
+        MERGE (i:Infrastructure {type: 'ExternalAPI'})
+        MERGE (f)-[r:CALLS_API]->(i)
+        SET r.method = $method, r.endpoint = $endpoint
+        """
+        with driver.session() as session:
+            session.run(query, func_name=func_name, method=method, endpoint=endpoint)
+            print(f"   ⚡ Found unresolved API Call: {func_name} -> {method} {endpoint}")
+        return
+
+    path = "/" + path_match.group("path")
+
+    # Query to find the function with the matching route
+    resolve_query = """
+    MATCH (caller:Function {name: $func_name})
+    MATCH (callee:Function) WHERE callee.route = $path
+    MERGE (caller)-[:CALLS]->(callee)
     """
     with driver.session() as session:
-        session.run(query, func_name=func_name, method=method, endpoint=endpoint)
-        print(f"   ⚡ Found API Call: {func_name} -> {method} {endpoint}")
+        result = session.run(resolve_query, func_name=func_name, path=path)
+        summary = result.consume()
+        if summary.counters.relationships_created > 0:
+            print(f"   ⚡ Found and linked API Call: {func_name} -> {path}")
+        else:
+            # Fallback if no function with that route is found
+            fallback_query = """
+            MATCH (f:Function {name: $func_name})
+            MERGE (i:Infrastructure {type: 'ExternalAPI'})
+            MERGE (f)-[r:CALLS_API]->(i)
+            SET r.method = $method, r.endpoint = $endpoint
+            """
+            session.run(fallback_query, func_name=func_name, method=method, endpoint=endpoint)
+            print(f"   ⚡ Found unresolved API Call: {func_name} -> {method} {endpoint}")
 
 def create_aws_touch_relationship(func_name, service):
     """
@@ -398,6 +428,16 @@ def process_file(file_path):
             # Claim this function in the graph
             write_function_node(func_name, file_path, node_type='function')
             print(f"   ➕ Function: {func_name}")
+
+            # Check for @app.route decorator
+            if func_def_node.prev_sibling and func_def_node.prev_sibling.type == 'decorator':
+                decorator_text = source_code[func_def_node.prev_sibling.start_byte:func_def_node.prev_sibling.end_byte]
+                route_match = re.search(r"@app\.route\(['\"](.*?)['\"]", decorator_text)
+                if route_match:
+                    route = route_match.group(1)
+                    with driver.session() as session:
+                        session.run("MATCH (f:Function {name: $name}) SET f.route = $route", name=func_name, route=route)
+                        print(f"      - Route: {route}")
             
             func_def_node = node.parent
             func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
@@ -436,6 +476,7 @@ def ingest_folder(folder_path):
         # Optional: Skip hidden folders like .git or venv
         if '.git' in dirs: dirs.remove('.git')
         if 'venv' in dirs: dirs.remove('venv')
+        if '.venv' in dirs: dirs.remove('.venv')
         if '__pycache__' in dirs: dirs.remove('__pycache__')
 
         for file in files:
