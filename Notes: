@@ -11,4 +11,13 @@ source venv/bin/activate && python clear_neo4j.py && python ingest2.py legacy_sh
 
 
 Now lets test and verify how RepoOS to refactor Repo1's app.py search_monolith. I've already installed the requirements and set up the virtual environment. We'll run the following command to refactor the code:
-source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && pyhton ingest2.py Repo2 && python refactor2.py search_monolith "The API is a monolith that does several sub fuctions. Refactor the API to make them more modular and easier to maintain. Identify the different sub functions and break them into separate microservices. Ensure that the refactored code maintains the same functionality and performance as the original monolith."
+source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && pyhton ingest2.py Repo2 && python refactor2.py search_monolith "The API is a monolith that does several sub functions. Refactor the API to make them more modular and easier to maintain. Identify the different sub functions and break them into separate microservices. Ensure that the refactored code maintains the same functionality and performance as the original monolith."
+
+source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python refactor2.py search_monolith "First, modify hello_world endpoint to return a random uuid. The callers of /search endpoint must first call the hello_world endpoint to get a uuid and then calls the search endpoint with the uuid.Make sure to also update the callers of the /search endpoint to use the new uuid parameter."
+
+
+
+Tell me how this feature in repoOS is going to add value to existing AI engines like Claude code. Be very honest about this idea. Say RepoOS is a tool that can automatically refactor codebases to improve their structure, maintainability, and performance. The way it does is, it utilizes the neo4J graph to understand what and how to change. It then build detailed and smaller prompts and send to an engine like Calude to perform refactoring in smaller units. 
+After claude completes its step, RepoOS checks the results and continues to build the next promopts accordingly based on the refactoring progress. 
+We provide a software called Intent manager that does this job, say on a mac.
+The intent manager will have a local AI in-built that performs above actions.

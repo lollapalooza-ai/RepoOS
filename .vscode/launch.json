@@ -16,8 +16,8 @@
             "program": "${workspaceFolder}/refactor2.py",
             "console": "integratedTerminal",
             "args": [
-                "Car.start",
-                "Rename the start method to ignite_engine, and apply this change to all subclasses as well. Ensure all Python syntax and linting rules are followed strictly."
+                "search_monolith",
+                "First, modify hello_world endpoint to return a random uuid. The callers of /search endpoint must first call the hello_world endpoint to get a uuid and then calls the search endpoint with the uuid.Make sure to also update the callers of the /search endpoint to use the new uuid parameter."
             ]
         },
         {
