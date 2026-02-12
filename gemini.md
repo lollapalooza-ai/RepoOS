@@ -31,8 +31,31 @@ Only when "--blueprint" is passed, the AI should output the "plan" of changes it
     b. Background
     c. Justification
     d. Existing architecture
+        i. Visual representation of the existing system as shown down below.
     e. Proposed architecture
-        i. Pros of the new architecture
-        ii. Cons of the new architecture (including trade-offs)
+        i. Visual representation of the new system as shown down below.
+        ii. Pros of the new architecture
+        iii. Cons of the new architecture (including trade-offs)
     f. Test plan
         i. How it will be tested by the AI
+
+Visual representation of the system must be like:
+Eg: ➕ Function: _authenticate_user
+    ➕ Function: _fetch_data_from_secondary_service
+    ➕ Function: _log_search_query
+    ➕ Function: _apply_business_logic_and_filter
+    ➕ Function: _fetch_data_from_primary_db
+    ➕ Function: _format_results_for_display
+    ➕ Function: search_monolith
+    - Route: /search
+    ➡️ Calls: jsonify
+    ➡️ Calls: _fetch_data_from_primary_db
+    ➡️ Calls: jsonify
+    ➡️ Calls: _authenticate_user
+    ➡️ Calls: _log_search_query
+    ➡️ Calls: _fetch_data_from_secondary_service
+    ➡️ Calls: _apply_business_logic_and_filter
+    ➡️ Calls: _format_results_for_display
+    ➡️ Calls: jsonify
+➕ Function: hello_world
+    - Route: /
