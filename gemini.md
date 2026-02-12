@@ -23,3 +23,16 @@ Idea 1:
 There are 2 code repositories.
 Repo1 - exposes an API endpoint - Search. This Search API is a monolith that performs 100s of operations.
 Repo2 - calls the Search endpoint monolith.
+
+Blueprint validation:
+The blueprint output by repoOS AI must follow below rules.
+Only when "--blueprint" is passed, the AI should output the "plan" of changes it is going to implement, in order to complete the given instruction. It should first ask me for an approval before proceeding with the change. If a change is suggested, it should be able to update the blueprint (or plan). Below are the sections the blueprint must contain. Very strictly all of these details must be present. 
+    a. Introduction
+    b. Background
+    c. Justification
+    d. Existing architecture
+    e. Proposed architecture
+        i. Pros of the new architecture
+        ii. Cons of the new architecture (including trade-offs)
+    f. Test plan
+        i. How it will be tested by the AI

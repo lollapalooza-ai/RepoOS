@@ -504,7 +504,74 @@ def process_single_file_sync(filename, file_content, instruction, dependencies, 
     print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
     return None
 
-def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False):
+def generate_and_review_blueprint(target_name, instruction, context_map, approval_choice=None):
+    """
+    Generates a detailed blueprint for the refactoring task and asks for user approval.
+    """
+    print(f"\n{Colors.BOLD}📄 Generating Blueprint for '{target_name}'...{Colors.RESET}")
+
+    # Construct a detailed prompt for the blueprint
+    blueprint_prompt = f"""
+    You are a senior architect. Based on the user's instruction and the provided context, generate a detailed blueprint for refactoring. The blueprint must contain the following sections:
+
+    **a. Introduction:**
+    Briefly describe the purpose of this refactoring.
+
+    **b. Background:**
+    Explain the context of the requested change. What is the current state of the code and why does it need to be changed?
+
+    **c. Justification:**
+    Justify the need for this refactoring. What are the benefits of the proposed changes?
+
+    **d. Existing Architecture:**
+    Describe the current architecture of the relevant components. Include a summary of the files and their roles.
+
+    **e. Proposed Architecture:**
+    Describe the new architecture after the refactoring. Explain how the changes will be implemented.
+        **i. Pros of the new architecture:**
+        List the advantages of the new design.
+        **ii. Cons of the new architecture (including trade-offs):**
+        List the disadvantages and trade-offs of the new design.
+
+    **f. Test Plan:**
+        **i. How it will be tested by the AI:**
+        Describe the steps the AI will take to.
+    
+    **User Instruction:**
+    {instruction}
+
+    **Affected Files and Items:**
+    """
+    for file_path, items in context_map.items():
+        blueprint_prompt += f"- {file_path}: {', '.join(items)}\n"
+
+    # Call the LLM to generate the blueprint
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {'role': 'system', 'content': "You are a senior architect generating a refactoring blueprint."},
+            {'role': 'user', 'content': blueprint_prompt}
+        ],
+        options={'temperature': 0.3}
+    )
+
+    blueprint = response['message']['content']
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}--- BLUEPRINT ---{Colors.RESET}")
+    print(blueprint)
+    print(f"{Colors.BOLD}{Colors.CYAN}-------------------{Colors.RESET}")
+
+    # Ask for approval
+    if approval_choice:
+        return approval_choice, blueprint
+
+    while True:
+        approval = input(f"\n{Colors.BOLD}Do you approve this blueprint? (y/n/u)pdate: {Colors.RESET}").lower()
+        if approval in ['y', 'n', 'u']:
+            return approval, blueprint
+        print("Invalid input. Please enter 'y', 'n', or 'u'.")
+
+def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False, blueprint=False, blueprint_approval=None):
     """
     The Sequential Manager.
     1. Analyze dependencies.
@@ -527,6 +594,20 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
     if error:
         print(f"❌ {error}")
         return
+
+    # Generate and review blueprint if requested
+    if blueprint:
+        approval, generated_blueprint = generate_and_review_blueprint(target_name, instruction, files_to_context, blueprint_approval)
+        if approval == 'n':
+            print("🛑 Blueprint rejected. Aborting refactoring.")
+            return
+        elif approval == 'u':
+            new_instruction = input("Please provide the updated instruction: ")
+            approval, generated_blueprint = generate_and_review_blueprint(target_name, new_instruction, files_to_context, blueprint_approval)
+            if approval != 'y':
+                print("🛑 Blueprint update rejected or aborted. Aborting refactoring.")
+                return
+            instruction = new_instruction
 
     # 2. FETCH MANDATORY TOOL CONTEXT
     tool_context = fetch_mandated_tools(constraints)
@@ -603,7 +684,9 @@ if __name__ == "__main__":
     arg_parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
     arg_parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
     arg_parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
+    arg_parser.add_argument("--blueprint", action="store_true", help="Generate a blueprint of the changes and ask for approval before applying them.")
+    arg_parser.add_argument("--blueprint-approval", choices=['y', 'n', 'u'], help="Approve the blueprint automatically.")
 
     args = arg_parser.parse_args()
 
-    orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes)
+    orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint, args.blueprint_approval)
