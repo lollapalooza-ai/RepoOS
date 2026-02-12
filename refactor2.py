@@ -3,12 +3,49 @@ import argparse # Import argparse
 import os
 import sys
 import json
+import re # Import re for regular expressions
 import time # Import time for sequential processing
 import ollama
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from validator import validate_code # Import the validator
+
+def _repair_llm_json_string(malformed_json_str):
+    """
+    Repairs common LLM JSON output issues by removing newlines outside of
+    JSON string values and escaping python's multi-line comments.
+    """
+    # Heuristically escape python multi-line comments.
+    # This is done first as it's a common source of unescaped quotes.
+    s = malformed_json_str.replace('"""', '\\"\\"\\"')
+    s = s.replace("'''", "\\'\\'\\'")
+
+    repaired = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        char = s[i]
+
+        if char == '\\':
+            # It's an escape sequence, append it and the next char
+            repaired.append(char)
+            if i + 1 < len(s):
+                repaired.append(s[i+1])
+            i += 2
+            continue
+
+        if char == '"':
+            in_string = not in_string
+
+        if not in_string and char in '\n\r':
+            i += 1
+            continue
+
+        repaired.append(char)
+        i += 1
+
+    return "".join(repaired)
 
 # --- ANSI COLORS ---
 class Colors:
@@ -364,6 +401,54 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
     return None
 
+def _parse_and_validate_response(response, filename, attempt):
+    """
+    Parses the JSON response from the LLM, validates the code, and returns the new code if valid.
+    """
+    try:
+        raw_llm_response_content = response['message']['content'].strip()
+        # Attempt to strip markdown code block wrappers
+        if raw_llm_response_content.startswith("```json"):
+            raw_llm_response_content = raw_llm_response_content[len("```json"):].strip()
+            if raw_llm_response_content.endswith("```"):
+                raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
+        elif raw_llm_response_content.startswith("```"): # Generic markdown
+            raw_llm_response_content = raw_llm_response_content[len("```"):].strip()
+            if raw_llm_response_content.endswith("```"):
+                raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
+        # response['message']['content'] = response['message']['content'].replace("```json\n?|```/g, ''")
+
+        # Attempt to repair common LLM JSON errors before parsing
+        repaired_llm_response_content = _repair_llm_json_string(raw_llm_response_content)
+
+        response_json = json.loads(repaired_llm_response_content)
+        plan_report = response_json.get('plan_report', 'No report generated.')
+        file_changes = response_json.get('file_changes', {})
+
+        new_code = file_changes.get(filename)
+        
+        if new_code:
+            errors = validate_code(new_code)
+            if not errors:
+                print(f"   ✅ Finished: {filename}")
+                print(f"   📋 Plan Report for {filename}: {plan_report}")
+                return new_code
+            else:
+                print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
+                # In a real app, you'd feed the error back to the LLM here
+        else:
+            print(f"   ❌ No changes returned for {filename} in file_changes (Attempt {attempt+1}).")
+
+    except json.JSONDecodeError:
+        print(f"   ❌ Attempt {attempt + 1} failed: AI output invalid JSON.")
+        print(f"   Raw LLM Response (Attempt {attempt + 1}):\n{response['message']['content']}")
+        # For self-correction, append feedback to the next user message,
+        # but for this retry loop, we just log and continue.
+    except Exception as e:
+        print(f"   An unexpected error occurred during processing LLM response (Attempt {attempt+1}): {e}")
+    
+    return None
+
 def process_single_file_sync(filename, file_content, instruction, dependencies, constraints, tool_context):
     """
     Synchronous Worker. Refactors ONE file and returns the result.
@@ -412,44 +497,9 @@ def process_single_file_sync(filename, file_content, instruction, dependencies, 
             options={'temperature': 0.1} # Low temp for precision
         )
         
-        # Parse the JSON response
-        try:
-            raw_llm_response_content = response['message']['content'].strip()
-            # Attempt to strip markdown code block wrappers
-            if raw_llm_response_content.startswith("```json"):
-                raw_llm_response_content = raw_llm_response_content[len("```json"):].strip()
-                if raw_llm_response_content.endswith("```"):
-                    raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
-            elif raw_llm_response_content.startswith("```"): # Generic markdown
-                raw_llm_response_content = raw_llm_response_content[len("```"):].strip()
-                if raw_llm_response_content.endswith("```"):
-                    raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
-
-            response_json = json.loads(raw_llm_response_content)
-            plan_report = response_json.get('plan_report', 'No report generated.')
-            file_changes = response_json.get('file_changes', {})
-
-            new_code = file_changes.get(filename)
-            
-            if new_code:
-                errors = validate_code(new_code)
-                if not errors:
-                    print(f"   ✅ Finished: {filename}")
-                    print(f"   📋 Plan Report for {filename}: {plan_report}")
-                    return new_code
-                else:
-                    print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
-                    # In a real app, you'd feed the error back to the LLM here
-            else:
-                print(f"   ❌ No changes returned for {filename} in file_changes (Attempt {attempt+1}).")
-
-        except json.JSONDecodeError:
-            print(f"   ❌ Attempt {attempt + 1} failed: AI output invalid JSON.")
-            print(f"   Raw LLM Response (Attempt {attempt + 1}):\n{response['message']['content']}")
-            # For self-correction, append feedback to the next user message,
-            # but for this retry loop, we just log and continue.
-        except Exception as e:
-            print(f"   An unexpected error occurred during processing LLM response (Attempt {attempt+1}): {e}")
+        new_code = _parse_and_validate_response(response, filename, attempt + 1)
+        if new_code:
+            return new_code
 
     print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
     return None
