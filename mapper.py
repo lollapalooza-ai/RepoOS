@@ -131,13 +131,59 @@ def render_ascii_subway_map(journey_json):
             print(f"    └── Issue: {station['risk_reason']}")
         print(f"    └── Code: {', '.join(station['functions'][:3])}...")
 
+
+def render_mermaid(data):
+    """
+    Generates a Mermaid.js definition for the subway map.
+    """
+    print(f"\n🌊 MERMAID JS CODE ({data['journey_name']})")
+    print("Copy the block below into Mermaid Live Editor or a Markdown file:\n")
+    
+    mermaid_lines = ["graph LR"]
+    
+    # Define Styles
+    mermaid_lines.append("    classDef safe fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px;")
+    mermaid_lines.append("    classDef risk fill:#ffcdd2,stroke:#c62828,stroke-width:4px;")
+    
+    # Generate Nodes
+    ids = []
+    for i, station in enumerate(data['stations']):
+        node_id = f"S{i+1}"
+        ids.append(node_id)
+        
+        # Icon logic
+        icon = "✅" if station['status'] == "OK" else "⚠️"
+        clean_name = station['name'].replace('"', "'") # Escape quotes
+        
+        # Apply class based on status
+        style_class = "safe" if station['status'] == "OK" else "risk"
+        
+        line = f'    {node_id}("{icon} {clean_name}"):::{style_class}'
+        mermaid_lines.append(line)
+        
+        # Optional: Add click events or tooltips if using in a web app
+        # mermaid_lines.append(f'    click {node_id} "Functions: {", ".join(station["functions"])}" "Tooltip"')
+
+    # Generate Connections
+    # S1 --> S2 --> S3
+    if len(ids) > 1:
+        connection_str = " --> ".join(ids)
+        mermaid_lines.append(f"    {connection_str}")
+
+    print("\n".join(mermaid_lines))
+    print("\n" + "="*40)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python mapper.py <route_path>")
+        print("Usage: python mapper.py <route_path> [--mermaid]")
         print("Example: python mapper.py /checkout")
         sys.exit(1)
 
     route = sys.argv[1]
+    render_format = 'ascii'
+    if len(sys.argv) > 2 and sys.argv[2] == '--mermaid':
+        render_format = 'mermaid'
     
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
     
@@ -157,7 +203,10 @@ def main():
         journey_data = generate_subway_map(route, raw_trace_data)
 
         # 3. Visualize
-        render_ascii_subway_map(journey_data)
+        if render_format == 'mermaid':
+            render_mermaid(journey_data)
+        else:
+            render_ascii_subway_map(journey_data)
 
     finally:
         driver.close()
