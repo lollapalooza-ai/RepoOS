@@ -127,32 +127,52 @@ def create_vector_indexes():
         print(f"   ⚠️ Vector Index Warning: {e}")
 
 
+def calculate_complexity(source_code):
+    """
+    Simple heuristic: Count 'if', 'for', 'while', 'try' statements.
+    """
+    complexity = 0
+    keywords = ['if ', 'for ', 'while ', 'try:', 'except ', 'with ']
+    for word in keywords:
+        complexity += source_code.count(word)
+    return complexity
+
+
 def write_function_node(func_name, file_path, source_code, docstring, node_type='function'):
     """
-    Now includes 'Right Brain' vector generation.
-    We embed: Name + Docstring + First 200 chars of code (Context)
+    Now includes 'Right Brain' vector generation and complexity calculation.
+    We embed: Name + Docstring + First 500 chars of code (Context)
     """
     # 1. Generate the Semantic Fingerprint
-    # We combine name, docstring, and a bit of source for context
     text_representation = f"Function: {func_name}\nDocstring: {docstring}\nCode: {source_code[:500]}"
-    vector = embedder.encode(text_representation).tolist() # Convert numpy array to list
+    vector = embedder.encode(text_representation).tolist()
 
-    # 2. Write to Graph + Vector Store
+    # 2. Calculate Complexity
+    complexity_score = calculate_complexity(source_code)
+
+    # 3. Write to Graph + Vector Store
     query = """
     MERGE (f:Function {name: $name})
     ON CREATE SET 
         f.file = $file, 
         f.type = $node_type, 
         f.scanned = true,
-        f.embedding = $embedding  // <--- The Magic Sauce
+        f.embedding = $embedding,
+        f.complexity = $complexity
     ON MATCH SET 
         f.file = $file, 
         f.type = $node_type, 
         f.scanned = true,
-        f.embedding = $embedding
+        f.embedding = $embedding,
+        f.complexity = $complexity
     """
     with driver.session() as session:
-        session.run(query, name=func_name, file=file_path, node_type=node_type, embedding=vector)
+        session.run(query, 
+                    name=func_name, 
+                    file=file_path, 
+                    node_type=node_type, 
+                    embedding=vector, 
+                    complexity=complexity_score)
 
 def write_class_node(class_name, file_path):
     """
