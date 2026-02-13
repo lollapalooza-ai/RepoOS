@@ -604,48 +604,29 @@ def generate_and_review_blueprint(target_name, instruction, context_map, approva
 
     blueprint = response['message']['content']
     
-    # --- Colorize the Architectural Delta ---
-    output_lines = []
-    lines = blueprint.split('\n')
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Find the start of the delta section
-        if "Architectural Delta" in line:
-            output_lines.append(line)
-            i += 1
-            # Find the start of the code block
-            while i < len(lines) and "```" not in lines[i]:
-                output_lines.append(lines[i])
-                i += 1
-            
-            if i < len(lines): # We found the opening ```
-                output_lines.append(lines[i])
-                i += 1
-            
-            # Now we're inside the block, so color the lines
-            while i < len(lines) and "```" not in lines[i]:
-                delta_line = lines[i]
-                if delta_line.strip().startswith('+'):
-                    output_lines.append(f"{Colors.GREEN}{delta_line}{Colors.RESET}")
-                elif delta_line.strip().startswith('-'):
-                    output_lines.append(f"{Colors.RED}{delta_line}{Colors.RESET}")
-                elif delta_line.strip().startswith('~'):
-                    output_lines.append(f"{Colors.YELLOW}{delta_line}{Colors.RESET}")
-                else:
-                    output_lines.append(delta_line)
-                i += 1
-            
-            # We are at the closing ``` or end of file
-            if i < len(lines):
-                output_lines.append(lines[i]) # append the closing ```
-            i += 1
-            continue # continue to the main while loop
+    # --- Colorize the Architectural Delta using Regex ---
+    def repl(match):
+        colored_lines = []
+        # The content of the code block is in match.group(1)
+        for line in match.group(1).split('\n'):
+            if line.strip().startswith('+'):
+                colored_lines.append(f"{Colors.GREEN}{line}{Colors.RESET}")
+            elif line.strip().startswith('-'):
+                colored_lines.append(f"{Colors.RED}{line}{Colors.RESET}")
+            elif line.strip().startswith('~'):
+                colored_lines.append(f"{Colors.YELLOW}{line}{Colors.RESET}")
+            else:
+                colored_lines.append(line)
+        return "```" + "\n".join(colored_lines) + "```"
 
-        output_lines.append(line)
-        i += 1
-        
-    blueprint = "\n".join(output_lines)
+    # Find the "Architectural Delta" header and then apply the regex to the rest of the string
+    delta_header_pos = blueprint.find("**Architectural Delta:**")
+    if delta_header_pos != -1:
+        header_part = blueprint[:delta_header_pos]
+        delta_part = blueprint[delta_header_pos:]
+        # Apply the regex substitution only to the part of the blueprint after the header
+        colored_delta_part = re.sub(r"```(.*?)```", repl, delta_part, count=1, flags=re.DOTALL)
+        blueprint = header_part + colored_delta_part
     # --- END ---
 
     print(f"\n{Colors.BOLD}{Colors.CYAN}--- BLUEPRINT ---{Colors.RESET}")
@@ -779,5 +760,4 @@ if __name__ == "__main__":
     arg_parser.add_argument("--blueprint-approval", choices=['y', 'n', 'u'], help="Approve the blueprint automatically.")
 
     args = arg_parser.parse_args()
-
     orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint, args.blueprint_approval)
