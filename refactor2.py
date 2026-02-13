@@ -51,6 +51,7 @@ def _repair_llm_json_string(malformed_json_str):
 class Colors:
     RED = '\033[91m'
     GREEN = '\033[92m'
+    YELLOW = '\033[93m'
     CYAN = '\033[96m'
     RESET = '\033[0m'
     BOLD = '\033[1m'
@@ -504,11 +505,48 @@ def process_single_file_sync(filename, file_content, instruction, dependencies, 
     print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
     return None
 
+def get_visual_architecture(session, context_map):
+    """
+    Queries Neo4j to build a textual visualization of the architecture
+    based on the context map from get_blast_radius.
+    """
+    all_items = sorted(list(set(item for sublist in context_map.values() for item in sublist)))
+    viz_lines = []
+
+    for item_name in all_items:
+        # Get node info
+        node_result = session.run("MATCH (n {name: $name}) RETURN n.route as route", name=item_name).single()
+        if not node_result:
+            # Maybe it's a class or something without a file, skip for viz
+            continue
+
+        viz_lines.append(f"➕ Function: {item_name}")
+        if node_result['route']:
+            viz_lines.append(f"    - Route: {node_result['route']}")
+
+        # Get outgoing CALLS relationships
+        calls_result = session.run("MATCH ({name: $name})-[:CALLS]->(m) RETURN m.name as callee_name ORDER BY m.name", name=item_name)
+        for record in calls_result:
+            viz_lines.append(f"    ➡️ Calls: {record['callee_name']}")
+
+        # Get outgoing CALLS_API relationships
+        api_calls_result = session.run("MATCH ({name: $name})-[r:CALLS_API]->() RETURN r.endpoint as endpoint ORDER BY endpoint", name=item_name)
+        for record in api_calls_result:
+            viz_lines.append(f"    ⚡ Found and linked API Call: {item_name} -> {record['endpoint']}")
+
+    return "\n".join(viz_lines)
+
 def generate_and_review_blueprint(target_name, instruction, context_map, approval_choice=None):
     """
     Generates a detailed blueprint for the refactoring task and asks for user approval.
     """
     print(f"\n{Colors.BOLD}📄 Generating Blueprint for '{target_name}'...{Colors.RESET}")
+
+    # --- Generate Visual Architecture ---
+    existing_arch_viz = ""
+    with driver.session() as session:
+        existing_arch_viz = get_visual_architecture(session, context_map)
+    # --- END ---
 
     # Construct a detailed prompt for the blueprint
     blueprint_prompt = f"""
@@ -524,18 +562,27 @@ def generate_and_review_blueprint(target_name, instruction, context_map, approva
     Justify the need for this refactoring. What are the benefits of the proposed changes?
 
     **d. Existing Architecture:**
-    Describe the current architecture of the relevant components. Include a summary of the files and their roles.
+    This is the current state of the system.
+    **Visual representation of the existing system:**
+    ```
+    {existing_arch_viz}
+    ```
 
     **e. Proposed Architecture:**
-    Describe the new architecture after the refactoring. Explain how the changes will be implemented.
-        **i. Pros of the new architecture:**
-        List the advantages of the new design.
-        **ii. Cons of the new architecture (including trade-offs):**
-        List the disadvantages and trade-offs of the new design.
+    Describe the new architecture after the refactoring.
+    **Architectural Delta:**
+    Based on the existing architecture, generate a single "Architectural Delta" diagram showing ONLY the changes.
+    - Use a `+` prefix for new nodes or relationships (additions).
+    - Use a `-` prefix for removed nodes or relationships (deletions).
+    - Use a `~` prefix for modified nodes or relationships (modifications).
+    - Unchanged items MUST be omitted for brevity.
+    ```
+    [GENERATE DELTA HERE]
+    ```
 
     **f. Test Plan:**
         **i. How it will be tested by the AI:**
-        Describe the steps the AI will take to.
+        Describe the steps the AI will take to test the changes.
     
     **User Instruction:**
     {instruction}
@@ -556,6 +603,50 @@ def generate_and_review_blueprint(target_name, instruction, context_map, approva
     )
 
     blueprint = response['message']['content']
+    
+    # --- Colorize the Architectural Delta ---
+    output_lines = []
+    lines = blueprint.split('\n')
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Find the start of the delta section
+        if "Architectural Delta" in line:
+            output_lines.append(line)
+            i += 1
+            # Find the start of the code block
+            while i < len(lines) and "```" not in lines[i]:
+                output_lines.append(lines[i])
+                i += 1
+            
+            if i < len(lines): # We found the opening ```
+                output_lines.append(lines[i])
+                i += 1
+            
+            # Now we're inside the block, so color the lines
+            while i < len(lines) and "```" not in lines[i]:
+                delta_line = lines[i]
+                if delta_line.strip().startswith('+'):
+                    output_lines.append(f"{Colors.GREEN}{delta_line}{Colors.RESET}")
+                elif delta_line.strip().startswith('-'):
+                    output_lines.append(f"{Colors.RED}{delta_line}{Colors.RESET}")
+                elif delta_line.strip().startswith('~'):
+                    output_lines.append(f"{Colors.YELLOW}{delta_line}{Colors.RESET}")
+                else:
+                    output_lines.append(delta_line)
+                i += 1
+            
+            # We are at the closing ``` or end of file
+            if i < len(lines):
+                output_lines.append(lines[i]) # append the closing ```
+            i += 1
+            continue # continue to the main while loop
+
+        output_lines.append(line)
+        i += 1
+        
+    blueprint = "\n".join(output_lines)
+    # --- END ---
 
     print(f"\n{Colors.BOLD}{Colors.CYAN}--- BLUEPRINT ---{Colors.RESET}")
     print(blueprint)
@@ -656,7 +747,7 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
             should_apply = auto_confirm
             if not auto_confirm:
                 confirm = input(f"\n{Colors.BOLD}Apply changes to {filename}? (y/n): {Colors.RESET}")
-                if confirm.lower() == 'y':
+                if confirm.lower().strip() == 'y':
                     should_apply = True
                 else:
                     should_apply = False

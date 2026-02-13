@@ -33,7 +33,7 @@ Only when "--blueprint" is passed, the AI should output the "plan" of changes it
     d. Existing architecture
         i. Visual representation of the existing system as shown down below.
     e. Proposed architecture
-        i. Visual representation of the new system as shown down below.
+        i. Visual representation of the new system (showing the architecture delta) as shown down below.
         ii. Pros of the new architecture
         iii. Cons of the new architecture (including trade-offs)
     f. Test plan
