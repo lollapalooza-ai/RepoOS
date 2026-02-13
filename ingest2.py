@@ -5,6 +5,7 @@ import builtins
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
+from sentence_transformers import SentenceTransformer
 
 # --- CONFIGURATION ---
 NEO4J_URI = "bolt://localhost:7687"
@@ -13,6 +14,11 @@ NEO4J_AUTH = ("neo4j", "password")
 # Initialize "Right Brain" (Parser)
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
+
+# Initialize "Right Brain" (Embedding Model)
+print("🧠 Loading Embedding Model (Local M4 Optimized)...")
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+EMBEDDING_DIM = 384  # Dimension for MiniLM
 
 # Initialize "Left Brain" (Graph DB)
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
@@ -90,19 +96,63 @@ CALL_QUERY = PY_LANGUAGE.query("""
 ) @call
 """)
 
-def write_function_node(func_name, file_path, node_type='function'):
+def create_vector_indexes():
     """
-    Creates or Updates a function/method node.
-    'ON MATCH' handles the case where the node was created
-    as a 'Ghost' dependency by another file earlier.
+    Creates the Vector Index in Neo4j (v5.x+ Syntax).
+    Allows us to query: "Find code related to 'payment retry logic'"
     """
+    query_func = """
+    CREATE VECTOR INDEX `function_embeddings` IF NOT EXISTS
+    FOR (n:Function) ON (n.embedding)
+    OPTIONS {indexConfig: {
+      `vector.dimensions`: 384,
+      `vector.similarity_function`: 'cosine'
+    }}
+    """
+    # Optional: Index Classes too if needed
+    query_class = """
+    CREATE VECTOR INDEX `class_embeddings` IF NOT EXISTS
+    FOR (n:Class) ON (n.embedding)
+    OPTIONS {indexConfig: {
+      `vector.dimensions`: 384,
+      `vector.similarity_function`: 'cosine'
+    }}
+    """
+    try:
+        with driver.session() as session:
+            session.run(query_func)
+            session.run(query_class)
+        print("   ✅ Vector Indexes Configured.")
+    except Exception as e:
+        print(f"   ⚠️ Vector Index Warning: {e}")
+
+
+def write_function_node(func_name, file_path, source_code, docstring, node_type='function'):
+    """
+    Now includes 'Right Brain' vector generation.
+    We embed: Name + Docstring + First 200 chars of code (Context)
+    """
+    # 1. Generate the Semantic Fingerprint
+    # We combine name, docstring, and a bit of source for context
+    text_representation = f"Function: {func_name}\nDocstring: {docstring}\nCode: {source_code[:500]}"
+    vector = embedder.encode(text_representation).tolist() # Convert numpy array to list
+
+    # 2. Write to Graph + Vector Store
     query = """
     MERGE (f:Function {name: $name})
-    ON CREATE SET f.file = $file, f.type = $node_type, f.scanned = true
-    ON MATCH SET f.file = $file, f.type = $node_type, f.scanned = true
+    ON CREATE SET 
+        f.file = $file, 
+        f.type = $node_type, 
+        f.scanned = true,
+        f.embedding = $embedding  // <--- The Magic Sauce
+    ON MATCH SET 
+        f.file = $file, 
+        f.type = $node_type, 
+        f.scanned = true,
+        f.embedding = $embedding
     """
     with driver.session() as session:
-        session.run(query, name=func_name, file=file_path, node_type=node_type)
+        session.run(query, name=func_name, file=file_path, node_type=node_type, embedding=vector)
 
 def write_class_node(class_name, file_path):
     """
@@ -384,7 +434,18 @@ def process_file(file_path):
                     full_method_name = f"{class_name}.{method_name}" # e.g., MyClass.my_method
                     method_def_node = method_node.parent
                     method_source_code = source_code[method_def_node.start_byte:method_def_node.end_byte]
-                    write_function_node(full_method_name, file_path, node_type='method')
+                    
+                    # EXTRACT DOCSTRING (Simple Regex or Tree-sitter check)
+                    docstring = ""
+                    if method_def_node.child_count > 0:
+                        # Simple heuristic: Check if first statement is a string expression
+                        body_node = method_def_node.child_by_field_name('body')
+                        if body_node and body_node.child_count > 0:
+                            first_child = body_node.children[0]
+                            if first_child.type == 'expression_statement' and first_child.children[0].type == 'string':
+                                docstring = source_code[first_child.start_byte:first_child.end_byte]
+
+                    write_function_node(full_method_name, file_path, method_source_code, docstring, node_type='method')
                     create_has_method_relationship(class_name, full_method_name)
                     print(f"      - Method: {full_method_name}")
 
@@ -425,9 +486,20 @@ def process_file(file_path):
             
             func_def_node = node.parent
             func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
-            # Claim this function in the graph
-            write_function_node(func_name, file_path, node_type='function')
-            print(f"   ➕ Function: {func_name}")
+            
+            # EXTRACT DOCSTRING (Simple Regex or Tree-sitter check)
+            docstring = ""
+            if func_def_node.child_count > 0:
+                # Simple heuristic: Check if first statement is a string expression
+                body_node = func_def_node.child_by_field_name('body')
+                if body_node and body_node.child_count > 0:
+                    first_child = body_node.children[0]
+                    if first_child.type == 'expression_statement' and first_child.children[0].type == 'string':
+                        docstring = source_code[first_child.start_byte:first_child.end_byte]
+
+            # Call the new Write Function
+            write_function_node(func_name, file_path, func_source_code, docstring, node_type='function')
+            print(f"   ➕ Function (with Vector): {func_name}")
 
             # Check for @app.route decorator
             if func_def_node.prev_sibling and func_def_node.prev_sibling.type == 'decorator':
@@ -492,6 +564,7 @@ if __name__ == "__main__":
         print("Usage: python ingest.py <path_to_repo>")
     else:
         target_folder = sys.argv[1]
+        create_vector_indexes()
         ingest_folder(target_folder)
         driver.close()
         sys.exit(0)

@@ -10,6 +10,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from validator import validate_code # Import the validator
+from sentence_transformers import SentenceTransformer
 
 def _repair_llm_json_string(malformed_json_str):
     """
@@ -37,12 +38,16 @@ def _repair_llm_json_string(malformed_json_str):
 
         if char == '"':
             in_string = not in_string
-
-        if not in_string and char in '\n\r':
-            i += 1
-            continue
-
-        repaired.append(char)
+            repaired.append(char)
+        elif in_string and char == '\n': # Found a literal newline inside a string
+            repaired.append('\\n')
+        elif in_string and char == '\r': # Found a literal carriage return inside a string
+            repaired.append('\\r')
+        elif not in_string and char in '\n\r':
+            # Newline outside string, skip it
+            pass
+        else:
+            repaired.append(char)
         i += 1
 
     return "".join(repaired)
@@ -122,58 +127,92 @@ MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
 MODEL_NAME_FOR_CONSTRAINTS = MODEL_NAME # Using the main model name for consistency
 MAX_RETRIES = 3 # Max attempts for the self-healing loop
 
+print("🧠 Loading Embedding Model...")
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 
-def get_blast_radius(target_name):
+def get_hybrid_context(instruction, explicit_target=None):
     """
-    Fetches the 'Center' node and everything connected to it using a more
-    sophisticated graph traversal query.
+    Hybrid RAG Strategy:
+    1. VECTOR (Anchor): Find code semantically related to the 'instruction'.
+    2. GRAPH (Traverse): Find dependencies (callers/callees) of those anchors.
     """
-    print(f"📡 Calculating Blast Radius for '{target_name}'...")
-
-    # This query is more sophisticated. It finds:
-    # 1. The target itself.
-    # 2. Upstream callers.
-    # 3. The parent class of the target method.
-    # 4. All subclasses of the parent class (to find overriding methods).
-    # 5. Downstream callees for context.
-    query = """
-    MATCH (target {name: $name})
-
-    // Find direct callers of the target
-    OPTIONAL MATCH (caller)-[:CALLS]->(target)
-
-    // Find the parent class and any subclasses
-    OPTIONAL MATCH (parent_class)-[:HAS_METHOD]->(target)
-    OPTIONAL MATCH (subclass)-[:IMPLEMENTS*]->(parent_class)
-
-    // Find downstream dependencies for context
-    OPTIONAL MATCH (target)-[:CALLS]->(downstream)
-
-    // Collect all unique nodes that have a file path
-    WITH collect(DISTINCT target) + collect(DISTINCT caller) + collect(DISTINCT subclass) + collect(DISTINCT downstream) as nodes
-    UNWIND nodes as n
-    WITH n WHERE n.file IS NOT NULL
-    RETURN n.file as file_path, collect(DISTINCT n.name) as relevant_items
-    """
+    print(f"📡  Hybrid RAG: Scanning Graph for intent: '{instruction[:50]}...'")
+    
+    # 1. Generate Embedding for the User's Instruction
+    query_vector = embedder.encode(instruction).tolist()
     
     context_map = {}
+    
+    # 2. Vector Search (Find the "Anchors")
+    # We find the top 5 functions that match the *meaning* of the prompt
+    vector_query = """
+    CALL db.index.vector.queryNodes('function_embeddings', 5, $embedding)
+    YIELD node AS anchor, score
+    WHERE score > 0.65  // Threshold to reduce noise
+    RETURN anchor.name, anchor.file, score
+    """
+    
+    anchors = []
     with driver.session() as session:
-        result = session.run(query, name=target_name)
+        result = session.run(vector_query, embedding=query_vector)
         for record in result:
-            file_path = record["file_path"]
-            items = record["relevant_items"]
-            if file_path not in context_map:
-                context_map[file_path] = []
-            for item in items:
-                if item not in context_map[file_path]:
-                    context_map[file_path].append(item)
-        
-    if not context_map:
-        return None, "Target not found or has no file associations in Graph."
-        
+            print(f"   ⚓ Found Anchor: {record['anchor.name']} (Score: {record['score']:.2f})")
+            anchors.append(record['anchor.name'])
+            
+            # Add Anchor to Context Map
+            file_path = record['anchor.file']
+            if file_path:
+                if file_path not in context_map: context_map[file_path] = []
+                if record['anchor.name'] not in context_map[file_path]:
+                    context_map[file_path].append(record['anchor.name'])
+
+    # If the user gave an explicit target (e.g. "search_monolith"), add that too
+    if explicit_target and explicit_target != "auto":
+        anchors.append(explicit_target)
+
+    if not anchors:
+        return None, "No relevant code found for this instruction. Try being more specific."
+
+    # 3. Graph Traversal (The "Blast Radius")
+    # Now we find what these anchors touch (Callers, Callees, Tables)
+    graph_query = """
+    MATCH (anchor:Function)
+    WHERE anchor.name IN $anchors
+    
+    // Find Callers (Who calls these functions? - Critical for your "update callers" request)
+    OPTIONAL MATCH (caller)-[:CALLS]->(anchor)
+    
+    // Find Callees (What do they call?)
+    OPTIONAL MATCH (anchor)-[:CALLS]->(callee)
+    
+    // Find Infrastructure (SQL Tables, API Endpoints they touch)
+    OPTIONAL MATCH (anchor)-[:TOUCHES]->(infra)
+    
+    RETURN 
+        anchor.file as anchor_file,
+        caller.file as caller_file, caller.name as caller_name,
+        callee.file as callee_file, callee.name as callee_name
+    """
+    
+    with driver.session() as session:
+        result = session.run(graph_query, anchors=anchors)
+        for record in result:
+            # Add Callers to Context
+            if record['caller_file']:
+                if record['caller_file'] not in context_map: context_map[record['caller_file']] = []
+                if record['caller_name'] not in context_map[record['caller_file']]:
+                    context_map[record['caller_file']].append(record['caller_name'])
+                    
+            # Add Callees to Context
+            if record['callee_file']:
+                if record['callee_file'] not in context_map: context_map[record['callee_file']] = []
+                if record['callee_name'] not in context_map[record['callee_file']]:
+                    context_map[record['callee_file']].append(record['callee_name'])
+
     return context_map, None
 
 def fetch_mandated_tools(constraints):
@@ -662,7 +701,7 @@ def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False
         print(f"🔒 Constraints Detected: Architectural notes: {constraints['architectural_notes']}")
 
     # 2. Get the Blast Radius
-    files_to_context, error = get_blast_radius(target_name)
+    files_to_context, error = get_hybrid_context(instruction, explicit_target=target_name)
     if error:
         print(f"❌ {error}")
         return
