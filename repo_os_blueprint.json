@@ -1,0 +1,126 @@
+{                                                                     
+  "type": "doc",                                                      
+  "content": [                                                        
+    {                                                                 
+      "type": "heading",                                              
+      "attrs": {                                                      
+        "level": 1                                                    
+      },                                                              
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Refactor hello_world and search_monolith Endpoints"
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "paragraph",                                            
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "The current implementation of the /hello_world and /search endpoints needs to be refactored. The /hello_world endpoint will now return a random UUID, which must be used by the /search endpoint."
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "taskItem",                                             
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Modify the "                                       
+        },                                                            
+        {                                                             
+          "type": "mention",                                          
+          "attrs": {                                                  
+            "id": "hello_world",                                      
+            "label": "hello_world"                                    
+          }                                                           
+        },                                                            
+        {                                                             
+          "type": "text",                                             
+          "text": " function to return a random UUID instead of its current implementation."                                                                                                              
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "taskItem",                                             
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Update the "                                       
+        },                                                            
+        {                                                             
+          "type": "mention",                                          
+          "attrs": {                                                  
+            "id": "call_hello_world_api",                             
+            "label": "call_hello_world_api"                           
+          }                                                           
+        },                                                            
+        {                                                             
+          "type": "text",                                             
+          "text": " function in Repo2/client.py to store and return the UUID received from the /hello_world endpoint."                                                                                    
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "taskItem",                                             
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Modify the "                                       
+        },                                                            
+        {                                                             
+          "type": "mention",                                          
+          "attrs": {                                                  
+            "id": "call_search_api",                                  
+            "label": "call_search_api"                                
+          }                                                           
+        },                                                            
+        {                                                             
+          "type": "text",                                             
+          "text": " function in Repo2/client.py to include the UUID obtained from the /hello_world endpoint as a parameter when calling the /search endpoint."                                            
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "taskItem",                                             
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Update the "                                       
+        },                                                            
+        {                                                             
+          "type": "mention",                                          
+          "attrs": {                                                  
+            "id": "search_monolith",                                  
+            "label": "search_monolith"                                
+          }                                                           
+        },                                                            
+        {                                                             
+          "type": "text",                                             
+          "text": " function in Repo1/app.py to accept a UUID as a parameter."                                                                                                                            
+        }                                                             
+      ]                                                               
+    },                                                                
+    {                                                                 
+      "type": "taskItem",                                             
+      "content": [                                                    
+        {                                                             
+          "type": "text",                                             
+          "text": "Ensure that the "                                  
+        },                                                            
+        {                                                             
+          "type": "mention",                                          
+          "attrs": {                                                  
+            "id": "search_monolith",                                  
+            "label": "search_monolith"                                
+          }                                                           
+        },                                                            
+        {                                                             
+          "type": "text",                                             
+          "text": " function uses the provided UUID for any necessary logic or validation."                                                                                                               
+        }                                                             
+      ]                                                               
+    }                                                                 
+  ]                                                                   
+}

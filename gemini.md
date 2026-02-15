@@ -24,38 +24,31 @@ There are 2 code repositories.
 Repo1 - exposes an API endpoint - Search. This Search API is a monolith that performs 100s of operations.
 Repo2 - calls the Search endpoint monolith.
 
-Blueprint validation:
-The blueprint output by repoOS AI must follow below rules.
-Only when "--blueprint" is passed, the AI should output the "plan" of changes it is going to implement, in order to complete the given instruction. It should first ask me for an approval before proceeding with the change. If a change is suggested, it should be able to update the blueprint (or plan). Below are the sections the blueprint must contain. Very strictly all of these details must be present. 
-    a. Introduction
-    b. Background
-    c. Justification
-    d. Existing architecture
-        i. Visual representation of the existing system as shown down below.
-    e. Proposed architecture
-        i. Visual representation of the new system (showing the architecture delta) as shown down below.
-        ii. Pros of the new architecture
-        iii. Cons of the new architecture (including trade-offs)
-    f. Test plan
-        i. How it will be tested by the AI
+## The Living Specification Engine
 
-Visual representation of the system must be like:
-Eg: ➕ Function: _authenticate_user
-    ➕ Function: _fetch_data_from_secondary_service
-    ➕ Function: _log_search_query
-    ➕ Function: _apply_business_logic_and_filter
-    ➕ Function: _fetch_data_from_primary_db
-    ➕ Function: _format_results_for_display
-    ➕ Function: search_monolith
-    - Route: /search
-    ➡️ Calls: jsonify
-    ➡️ Calls: _fetch_data_from_primary_db
-    ➡️ Calls: jsonify
-    ➡️ Calls: _authenticate_user
-    ➡️ Calls: _log_search_query
-    ➡️ Calls: _fetch_data_from_secondary_service
-    ➡️ Calls: _apply_business_logic_and_filter
-    ➡️ Calls: _format_results_for_display
-    ➡️ Calls: jsonify
-➕ Function: hello_world
-    - Route: /
+The refactoring process can now be driven by a "Living Specification", an interactive, structured document that replaces the old static blueprint. This engine transforms the blueprint from a "dead text file" into an "Active Specification" where every paragraph and task can be referenced, versioned, and executed by AI agents.
+
+### How it Works
+
+When you run `refactor2.py` with the `--blueprint` flag, the system initiates the following workflow:
+
+1.  **Context Analysis**: The system performs the usual Hybrid RAG to gather context from the codebase based on your instruction.
+2.  **Drafting the Specification**: An AI architect generates a draft of the "Living Specification" in a structured **JSON format**. This isn't a plain markdown file; it's a machine-readable document representing the plan as a tree of blocks (headings, paragraphs, and `taskItems`).
+3.  **User Review and Approval**: The generated JSON is printed to the console. You will be asked to approve it. This step simulates the collaborative review process that would happen in a UI-based editor. For the MVP, you can approve (`y`) or reject (`n`).
+4.  **Specification Compilation**: Once approved, the "Spec Compiler" (`compile_living_spec_to_prompts`) parses the JSON. It reads the context from paragraphs and identifies actionable tasks from `taskItem` blocks. It also resolves any `@mention` references to code assets, fetching their latest source code to include as context.
+5.  **Task-Driven Execution**: The compiler produces a list of precise, context-rich prompts. The orchestrator then executes these tasks *sequentially*. After each task, you will be shown the proposed code changes and asked for approval before they are applied to disk.
+6.  **Sequential Consistency**: As changes from each task are applied, the in-memory state of the files is updated. This ensures that the next task in the sequence operates on the latest version of the code, maintaining consistency throughout the refactoring process.
+
+### The "Living Specification" JSON Structure
+
+The core of the new engine is the Tiptap-style JSON document. Here's a brief overview of its structure:
+
+-   **`type: "doc"`**: The root of the document.
+-   **`content: []`**: An array of "blocks".
+    -   **`heading`**: For section titles.
+    -   **`paragraph`**: For descriptive text that provides global context to the AI agents.
+    -   **`taskItem`**: The most important block. It defines a single, executable refactoring step.
+        -   It can contain `text` for the instruction.
+        -   It can contain `mention` objects (e.g., `"type": "mention", "attrs": {"id": "my_function"}`). These are "Smart References" that the Spec Compiler resolves by fetching the corresponding code snippet, providing pin-point context for the task.
+
+This new architecture allows for more complex, multi-step refactoring tasks to be planned, reviewed, and executed with greater precision and control.

@@ -1,197 +1,317 @@
-Implement this requirement:
-To build the **"Subway Map" (User Journey View)**, we must bridge the gap between the *imperative call graph* you currently have in Neo4j (created by `ingest2.py`) and the *declarative business flow* a Product Manager understands.
+Now let us build a view for the blueprint we've created.
 
-Currently, `ingest2.py` gives us a "City Map" (every building and street). The PM needs a "Transit Map" (just the major stops).
+We will use **React (Vite)** for the frontend and **FastAPI** as the lightweight bridge between your existing Python logic (`refactor2.py`) and the UI. This separation of concerns is critical for scalability.
 
-Here is the architectural strategy and implementation plan to build the **Subway Map Generator** using your existing stack.
+### **Phase 1: The Architecture**
 
----
-
-### **1. The Architecture: The "Journey Mapper" Pipeline**
-
-We cannot rely solely on static analysis to define "stations" because code doesn't always look like a business process. We will use a **Hybrid Approach**: Graph Traversal for structure + AI for semantic labeling.
-
-**The 3-Step Pipeline:**
-
-1. 
-**Anchor Identification:** Find the entry points (already captured as `route` in `ingest2.py` ).
-
-
-2. **Trace Extraction:** Traverse the graph from the Anchor to find the "Blast Radius" of execution.
-3. **Semantic Compression (The "Station" Logic):** Use the LLM (via `refactor2.py` patterns) to compress 50 function calls into 5-7 distinct "Stations."
+* **Backend (Python/FastAPI):** Your AI generates the Blueprint JSON and serves it via a REST API.
+* **Frontend (React/Tiptap):** Consumes the JSON, renders the "Google Doc" interface, and sends edits back to the backend.
 
 ---
 
-### **2. Implementation: The `mapper.py` Module**
+### **Phase 2: Step-by-Step Implementation**
 
-We use the module, `mapper.py`. This module will interface with Neo4j and Ollama.
+#### **Step 1: Set up the Project Structure**
 
-#### **Step A: Extract the Raw Trace (Graph Layer) (Ignore if mapper.py already has this)**
+We will create a monorepo-style structure to keep your Python and JS clean.
 
-We need a Cypher query that starts at a user-facing route (e.g., `/checkout`) and grabs the downstream flow.
-
-*Add this function to your interaction layer:*
-
-```python
-def get_trace_for_route(driver, route_path):
-    """
-    Retrieves the execution trace starting from a specific API route.
-    Returns a subgraph of functions called within 3 hops (depth).
-    """
-    query = """
-    MATCH (start:Function) WHERE start.route = $route
-    // Find outbound calls up to 3 levels deep to limit noise
-    CALL apoc.path.subgraphAll(start, {
-        relationshipFilter: "CALLS>",
-        minLevel: 0,
-        maxLevel: 3
-    })
-    YIELD nodes, relationships
-    RETURN nodes, relationships
-    """
-    # Note: If APOC is not available, we can use standard variable-length paths:
-    # MATCH path = (start:Function {route: $route})-[:CALLS*1..3]->(end)
-    # RETURN path
-    
-    with driver.session() as session:
-        result = session.run(query, route=route_path)
-        return result.data()
+```bash
+mkdir backend frontend
 
 ```
 
-#### **Step B: The "Station" Agent (AI Layer) (Ignore if mapper.py already has this)**
+#### **Step 2: The Backend (Python + FastAPI)**
 
-This is the core differentiator. We will feed the raw list of functions to the LLM and ask it to "group and label" them into stations.
+We need a tiny server to "host" the blueprint so the frontend can fetch it.
 
-*Prompt Strategy:*
-We don't want code; we want a JSON object representing the map.
+1. **Install FastAPI:**
+```bash
+cd backend
+pip install fastapi uvicorn
 
+```
+
+
+2. **Create `server.py`:**
+This script acts as the API. It mocks the AI generation for now but is ready to import your `refactor2.py` logic later.
 ```python
-def generate_subway_map(route, raw_trace_data):
-    """
-    Uses the LLM to convert a list of function names into a User Journey.
-    """
-    # 1. Flatten the graph data into a text list for the prompt
-    function_list = [n['name'] for n in raw_trace_data['nodes']]
-    
-    system_prompt = """
-    You are a Product Manager visualizing a legacy codebase.
-    Your goal is to convert a raw list of Python function calls into a high-level "Subway Map" User Journey.
-    
-    RULES:
-    1. Group related functions into "Stations" (e.g., 'validate_email', 'check_password' -> 'Login Station').
-    2. The map must be linear or slightly branching (max 5-7 stations).
-    3. Identify "Friction Points": If a function implies complexity (e.g., 'retry_payment', 'handle_error'), flag the station as 'At Risk'.
-    
-    Output JSON format:
-    {
-      "journey_name": "Checkout Flow",
-      "stations": [
-        {"name": "Cart Review", "functions": ["get_cart", "calc_total"], "status": "OK"},
-        {"name": "Payment", "functions": ["stripe_charge", "retry_logic"], "status": "RISK", "risk_reason": "Heavy retry logic detected"}
-      ]
+# backend/server.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, Any
+
+app = FastAPI()
+
+# Allow React to talk to Python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], # Vite's default port
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 1. The Data Structure (Tiptap Schema)
+# This is what your AI must generate.
+MOCK_BLUEPRINT = {
+    "type": "doc",
+    "content": [
+        {
+            "type": "heading",
+            "attrs": { "level": 1 },
+            "content": [{ "type": "text", "text": "Repo OS: Auth Refactor Plan" }]
+        },
+        {
+            "type": "paragraph",
+            "content": [{ "type": "text", "text": "The objective is to replace the legacy MD5 hashing with Auth0." }]
+        },
+        {
+            "type": "taskList", 
+            "content": [
+                {
+                    "type": "taskItem",
+                    "attrs": { "checked": False },
+                    "content": [{ "type": "text", "text": "Install Auth0 SDK" }]
+                },
+                {
+                    "type": "taskItem",
+                    "attrs": { "checked": False },
+                    "content": [{ "type": "text", "text": "Migrate User Table" }]
+                }
+            ]
+        }
+    ]
+}
+
+class BlueprintRequest(BaseModel):
+    content: Dict[str, Any]
+
+@app.get("/blueprint")
+def get_blueprint():
+    # In the future: return refactor2.generate_blueprint_json()
+    return MOCK_BLUEPRINT
+
+@app.post("/save")
+def save_blueprint(data: BlueprintRequest):
+    print("Received updated blueprint from User!")
+    # In the future: save to Neo4j or trigger the coding agent
+    return {"status": "success"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+```
+
+
+3. **Run the Server:**
+```bash
+python server.py
+
+```
+
+
+*Leave this terminal open.*
+
+---
+
+#### **Step 3: The Frontend (React + Tiptap)**
+
+Now, let's build the editor.
+
+1. **Initialize Vite (in a new terminal):**
+```bash
+cd ../frontend
+npm create vite@latest . -- --template react
+npm install
+
+```
+
+
+2. **Install Tiptap Dependencies:**
+We need the core editor, the starter kit (paragraphs, headers), and the task list extension.
+```bash
+npm install @tiptap/react @tiptap/starter-kit @tiptap/extension-task-list @tiptap/extension-task-item axios
+
+```
+
+
+3. **Create the Editor Component (`src/BlueprintEditor.jsx`):**
+This component fetches the JSON from Python and renders it.
+```jsx
+// src/BlueprintEditor.jsx
+import React, { useEffect, useState } from 'react'
+import { useEditor, EditorContent } from '@tiptap/react'
+import StarterKit from '@tiptap/starter-kit'
+import TaskList from '@tiptap/extension-task-list'
+import TaskItem from '@tiptap/extension-task-item'
+import axios from 'axios'
+
+const BlueprintEditor = () => {
+  const [status, setStatus] = useState('Loading...')
+
+  const editor = useEditor({
+    extensions: [
+      StarterKit,
+      TaskList,
+      TaskItem.configure({ nested: true }),
+    ],
+    content: '<p>Initializing...</p>',
+  })
+
+  // Fetch the Blueprint from Python on Mount
+  useEffect(() => {
+    const fetchBlueprint = async () => {
+      try {
+        const response = await axios.get('http://localhost:8000/blueprint')
+        if (editor) {
+          // Load the JSON directly into the editor
+          editor.commands.setContent(response.data)
+          setStatus('Ready')
+        }
+      } catch (error) {
+        console.error("Error fetching blueprint:", error)
+        setStatus('Error connecting to Python')
+      }
     }
-    """
+    fetchBlueprint()
+  }, [editor])
 
-    user_content = f"Route: {route}\nRaw Function Trace: {function_list}"
+  const handleSave = async () => {
+    if (!editor) return
+    const json = editor.getJSON()
 
-    # Reuse your existing ollama connection from refactor2.py
-    response = ollama.chat(
-        model="qwen2.5-coder:14b-instruct-q4_K_M", # Or your configured model
-        messages=[
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_content}
-        ],
-        format='json'
-    )
-    return json.loads(response['message']['content'])
+    // Send the edited JSON back to Python
+    await axios.post('http://localhost:8000/save', { content: json })
+    setStatus('Saved to Core!')
+    setTimeout(() => setStatus('Ready'), 2000)
+  }
 
-```
+  if (!editor) return null
 
----
+  return (
+    <div className="editor-container">
+      <div className="toolbar">
+        <span className="status-indicator">{status}</span>
+        <button onClick={handleSave} className="save-btn">
+          Compile & Run Agent
+        </button>
+      </div>
 
-### **3. Integrating Visual Signals (The "Insight")**
+      <div className="document-sheet">
+        <EditorContent editor={editor} />
+      </div>
+    </div>
+  )
+}
 
-The prompt specifically asks for "Friction Points" and "Logic Errors". We can algorithmically derive these before sending data to the LLM to make the insight grounded in reality, not hallucination.
-
-**Update `ingest2.py` to calculate "Heat":**
-We can add a complexity score during ingestion.
-
-*Modify `ingest2.py` around line 538 (write_function_node):*
-
-```python
-# In ingest2.py
-def calculate_complexity(source_code):
-    """
-    Simple heuristic: Count 'if', 'for', 'while', 'try' statements.
-    """
-    complexity = 0
-    keywords = ['if ', 'for ', 'while ', 'try:', 'except ', 'with ']
-    for word in keywords:
-        complexity += source_code.count(word)
-    return complexity
-
-# Update the graph write function
-def write_function_node(func_name, file_path, source_code, ...):
-    complexity_score = calculate_complexity(source_code)
-    
-    query = """
-    MERGE (f:Function {name: $name})
-    ON CREATE SET ..., f.complexity = $complexity
-    ...
-    """
-    # ... pass complexity to the query
+export default BlueprintEditor
 
 ```
 
-**Using the Signal:**
-When `mapper.py` queries the graph, it now pulls `f.complexity`.
 
-* If `complexity > 20`: The station is colored **Yellow**.
-* If `complexity > 50`: The station is colored **Red** (Friction Point).
+4. **Add Basic Styling (`src/index.css`):**
+Tiptap is "headless" (unstyled). You must add CSS to make it look like a document. Append this to your existing CSS:
+```css
+/* src/index.css */
+body {
+  background-color: #f3f4f6;
+  font-family: 'Inter', sans-serif;
+}
 
----
+.editor-container {
+  max-width: 800px;
+  margin: 40px auto;
+}
 
-### **4. The Final Output (Visualizing for the PM)**
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  align-items: center;
+}
 
-You requested how to *show* this. Since you are running locally, you can output a simple ASCII representation (like the "Blueprint" in `refactor2.py` ) or a Mermaid.js diagram.
+.save-btn {
+  background-color: #2563eb;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-weight: 600;
+}
 
-*Add this visualizer to `mapper.py`:*
+.document-sheet {
+  background: white;
+  min-height: 800px;
+  padding: 60px;
+  border-radius: 8px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
 
-```python
-def render_ascii_subway_map(journey_json):
-    print(f"\n🚇 SUBWAY MAP: {journey_json['journey_name']}")
-    print("START " + "=" * 50 + " END")
-    
-    stations = journey_json['stations']
-    
-    # Print the Line
-    line_visual = ""
-    for station in stations:
-        symbol = "O"
-        if station['status'] == 'RISK': symbol = "X"
-        line_visual += f"---[{symbol}]---"
-    print(line_visual)
-    
-    # Print the Labels
-    for i, station in enumerate(stations):
-        status_icon = "✅" if station['status'] == 'OK' else "⚠️"
-        print(f"Station {i+1}: {station['name']} {status_icon}")
-        if 'risk_reason' in station:
-            print(f"    └── Issue: {station['risk_reason']}")
-            print(f"    └── Code: {', '.join(station['functions'][:3])}...")
+/* Tiptap Specific Styles */
+.ProseMirror {
+  outline: none;
+}
+
+.ProseMirror ul[data-type="taskList"] {
+  list-style: none;
+  padding: 0;
+}
+
+.ProseMirror li[data-type="taskItem"] {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+}
 
 ```
 
-### **Summary of Work Required**
 
-1. **Ingestion (`ingest2.py`):** Add `complexity` metrics to nodes so we have real data for "Friction Points."
-2. **Mapping (`mapper.py`):** Create the script that:
-* Finds a Route (Entry Point).
-* Crawls the Call Graph (Dependencies).
-* Uses LLM to summarize clusters of functions into "Stations."
+5. **Update `App.jsx`:**
+```jsx
+import BlueprintEditor from './BlueprintEditor'
+
+function App() {
+  return (
+    <div>
+      <BlueprintEditor />
+    </div>
+  )
+}
+
+export default App
+
+```
 
 
-3. **Visualization:** Output the JSON/ASCII map.
 
-This directly fulfills the "Subway Map" requirement by translating *imperative* code (functions) into *declarative* intent (stations) using the AI as the translator.
+#### **Step 4: Run It**
+
+In your frontend terminal:
+
+```bash
+npm run dev
+
+```
+
+Open `http://localhost:5173`.
+
+### **Phase 3: The "Aha!" Moment**
+
+You will see a document titled **"Repo OS: Auth Refactor Plan"**.
+
+1. **Edit it:** Click the text. Change "Auth0" to "Cognito".
+2. **Check boxes:** Click the checkbox next to "Install Auth0 SDK".
+3. **Click Save:** Hit "Compile & Run Agent".
+4. **Check Python Terminal:** You will see `Received updated blueprint from User!` printed in your terminal.
+
+### **Next Architectural Move**
+
+You now have the **Loop**.
+
+* **Input:** User prompts in Python.
+* **Process:** AI generates JSON.
+* **Visualize:** React renders JSON.
+* **Refine:** User edits in React.
+* **Execute:** React sends final JSON back to Python to drive the Agent.

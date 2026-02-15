@@ -343,6 +343,24 @@ def get_code_snippet(file_path, item_name):
 
     return None, f"Item '{item_name}' not found in {file_path}."
 
+def get_code_snippet_by_name(item_name):
+    """
+    Finds a function/class by its name in Neo4j, then extracts its code.
+    """
+    query = "MATCH (n {name: $name}) RETURN n.file as file_path LIMIT 1"
+    with driver.session() as session:
+        result = session.run(query, name=item_name).single()
+        if result and result['file_path']:
+            return get_code_snippet(result['file_path'], item_name)
+        else:
+            # Fallback for `ClassName.methodName` format if direct match fails
+            if '.' in item_name:
+                # The get_code_snippet function already has logic for this
+                # but we need a file path. This is a limitation if the class isn't in the graph.
+                # Assuming for now the item_name is a direct function/class name.
+                pass
+            return None, f"Item '{item_name}' not found in the graph."
+
 def apply_updates(file_updates):
     """
     Writes changes to disk. 
@@ -363,6 +381,61 @@ def apply_updates(file_updates):
         except Exception as e:
             print(f"   ❌ Error writing to {file_path}: {e}")
 
+def compile_living_spec_to_prompts(tiptap_json):
+    """
+    Converts a Tiptap JSON document into a list of precise technical prompts.
+    This acts as the "Spec Compiler".
+    """
+    prompts = []
+    # Global context from paragraphs
+    global_context = ""
+    # Find all paragraphs and build a context string
+    for block in tiptap_json.get('content', []):
+        if block.get('type') == 'paragraph' and block.get('content'):
+            for content_item in block.get('content', []):
+                if content_item.get('type') == 'text':
+                    global_context += content_item.get('text', '') + "\n"
+
+    # Process task items to generate specific prompts
+    for block in tiptap_json.get('content', []):
+        if block.get('type') == 'taskItem' and block.get('content'):
+            task_instruction = ""
+            task_context = ""
+            
+            # Aggregate content within the task item
+            for content_item in block.get('content', []):
+                if content_item.get('type') == 'text':
+                    task_instruction += content_item.get('text', '')
+                elif content_item.get('type') == 'mention':
+                    # This is a "Smart Reference" to a code asset
+                    node_id = content_item.get('attrs', {}).get('id')
+                    # Fetch fresh code from Neo4j/file system for this specific node
+                    # Assuming file path is stored in the mention's attrs or can be looked up
+                    # For now, we'll assume we need a lookup function.
+                    # Placeholder for fetching code context
+                    code_snippet, error = get_code_snippet_by_name(node_id) # This function needs to be robust
+                    if code_snippet and not error:
+                        task_context += f"\nREFERENCE CODE for '{node_id}':\n```\n{code_snippet}\n```\n"
+                    else:
+                        task_context += f"\nWARNING: Could not retrieve code for reference '{node_id}'.\n"
+
+            # Construct the final prompt for this task
+            if task_instruction:
+                full_prompt = f"""
+                **Global Context:**
+                {global_context}
+                
+                **Referenced Code Snippets for this specific task:**
+                {task_context}
+                
+                **Your Task:**
+                {task_instruction}
+                """
+                prompts.append(full_prompt.strip())
+                
+    return prompts
+
+
 def generate_with_retries(system_prompt, initial_user_content, original_files_full_content, max_retries=MAX_RETRIES):
     """
     Attempts to generate a valid refactor plan with retries and self-correction.
@@ -373,7 +446,7 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
         temp = max(temp, 0.0) # Ensure temperature doesn't go below 0
 
         print(f"\n🧠 Attempt {attempt + 1}/{max_retries} (Temperature: {temp:.1f})...")
-        print("\n--- LLM PROMPT (User Content) ---\n", current_user_content, "\n----------------------------------\n")
+        # print("\n--- LLM PROMPT (User Content) ---\n", current_user_content, "\n----------------------------------\n")
         
         response = ollama.chat(
             model=MODEL_NAME,
@@ -384,16 +457,21 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
             format='json',
             options={'temperature': temp}
         )
-        print("\n--- LLM RAW RESPONSE ---\n", response['message']['content'], "\n--------------------------\n")
+        # print("\n--- LLM RAW RESPONSE ---\n", response['message']['content'], "\n--------------------------\n")
 
         try:
-            response_json = json.loads(response['message']['content'])
+            repaired_json_str = _repair_llm_json_string(response['message']['content'])
+            response_json = json.loads(repaired_json_str)
             
             all_valid = True
             errors_feedback = []
             
             # Create a mutable copy of the original files to apply proposed changes for validation
             current_state_of_files = original_files_full_content.copy()
+
+            if not isinstance(response_json, dict):
+                all_valid = False
+                errors_feedback.append(f"Your response was not a JSON object (dictionary). It was a {type(response_json)}. Please return a JSON object with filenames as keys.")
 
             # Apply LLM's proposed changes to the current state of files for validation
             for file_path, new_content in response_json.items():
@@ -403,9 +481,9 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
                     continue
                 current_state_of_files[file_path] = new_content
             
-            # Now validate each file that was part of the original context (whether modified or not)
-            for file_path, content_to_validate in current_state_of_files.items():
-                file_errors = validate_code(content_to_validate)
+            # Now validate each file that was modified
+            for file_path, new_content in response_json.items():
+                file_errors = validate_code(new_content)
                 if file_errors:
                     all_valid = False
                     errors_feedback.append(f"Validation errors in proposed '{file_path}':")
@@ -418,7 +496,7 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
             else:
                 print(f"❌ Attempt {attempt + 1} failed validation.")
                 error_message_for_llm = "\n\n--- VALIDATION FEEDBACK ---\n" + "\n".join(errors_feedback) + "\n\n"
-                error_message_for_llm += "Please correct these issues. Remember to output ONLY a valid JSON object. Ensure that the JSON values contain raw code, not markdown wrappers."
+                error_message_for_llm += "Please correct these issues. Remember to output ONLY a valid JSON object with filenames as keys and the full, raw source code as values."
                 
                 # Append feedback to user content for the next LLM call
                 current_user_content += error_message_for_llm
@@ -429,7 +507,7 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
                 "\n\n--- VALIDATION FEEDBACK ---\n"
                 "Your previous response was not a valid JSON object. "
                 "You MUST output a valid JSON object where keys are filenames and values are the NEW full content of that file. "
-                "Ensure strict JSON formatting."
+                "Ensure strict JSON formatting. Do not include markdown code block wrappers like ```json."
             )
             current_user_content += error_message_for_llm
             
@@ -439,109 +517,6 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
             break # Exit retry loop on unexpected errors
 
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
-    return None
-
-def _parse_and_validate_response(response, filename, attempt):
-    """
-    Parses the JSON response from the LLM, validates the code, and returns the new code if valid.
-    """
-    try:
-        raw_llm_response_content = response['message']['content'].strip()
-        # Attempt to strip markdown code block wrappers
-        if raw_llm_response_content.startswith("```json"):
-            raw_llm_response_content = raw_llm_response_content[len("```json"):].strip()
-            if raw_llm_response_content.endswith("```"):
-                raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
-        elif raw_llm_response_content.startswith("```"): # Generic markdown
-            raw_llm_response_content = raw_llm_response_content[len("```"):].strip()
-            if raw_llm_response_content.endswith("```"):
-                raw_llm_response_content = raw_llm_response_content[:-len("```")].strip()
-        # response['message']['content'] = response['message']['content'].replace("```json\n?|```/g, ''")
-
-        # Attempt to repair common LLM JSON errors before parsing
-        repaired_llm_response_content = _repair_llm_json_string(raw_llm_response_content)
-
-        response_json = json.loads(repaired_llm_response_content)
-        plan_report = response_json.get('plan_report', 'No report generated.')
-        file_changes = response_json.get('file_changes', {})
-
-        new_code = file_changes.get(filename)
-        
-        if new_code:
-            errors = validate_code(new_code)
-            if not errors:
-                print(f"   ✅ Finished: {filename}")
-                print(f"   📋 Plan Report for {filename}: {plan_report}")
-                return new_code
-            else:
-                print(f"   ⚠️ Syntax Error (Attempt {attempt+1}): {errors}")
-                # In a real app, you'd feed the error back to the LLM here
-        else:
-            print(f"   ❌ No changes returned for {filename} in file_changes (Attempt {attempt+1}).")
-
-    except json.JSONDecodeError:
-        print(f"   ❌ Attempt {attempt + 1} failed: AI output invalid JSON.")
-        print(f"   Raw LLM Response (Attempt {attempt + 1}):\n{response['message']['content']}")
-        # For self-correction, append feedback to the next user message,
-        # but for this retry loop, we just log and continue.
-    except Exception as e:
-        print(f"   An unexpected error occurred during processing LLM response (Attempt {attempt+1}): {e}")
-    
-    return None
-
-def process_single_file_sync(filename, file_content, instruction, dependencies, constraints, tool_context):
-    """
-    Synchronous Worker. Refactors ONE file and returns the result.
-    """
-    print(f"\n🚀 Starting Task: {filename}")
-
-    constraint_str = ""
-    if constraints.get('must_use_functions'):
-        constraint_str += f"MANDATORY: You must implement the solution using: {', '.join(constraints['must_use_functions'])}. "
-    if constraints.get('must_use_libraries'):
-        constraint_str += f"MANDATORY: You must use the following libraries: {', '.join(constraints['must_use_libraries'])}."
-    if constraints.get('architectural_notes'):
-        constraint_str += f"ARCHITECTURAL NOTE: {constraints['architectural_notes']}."
-
-    system_prompt = f"""
-    You are a Principal Engineer. Refactor the code for {filename}.
-
-    CRITICAL RULES:
-    {constraint_str} (These are hard constraints. You will be penalized for ignoring them.)
-    Output a JSON object with TWO fields:
-       - "plan_report": A brief explanation of how you satisfied the specific constraints for {filename}.
-       - "file_changes": A dictionary with one entry: {{"{filename}": "new_code_for_{filename}"}}.
-
-    Example Output:
-    {{
-      "plan_report": "I fixed the SQL injection in {filename} by using db.run_raw_sql as requested.",
-      "file_changes": {{ "{filename}": "..." }}
-    }}
-
-    Context for mandatory tools:
-    {tool_context}
-
-    Additional context from dependent files:
-    {dependencies}
-    """
-    
-    # Retry Loop (Self-Correction)
-    for attempt in range(3):
-        # We use standard synchronous chat here
-        response = ollama.chat(
-            model=MODEL_NAME,
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': f"CODE for {filename}:\n{file_content}\n\nINSTRUCTION:\n{instruction}"}
-            ],
-            options={'temperature': 0.1} # Low temp for precision
-        )
-        
-        new_code = _parse_and_validate_response(response, filename, attempt + 1)
-        if new_code:
-            return new_code
-
-    print(f"   ❌ Failed to refactor {filename} after 3 attempts.")
     return None
 
 def get_visual_architecture(session, context_map):
@@ -575,228 +550,275 @@ def get_visual_architecture(session, context_map):
 
     return "\n".join(viz_lines)
 
-def generate_and_review_blueprint(target_name, instruction, context_map, approval_choice=None):
+def draft_and_review_living_blueprint(target_name, instruction, context_map):
     """
-    Generates a detailed blueprint for the refactoring task and asks for user approval.
+    Generates a detailed, structured JSON blueprint for the refactoring task 
+    and asks for user approval. This simulates the "Active Spec" creation.
     """
-    print(f"\n{Colors.BOLD}📄 Generating Blueprint for '{target_name}'...{Colors.RESET}")
+    print(f"\n{Colors.BOLD}📄 Generating Living Specification for '{target_name}'...{Colors.RESET}")
 
     # --- Generate Visual Architecture ---
-    existing_arch_viz = ""
     with driver.session() as session:
         existing_arch_viz = get_visual_architecture(session, context_map)
     # --- END ---
 
-    # Construct a detailed prompt for the blueprint
     blueprint_prompt = f"""
-    You are a senior architect. Based on the user's instruction and the provided context, generate a detailed blueprint for refactoring. The blueprint must contain the following sections:
+You are a senior architect. Your task is to create a "Living Specification" for a refactoring task.
+This specification must be a JSON object that is both human-readable and machine-parseable.
 
-    **a. Introduction:**
-    Briefly describe the purpose of this refactoring.
+**INSTRUCTION:**
+{instruction}
 
-    **b. Background:**
-    Explain the context of the requested change. What is the current state of the code and why does it need to be changed?
+**CONTEXT:**
+The user wants to refactor code related to '{target_name}'.
+The following files and items have been identified as relevant:
+{json.dumps(context_map, indent=2)}
 
-    **c. Justification:**
-    Justify the need for this refactoring. What are the benefits of the proposed changes?
+Here is a view of the existing architecture based on the context:
+```
+{existing_arch_viz}
+```
 
-    **d. Existing Architecture:**
-    This is the current state of the system.
-    **Visual representation of the existing system:**
-    ```
-    {existing_arch_viz}
-    ```
+**YOUR TASK:**
+Generate a single JSON object with the following structure:
+1.  `"type": "doc"`
+2.  `"content": [...]` - An array of blocks.
 
-    **e. Proposed Architecture:**
-    Describe the new architecture after the refactoring.
-    **Architectural Delta:**
-    Based on the existing architecture, generate a single "Architectural Delta" diagram showing ONLY the changes.
-    - Use a `+` prefix for new nodes or relationships (additions).
-    - Use a `-` prefix for removed nodes or relationships (deletions).
-    - Use a `~` prefix for modified nodes or relationships (modifications).
-    - Unchanged items MUST be omitted for brevity.
-    ```
-    [GENERATE DELTA HERE]
-    ```
+**BLOCK TYPES:**
+- **`heading`**: For section titles. e.g., `{{"type": "heading", "attrs": {{"level": 1}}, "content": [{{"type": "text", "text": "1. Introduction"}}]}}`
+- **`paragraph`**: For explanatory text. This text provides context for the AI agents.
+- **`taskItem`**: **This is the most important block.** It represents a single, executable refactoring task for an AI agent.
+    - Inside a `taskItem`, you can include `text` content and `mention` content.
+    - A `mention` represents a "Smart Reference" to a code asset. The `id` attribute of the mention MUST be the name of the function or class, not the file path. Use it to link to specific functions or classes that are relevant to the task. e.g., `{{"type": "mention", "attrs": {{"id": "UserAuth", "label": "UserAuth"}}, "content": []}}`
 
-    **f. Test Plan:**
-        **i. How it will be tested by the AI:**
-        Describe the steps the AI will take to test the changes.
-    
-    **User Instruction:**
-    {instruction}
+**EXAMPLE JSON STRUCTURE:**
+```json
+{{
+  "type": "doc",
+  "content": [
+    {{
+      "type": "heading",
+      "attrs": {{"level": 1}},
+      "content": [{{"type": "text", "text": "Refactor Authentication Logic"}}]
+    }},
+    {{
+      "type": "paragraph",
+      "content": [{{"type": "text", "text": "The current authentication system uses a monolithic function. We will break it down into smaller, more manageable pieces."}}]
+    }},
+    {{
+      "type": "taskItem",
+      "content": [
+        {{
+          "type": "text",
+          "text": "Create a new function `_authenticate_user` that encapsulates the logic from "
+        }},
+        {{
+          "type": "mention",
+          "attrs": {{
+            "id": "search_monolith",
+            "label": "search_monolith"
+          }}
+        }},
+        {{
+            "type": "text",
+            "text": "."
+        }}
+      ]
+    }},
+    {{
+      "type": "taskItem",
+      "content": [
+        {{
+            "type": "text",
+            "text": "Update the main route to call the new `_authenticate_user` function."
+        }}
+      ]
+    }}
+  ]
+}}
+```
 
-    **Affected Files and Items:**
-    """
-    for file_path, items in context_map.items():
-        blueprint_prompt += f"- {file_path}: {', '.join(items)}\n"
+Now, generate the complete JSON object for the user's instruction.
+"""
 
     # Call the LLM to generate the blueprint
+    print("   🧠 Calling LLM to generate JSON blueprint...")
     response = ollama.chat(
         model=MODEL_NAME,
         messages=[
-            {'role': 'system', 'content': "You are a senior architect generating a refactoring blueprint."},
+            {'role': 'system', 'content': "You are a senior architect generating a refactoring blueprint in JSON format."},
             {'role': 'user', 'content': blueprint_prompt}
         ],
+        format='json',
         options={'temperature': 0.3}
     )
 
-    blueprint = response['message']['content']
-    
-    # --- Colorize the Architectural Delta using Regex ---
-    def repl(match):
-        colored_lines = []
-        # The content of the code block is in match.group(1)
-        for line in match.group(1).split('\n'):
-            if line.strip().startswith('+'):
-                colored_lines.append(f"{Colors.GREEN}{line}{Colors.RESET}")
-            elif line.strip().startswith('-'):
-                colored_lines.append(f"{Colors.RED}{line}{Colors.RESET}")
-            elif line.strip().startswith('~'):
-                colored_lines.append(f"{Colors.YELLOW}{line}{Colors.RESET}")
-            else:
-                colored_lines.append(line)
-        return "```" + "\n".join(colored_lines) + "```"
+    try:
+        blueprint_json_str = _repair_llm_json_string(response['message']['content'])
+        blueprint_json = json.loads(blueprint_json_str)
 
-    # Find the "Architectural Delta" header and then apply the regex to the rest of the string
-    delta_header_pos = blueprint.find("**Architectural Delta:**")
-    if delta_header_pos != -1:
-        header_part = blueprint[:delta_header_pos]
-        delta_part = blueprint[delta_header_pos:]
-        # Apply the regex substitution only to the part of the blueprint after the header
-        colored_delta_part = re.sub(r"```(.*?)```", repl, delta_part, count=1, flags=re.DOTALL)
-        blueprint = header_part + colored_delta_part
-    # --- END ---
+        print(f"\n{Colors.BOLD}{Colors.CYAN}--- LIVING SPECIFICATION (JSON Blueprint) ---{Colors.RESET}")
+        print(json.dumps(blueprint_json, indent=2))
+        print(f"{Colors.BOLD}{Colors.CYAN}-------------------------------------------{Colors.RESET}")
 
-    print(f"\n{Colors.BOLD}{Colors.CYAN}--- BLUEPRINT ---{Colors.RESET}")
-    print(blueprint)
-    print(f"{Colors.BOLD}{Colors.CYAN}-------------------{Colors.RESET}")
+        while True:
+            approval = input(f"\n{Colors.BOLD}Do you approve this specification? (y/n): {Colors.RESET}").lower()
+            if approval in ['y', 'n']:
+                return approval, blueprint_json
+            print("Invalid input. Please enter 'y' or 'n'.")
 
-    # Ask for approval
-    if approval_choice:
-        return approval_choice, blueprint
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: Failed to decode the JSON blueprint from the LLM.")
+        print(f"   Error details: {e}")
+        print("--- RAW LLM OUTPUT ---")
+        print(response['message']['content'])
+        print("----------------------")
+        return 'n', None
+    except Exception as e:
+        print(f"❌ An unexpected error occurred: {e}")
+        return 'n', None
 
-    while True:
-        approval = input(f"\n{Colors.BOLD}Do you approve this blueprint? (y/n/u)pdate: {Colors.RESET}").lower()
-        if approval in ['y', 'n', 'u']:
-            return approval, blueprint
-        print("Invalid input. Please enter 'y', 'n', or 'u'.")
 
-def orchestrate_sequential_refactor(target_name, instruction, auto_confirm=False, blueprint=False, blueprint_approval=None):
+def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint=False):
     """
-    The Sequential Manager.
-    1. Analyze dependencies.
-    2. Sort tasks (Critical dependencies first).
-    3. Execute one by one.
+    The main orchestrator for the refactoring process.
+    Supports two modes:
+    1. Direct Refactoring: Immediately attempts to refactor based on the instruction.
+    2. Blueprint-Driven Refactoring: First generates a "Living Specification" (JSON),
+       compiles it into tasks, and then executes them sequentially.
     """
-    # 1. EXTRACT CONSTRAINTS
+    # 1. EXTRACT CONSTRAINTS & GET CONTEXT (Common to both modes)
     print("🕵️ Analyzing Instructions...")
     constraints = extract_constraints(instruction)
-    
-    if constraints.get('must_use_functions'):
-        print(f"🔒 Constraints Detected: Must use functions: {constraints['must_use_functions']}")
-    if constraints.get('must_use_libraries'):
-        print(f"🔒 Constraints Detected: Must use libraries: {constraints['must_use_libraries']}")
-    if constraints.get('architectural_notes'):
-        print(f"🔒 Constraints Detected: Architectural notes: {constraints['architectural_notes']}")
+    # (Your existing constraint logging here...)
 
-    # 2. Get the Blast Radius
-    files_to_context, error = get_hybrid_context(instruction, explicit_target=target_name)
+    tool_context = fetch_mandated_tools(constraints)
+
+    print("🗺️ Gathering Code Context...")
+    context_map, error = get_hybrid_context(instruction, explicit_target=target_name)
     if error:
         print(f"❌ {error}")
         return
 
-    # Generate and review blueprint if requested
+    # Load initial file contents that are within the context
+    original_files_content = {
+        file_path: fetch_file_content(file_path)
+        for file_path in context_map.keys()
+        if fetch_file_content(file_path) is not None
+    }
+    if not original_files_content:
+        print("❌ Could not read content for any of the context files. Aborting.")
+        return
+
+    # This dictionary will be updated as changes are applied
+    current_files_content = original_files_content.copy()
+
+    # --- WORKFLOW DECISION ---
     if blueprint:
-        approval, generated_blueprint = generate_and_review_blueprint(target_name, instruction, files_to_context, blueprint_approval)
-        if approval == 'n':
-            print("🛑 Blueprint rejected. Aborting refactoring.")
+        # 2.A. BLUEPRINT-DRIVEN WORKFLOW
+        approval, blueprint_json = draft_and_review_living_blueprint(target_name, instruction, context_map)
+        if approval != 'y':
+            print("🛑 Blueprint not approved. Aborting refactoring.")
             return
-        elif approval == 'u':
-            new_instruction = input("Please provide the updated instruction: ")
-            approval, generated_blueprint = generate_and_review_blueprint(target_name, new_instruction, files_to_context, blueprint_approval)
-            if approval != 'y':
-                print("🛑 Blueprint update rejected or aborted. Aborting refactoring.")
-                return
-            instruction = new_instruction
 
-    # 2. FETCH MANDATORY TOOL CONTEXT
-    tool_context = fetch_mandated_tools(constraints)
-
-    # 3. Load initial file contents
-    original_files_full_content = {} 
-    for file_path in files_to_context.keys():
-        full_content = fetch_file_content(file_path)
-        if full_content:
-            original_files_full_content[file_path] = full_content
-        else:
-            print(f"⚠️ Warning: Could not read full content for {file_path}. Skipping.")
-
-    # 3. Topological Sort (Optional but Smart)
-    # Ideally, you want to refactor the 'Dependency' (utils.py) before the 'Dependent' (main.py)
-    # For MVP, we'll just process them in the order provided or simple alphabetical
-    sorted_files = sorted(original_files_full_content.keys()) 
-    
-    print(f"📋 Sequential Plan: {sorted_files}")
-    
-    applied_files_content = {} # To store content of files already processed and applied
-
-    for filename in sorted_files:
-        content = original_files_full_content[filename]
-
-        # 4. Dynamic Context Building
-        # The 'dependencies' context could essentially be the *new* code of files we just finished!
-        # This allows 'main.py' to see the *updated* 'utils.py' immediately.
-        current_context_str = "Recently Updated Files:\n"
-        for finished_file, new_content_for_context in applied_files_content.items():
-            current_context_str += f"- {finished_file} (Refactored)\n"
-
-        # 5. Execute
-        new_code = process_single_file_sync(filename, content, instruction, current_context_str, constraints, tool_context)
-
-        if new_code:
-            print(f"\n--- PROPOSED CHANGE FOR: {filename} ---")
-            
-            # Create a temporary dict for review_changes to show only this file's change
-            single_file_original = {filename: original_files_full_content[filename]}
-            single_file_proposed = {filename: new_code}
-
-            if not auto_confirm:
-                review_changes(single_file_original, single_file_proposed)
-
-            should_apply = auto_confirm
-            if not auto_confirm:
-                confirm = input(f"\n{Colors.BOLD}Apply changes to {filename}? (y/n): {Colors.RESET}")
-                if confirm.lower().strip() == 'y':
-                    should_apply = True
-                else:
-                    should_apply = False
-                    print(f"🛑 Aborted changes for {filename}. Moving to next file.")
-
-            if should_apply:
-                apply_updates(single_file_proposed) # Apply only the current file's change
-                applied_files_content[filename] = new_code # Add to applied for context in next iteration
-                print(f"✅ Changes for {filename} applied.")
-                # Simulate a brief cooldown if needed for thermal management
-                time.sleep(0.5) 
-            else:
-                # If not applied, the original content persists for subsequent context if needed,
-                # but for simplicity, we just won't add it to applied_files_content.
-                pass # Already printed "Aborted"
-
-        else:
-            print(f"❌ Failed to refactor {filename}. Aborting sequential refactoring.")
-            return # Exit the function immediately
-
-    print("\n--- SEQUENTIAL REFACTORING PROCESS COMPLETE ---")
+        print("⚙️ Compiling Living Specification into executable prompts...")
+        prompts = compile_living_spec_to_prompts(blueprint_json)
+        if not prompts:
+            print("⚠️ No actionable tasks found in the blueprint. Nothing to do.")
+            return
         
+        print(f"✅ Compiled {len(prompts)} tasks from the specification.")
+
+        # Execute each task sequentially
+        for i, task_prompt in enumerate(prompts):
+            print(f"\n--- Executing Task {i+1}/{len(prompts)} ---")
+            
+            system_prompt = f"""
+You are a Principal Engineer executing a refactoring task. Your primary goal is to successfully refactor the code according to the user's instructions.
+Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file.
+You have access to the full content of all relevant files. Your task is to modify one or more of them based on the user's request.
+Ensure your changes fully address the user's instruction.
+
+MANDATORY TOOL CONTEXT:
+{tool_context}
+
+Example Output:
+{{
+  "file1.py": "...",
+  "utils/helper.py": "..."
+}}
+            """
+            # Build the full context string for this task
+            full_context_str = ""
+            for path, content in current_files_content.items():
+                full_context_str += f"--- FILE: {path} ---\n{content}\n\n"
+
+            final_user_prompt = f"CONTEXT:\n{full_context_str}\n\nINSTRUCTION:\n{task_prompt}"
+
+            proposed_changes = generate_with_retries(system_prompt, final_user_prompt, current_files_content.copy())
+            
+            if not proposed_changes:
+                print(f"❌ LLM failed to generate valid changes for this task. Aborting.")
+                return
+
+            review_changes(current_files_content, proposed_changes)
+            
+            # Get user approval for this specific set of changes
+            confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply changes for this task? (y/n): {Colors.RESET}").lower().strip()
+
+            if confirm == 'y':
+                apply_updates(proposed_changes)
+                # IMPORTANT: Update the current state for the next task
+                current_files_content.update(proposed_changes)
+                print("✅ Task changes applied.")
+            else:
+                print("🛑 Task changes rejected. Aborting remaining tasks.")
+                return
+
+    else:
+        # 2.B. DIRECT REFACTORING WORKFLOW (Original sequential logic)
+        print("🚀 Starting Direct Refactoring...")
+        # This part can be refactored to use the same `generate_with_retries` as the blueprint mode
+        # For now, keeping the old logic for compatibility if --blueprint is not used.
+        # Note: The original `orchestrate_sequential_refactor` logic was complex and processed
+        # file-by-file. We will simplify it to a single-shot attempt for non-blueprint mode.
+        
+        system_prompt = f"""
+You are a Principal Engineer. Your primary goal is to successfully refactor the code based on the user's instruction.
+Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file.
+You have access to the full content of all relevant files. Modify them as needed.
+Ensure your changes fully address the user's instruction.
+
+MANDATORY TOOL CONTEXT:
+{tool_context}
+        """
+        context_str = ""
+        for path, content in original_files_content.items():
+            context_str += f"--- FILE: {path} ---\n{content}\n\n"
+        
+        user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
+
+        proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_content.copy())
+        
+        if not proposed_changes:
+            print("❌ LLM failed to generate any valid changes.")
+            return
+
+        review_changes(original_files_content, proposed_changes)
+        confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply all proposed changes? (y/n): {Colors.RESET}").lower()
+        if confirm == 'y':
+            apply_updates(proposed_changes)
+            print("✅ All changes applied.")
+        else:
+            print("🛑 Changes rejected.")
+
+
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser(description="Repo OS Sequential Refactoring Orchestrator.")
+    arg_parser = argparse.ArgumentParser(description="Repo OS Refactoring Orchestrator.")
     arg_parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
     arg_parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
     arg_parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
-    arg_parser.add_argument("--blueprint", action="store_true", help="Generate a blueprint of the changes and ask for approval before applying them.")
-    arg_parser.add_argument("--blueprint-approval", choices=['y', 'n', 'u'], help="Approve the blueprint automatically.")
-
+    arg_parser.add_argument("--blueprint", action="store_true", help="Generate a 'Living Specification' blueprint of the changes and ask for approval before applying them.")
+    
     args = arg_parser.parse_args()
-    orchestrate_sequential_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint, args.blueprint_approval)
+    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint)

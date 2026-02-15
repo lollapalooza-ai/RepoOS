@@ -3,15 +3,16 @@ import json
 import uuid
 
 REPO1_BASE_URL = "http://127.0.0.1:5000" # Assuming Repo1 runs locally on port 5000
-
+cached_uuid = None
 def call_hello_world_api():
-    """
-    Calls the hello_world API endpoint of Repo1 to get a random UUID.
-    """
+    global cached_uuid
+    if cached_uuid is not None:
+        return cached_uuid
     try:
         response = requests.get(f"{REPO1_BASE_URL}/hello_world")
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 500)
-        return response.json().get('uuid')
+        cached_uuid = response.json().get('uuid')
+        return cached_uuid
     except requests.exceptions.HTTPError as err:
         print(f"HTTP error occurred: {err}")  # Python 3.6+
     except requests.exceptions.ConnectionError as err:
@@ -22,10 +23,9 @@ def call_hello_world_api():
         print(f"Something went wrong: {err}")
     return None
 
-def call_search_api(query, uuid, token="valid-token"):
-    """
-    Calls the search API endpoint of Repo1 with a required UUID.
-    """
+def call_search_api(query, uuid=None, token="valid-token"):
+    if uuid is None:
+        uuid = call_hello_world_api()
     headers = {"Authorization": token}
     params = {"q": query, "uuid": uuid}
     
@@ -53,21 +53,21 @@ if __name__ == "__main__":
     print(f"UUID obtained: {uuid}")
     
     print("Calling Repo1 search API with query 'normal'...")
-    results = call_search_api("normal", uuid)
+    results = call_search_api("normal")
     if results:
         print(json.dumps(results, indent=2))
     else:
         print("Failed to get results.")
     
     print("Calling Repo1 search API with query 'expensive' and invalid token...")
-    results_invalid_token = call_search_api("expensive", uuid, token="invalid-token")
+    results_invalid_token = call_search_api("expensive", token="invalid-token")
     if results_invalid_token:
         print(json.dumps(results_invalid_token, indent=2))
     else:
         print("Failed to get results with invalid token (expected).")
     
     print("Calling Repo1 search API with query 'promo'...")
-    results_promo = call_search_api("promo", uuid)
+    results_promo = call_search_api("promo")
     if results_promo:
         print(json.dumps(results_promo, indent=2))
     else:
