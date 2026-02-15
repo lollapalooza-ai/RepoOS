@@ -550,10 +550,10 @@ def get_visual_architecture(session, context_map):
 
     return "\n".join(viz_lines)
 
-def draft_and_review_living_blueprint(target_name, instruction, context_map):
+def draft_and_review_living_blueprint(target_name, instruction, context_map, export_mode=False):
     """
-    Generates a detailed, structured JSON blueprint for the refactoring task 
-    and asks for user approval. This simulates the "Active Spec" creation.
+    Generates a detailed, structured JSON blueprint for the refactoring task.
+    If not in export_mode, it asks for user approval.
     """
     print(f"\n{Colors.BOLD}📄 Generating Living Specification for '{target_name}'...{Colors.RESET}")
 
@@ -585,11 +585,11 @@ Generate a single JSON object with the following structure:
 2.  `"content": [...]` - An array of blocks.
 
 **BLOCK TYPES:**
-- **`heading`**: For section titles. e.g., `{{"type": "heading", "attrs": {{"level": 1}}, "content": [{{"type": "text", "text": "1. Introduction"}}]}}`
+- **`heading`**: For section titles. e.g., {{"type": "heading", "attrs": {{"level": 1}}, "content": [{{"type": "text", "text": "1. Introduction"}}]}}`
 - **`paragraph`**: For explanatory text. This text provides context for the AI agents.
 - **`taskItem`**: **This is the most important block.** It represents a single, executable refactoring task for an AI agent.
     - Inside a `taskItem`, you can include `text` content and `mention` content.
-    - A `mention` represents a "Smart Reference" to a code asset. The `id` attribute of the mention MUST be the name of the function or class, not the file path. Use it to link to specific functions or classes that are relevant to the task. e.g., `{{"type": "mention", "attrs": {{"id": "UserAuth", "label": "UserAuth"}}, "content": []}}`
+    - A `mention` represents a "Smart Reference" to a code asset. The `id` attribute of the mention MUST be the name of the function or class, not the file path. Use it to link to specific functions or classes that are relevant to the task. e.g., {{"type": "mention", "attrs": {{"id": "UserAuth", "label": "UserAuth"}}, "content": []}}`
 
 **EXAMPLE JSON STRUCTURE:**
 ```json
@@ -660,6 +660,9 @@ Now, generate the complete JSON object for the user's instruction.
         print(f"\n{Colors.BOLD}{Colors.CYAN}--- LIVING SPECIFICATION (JSON Blueprint) ---{Colors.RESET}")
         print(json.dumps(blueprint_json, indent=2))
         print(f"{Colors.BOLD}{Colors.CYAN}-------------------------------------------{Colors.RESET}")
+        
+        if export_mode:
+            return 'y', blueprint_json
 
         while True:
             approval = input(f"\n{Colors.BOLD}Do you approve this specification? (y/n): {Colors.RESET}").lower()
@@ -679,19 +682,124 @@ Now, generate the complete JSON object for the user's instruction.
         return 'n', None
 
 
-def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint=False):
+def generate_and_review_blueprint(target_name, instruction, context_map, approval_choice=None):
+    """
+    Generates a detailed blueprint for the refactoring task and asks for user approval.
+    """
+    print(f"\n{Colors.BOLD}📄 Generating Blueprint for '{target_name}'...{Colors.RESET}")
+
+    # --- Generate Visual Architecture ---
+    existing_arch_viz = ""
+    with driver.session() as session:
+        existing_arch_viz = get_visual_architecture(session, context_map)
+    # --- END ---
+
+    # Construct a detailed prompt for the blueprint
+    blueprint_prompt = f"""
+    You are a senior architect. Based on the user's instruction and the provided context, generate a detailed blueprint for refactoring. The blueprint must contain the following sections:
+
+    **a. Introduction:**
+    Briefly describe the purpose of this refactoring.
+
+    **b. Background:**
+    Explain the context of the requested change. What is the current state of the code and why does it need to be changed?
+
+    **c. Justification:**
+    Justify the need for this refactoring. What are the benefits of the proposed changes?
+
+    **d. Existing Architecture:**
+    This is the current state of the system.
+    **Visual representation of the existing system:**
+    ```
+    {existing_arch_viz}
+    ```
+
+    **e. Proposed Architecture:**
+    Describe the new architecture after the refactoring.
+    **Architectural Delta:**
+    Based on the existing architecture, generate a single "Architectural Delta" diagram showing ONLY the changes.
+    - Use a `+` prefix for new nodes or relationships (additions).
+    - Use a `-` prefix for removed nodes or relationships (deletions).
+    - Use a `~` prefix for modified nodes or relationships (modifications).
+    - Unchanged items MUST be omitted for brevity.
+    ```
+    [GENERATE DELTA HERE]
+    ```
+
+    **f. Test Plan:**
+        **i. How it will be tested by the AI:**
+        Describe the steps the AI will take to test the changes.
+    
+    **User Instruction:**
+    {instruction}
+
+    **Affected Files and Items:**
+    """
+    for file_path, items in context_map.items():
+        blueprint_prompt += f"- {file_path}: {', '.join(items)}\n"
+
+    # Call the LLM to generate the blueprint
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {'role': 'system', 'content': "You are a senior architect generating a refactoring blueprint."},
+            {'role': 'user', 'content': blueprint_prompt}
+        ],
+        options={'temperature': 0.3}
+    )
+
+    blueprint = response['message']['content']
+    
+    # --- Colorize the Architectural Delta using Regex ---
+    def repl(match):
+        colored_lines = []
+        # The content of the code block is in match.group(1)
+        for line in match.group(1).split('\n'):
+            if line.strip().startswith('+'):
+                colored_lines.append(f"{Colors.GREEN}{line}{Colors.RESET}")
+            elif line.strip().startswith('-'):
+                colored_lines.append(f"{Colors.RED}{line}{Colors.RESET}")
+            elif line.strip().startswith('~'):
+                colored_lines.append(f"{Colors.YELLOW}{line}{Colors.RESET}")
+            else:
+                colored_lines.append(line)
+        return "```" + "\n".join(colored_lines) + "```"
+
+    # Find the "Architectural Delta" header and then apply the regex to the rest of the string
+    delta_header_pos = blueprint.find("**Architectural Delta:**")
+    if delta_header_pos != -1:
+        header_part = blueprint[:delta_header_pos]
+        delta_part = blueprint[delta_header_pos:]
+        # Apply the regex substitution only to the part of the blueprint after the header
+        colored_delta_part = re.sub(r"```(.*?)```", repl, delta_part, count=1, flags=re.DOTALL)
+        blueprint = header_part + colored_delta_part
+    # --- END ---
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}--- BLUEPRINT ---{Colors.RESET}")
+    print(blueprint)
+    print(f"{Colors.BOLD}{Colors.CYAN}-------------------{Colors.RESET}")
+
+    # Ask for approval
+    if approval_choice:
+        return approval_choice, blueprint
+
+    while True:
+        approval = input(f"\n{Colors.BOLD}Do you approve this blueprint? (y/n/u)pdate: {Colors.RESET}").lower()
+        if approval in ['y', 'n', 'u']:
+            return approval, blueprint
+        print("Invalid input. Please enter 'y', 'n', or 'u'.")
+
+def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint=False, blueprint_export=False):
     """
     The main orchestrator for the refactoring process.
-    Supports two modes:
-    1. Direct Refactoring: Immediately attempts to refactor based on the instruction.
-    2. Blueprint-Driven Refactoring: First generates a "Living Specification" (JSON),
-       compiles it into tasks, and then executes them sequentially.
+    Supports three modes:
+    1. Direct Refactoring: Immediately attempts to refactor.
+    2. Blueprint Generation (--blueprint): Generates a textual blueprint, asks for approval, then refactors.
+    3. Blueprint Export (--blueprint-export): Generates a Tiptap JSON blueprint, saves it, and exits.
     """
-    # 1. EXTRACT CONSTRAINTS & GET CONTEXT (Common to both modes)
+    # 1. COMMON SETUP: EXTRACT CONSTRAINTS & GET CONTEXT
     print("🕵️ Analyzing Instructions...")
     constraints = extract_constraints(instruction)
-    # (Your existing constraint logging here...)
-
     tool_context = fetch_mandated_tools(constraints)
 
     print("🗺️ Gathering Code Context...")
@@ -700,7 +808,19 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint
         print(f"❌ {error}")
         return
 
-    # Load initial file contents that are within the context
+    # --- WORKFLOW DECISION ---
+    if blueprint_export:
+        # WORKFLOW 3: EXPORT JSON BLUEPRINT
+        _, blueprint_json = draft_and_review_living_blueprint(target_name, instruction, context_map, export_mode=True)
+        if blueprint_json:
+            with open("repo_os_blueprint.json", "w") as f:
+                json.dump(blueprint_json, f, indent=2)
+            print(f"\n{Colors.GREEN}✅ Tiptap JSON blueprint exported to repo_os_blueprint.json{Colors.RESET}")
+        else:
+            print(f"\n{Colors.RED}❌ Failed to generate Tiptap JSON blueprint for export.{Colors.RESET}")
+        return  # Exit after exporting
+
+    # Load file contents for the remaining workflows
     original_files_content = {
         file_path: fetch_file_content(file_path)
         for file_path in context_map.keys()
@@ -710,80 +830,30 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint
         print("❌ Could not read content for any of the context files. Aborting.")
         return
 
-    # This dictionary will be updated as changes are applied
+    if blueprint:
+        # WORKFLOW 2: TEXTUAL BLUEPRINT AND REFACTOR
+        approval, generated_blueprint = generate_and_review_blueprint(target_name, instruction, context_map)
+        if approval == 'n':
+            print("🛑 Blueprint rejected. Aborting refactoring.")
+            return
+        elif approval == 'u':
+            new_instruction = input(f"{Colors.BOLD}Please provide the updated instruction: {Colors.RESET}")
+            # Re-run blueprint generation with the new instruction
+            approval, generated_blueprint = generate_and_review_blueprint(target_name, new_instruction, context_map)
+            if approval != 'y':
+                print("🛑 Blueprint update rejected or aborted. Aborting refactoring.")
+                return
+            instruction = new_instruction # Use the new instruction for the refactoring
+
+    # PROCEED WITH REFACTORING (for blueprint-approved and direct workflows)
+    
     current_files_content = original_files_content.copy()
 
-    # --- WORKFLOW DECISION ---
-    if blueprint:
-        # 2.A. BLUEPRINT-DRIVEN WORKFLOW
-        approval, blueprint_json = draft_and_review_living_blueprint(target_name, instruction, context_map)
-        if approval != 'y':
-            print("🛑 Blueprint not approved. Aborting refactoring.")
-            return
-
-        print("⚙️ Compiling Living Specification into executable prompts...")
-        prompts = compile_living_spec_to_prompts(blueprint_json)
-        if not prompts:
-            print("⚠️ No actionable tasks found in the blueprint. Nothing to do.")
-            return
-        
-        print(f"✅ Compiled {len(prompts)} tasks from the specification.")
-
-        # Execute each task sequentially
-        for i, task_prompt in enumerate(prompts):
-            print(f"\n--- Executing Task {i+1}/{len(prompts)} ---")
-            
-            system_prompt = f"""
-You are a Principal Engineer executing a refactoring task. Your primary goal is to successfully refactor the code according to the user's instructions.
-Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file.
-You have access to the full content of all relevant files. Your task is to modify one or more of them based on the user's request.
-Ensure your changes fully address the user's instruction.
-
-MANDATORY TOOL CONTEXT:
-{tool_context}
-
-Example Output:
-{{
-  "file1.py": "...",
-  "utils/helper.py": "..."
-}}
-            """
-            # Build the full context string for this task
-            full_context_str = ""
-            for path, content in current_files_content.items():
-                full_context_str += f"--- FILE: {path} ---\n{content}\n\n"
-
-            final_user_prompt = f"CONTEXT:\n{full_context_str}\n\nINSTRUCTION:\n{task_prompt}"
-
-            proposed_changes = generate_with_retries(system_prompt, final_user_prompt, current_files_content.copy())
-            
-            if not proposed_changes:
-                print(f"❌ LLM failed to generate valid changes for this task. Aborting.")
-                return
-
-            review_changes(current_files_content, proposed_changes)
-            
-            # Get user approval for this specific set of changes
-            confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply changes for this task? (y/n): {Colors.RESET}").lower().strip()
-
-            if confirm == 'y':
-                apply_updates(proposed_changes)
-                # IMPORTANT: Update the current state for the next task
-                current_files_content.update(proposed_changes)
-                print("✅ Task changes applied.")
-            else:
-                print("🛑 Task changes rejected. Aborting remaining tasks.")
-                return
-
-    else:
-        # 2.B. DIRECT REFACTORING WORKFLOW (Original sequential logic)
-        print("🚀 Starting Direct Refactoring...")
-        # This part can be refactored to use the same `generate_with_retries` as the blueprint mode
-        # For now, keeping the old logic for compatibility if --blueprint is not used.
-        # Note: The original `orchestrate_sequential_refactor` logic was complex and processed
-        # file-by-file. We will simplify it to a single-shot attempt for non-blueprint mode.
-        
-        system_prompt = f"""
+    # The logic from the old `orchestrate_sequential_refactor` and the newer `generate_with_retries`
+    # are being merged here. We will use a single-shot approach for simplicity as the newer implementation does.
+    
+    print("🚀 Starting Refactoring Process...")
+    system_prompt = f"""
 You are a Principal Engineer. Your primary goal is to successfully refactor the code based on the user's instruction.
 Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file.
 You have access to the full content of all relevant files. Modify them as needed.
@@ -791,26 +861,28 @@ Ensure your changes fully address the user's instruction.
 
 MANDATORY TOOL CONTEXT:
 {tool_context}
-        """
-        context_str = ""
-        for path, content in original_files_content.items():
-            context_str += f"--- FILE: {path} ---\n{content}\n\n"
-        
-        user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
+    """
+    context_str = ""
+    for path, content in original_files_content.items():
+        context_str += f"--- FILE: {path} ---\n{content}\n\n"
+    
+    user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
 
-        proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_content.copy())
-        
-        if not proposed_changes:
-            print("❌ LLM failed to generate any valid changes.")
-            return
+    # Using the robust `generate_with_retries` function for the core refactoring logic
+    proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_content.copy())
+    
+    if not proposed_changes:
+        print("❌ LLM failed to generate any valid changes.")
+        return
 
-        review_changes(original_files_content, proposed_changes)
-        confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply all proposed changes? (y/n): {Colors.RESET}").lower()
-        if confirm == 'y':
-            apply_updates(proposed_changes)
-            print("✅ All changes applied.")
-        else:
-            print("🛑 Changes rejected.")
+    review_changes(original_files_content, proposed_changes)
+    
+    confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply all proposed changes? (y/n): {Colors.RESET}").lower()
+    if confirm == 'y':
+        apply_updates(proposed_changes)
+        print("✅ All changes applied.")
+    else:
+        print("🛑 Changes rejected.")
 
 
 if __name__ == "__main__":
@@ -819,6 +891,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
     arg_parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
     arg_parser.add_argument("--blueprint", action="store_true", help="Generate a 'Living Specification' blueprint of the changes and ask for approval before applying them.")
+    arg_parser.add_argument("--blueprint-export", action="store_true", help="Generate and export the 'Living Specification' JSON to a file without execution.")
     
     args = arg_parser.parse_args()
-    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint)
+    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint, args.blueprint_export)
