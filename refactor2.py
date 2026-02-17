@@ -148,6 +148,22 @@ def drive_agent_from_spec(blueprint_json):
     """
     tasks = []
     
+    # Helper function to extract text from any nested Tiptap content
+    def get_text_from_node(node_content):
+        text = ""
+        if isinstance(node_content, list):
+            for part in node_content:
+                text += get_text_from_node(part)
+        elif isinstance(node_content, dict):
+            if node_content.get('type') == 'text':
+                text += node_content.get('text', '')
+            elif node_content.get('type') == 'mention':
+                # Use 'label' if available, otherwise fallback to 'id'
+                text += node_content.get('attrs', {}).get('label', node_content.get('attrs', {}).get('id', ''))
+            elif 'content' in node_content:
+                text += get_text_from_node(node_content['content'])
+        return text
+
     # 1. Find the "Implementation Plan" section
     content_blocks = blueprint_json.get('content', [])
     plan_started = False
@@ -172,12 +188,8 @@ def drive_agent_from_spec(blueprint_json):
     # 2. Walk the taskList node to find 'taskItem' nodes
     def extract_tasks_from_list(node):
         if node.get('type') == 'taskItem':
-            task_text = ""
-            if node.get('content'):
-                for content_part in node.get('content', []):
-                    if content_part.get('type') == 'text':
-                        task_text += content_part.get('text', '')
-
+            # Use the helper to get text from potentially nested content
+            task_text = get_text_from_node(node.get('content', []))
             is_checked = node.get('attrs', {}).get('checked', False)
             
             if task_text and not is_checked:
@@ -185,6 +197,8 @@ def drive_agent_from_spec(blueprint_json):
         
         if 'content' in node and node['content'] is not None:
             for child in node['content']:
+                # Recursively call extract_tasks_from_list for any nested taskItems
+                # This also handles cases where other nodes (like paragraphs) contain taskItems
                 extract_tasks_from_list(child)
 
     if task_list_node:
@@ -1024,7 +1038,7 @@ MANDATORY TOOL CONTEXT:
 {tool_context}
     """
     context_str = ""
-    for path, content in original_files_full_content.items():
+    for path, content in original_files_content.items():
         context_str += f"--- FILE: {path} ---\n{content}\n\n"
     
     user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
