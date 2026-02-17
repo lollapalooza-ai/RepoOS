@@ -61,6 +61,161 @@ class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
+TIPTAP_SYSTEM_PROMPT = """
+You are a Principal Software Architect. Your goal is to design a concrete implementation plan.
+DO NOT output conversational text.
+DO NOT output Markdown.
+Output ONLY a valid JSON object matching the Tiptap schema structure below.
+
+Structure Rules:
+1. Root object must be { "type": "doc", "content": [...] }
+2. Use "heading" nodes for sections (Level 1: Title, Level 2: Component).
+3. Use "paragraph" nodes for architectural reasoning.
+4. Use "taskList" and "taskItem" nodes for actionable steps.
+5. Use "codeBlock" nodes for crucial snippets (schemas, signatures).
+
+Example Output:
+{
+  "type": "doc",
+  "content": [
+    { "type": "heading", "attrs": { "level": 1 }, "content": [{ "type": "text", "text": "Plan: OAuth Migration" }] },
+    { "type": "paragraph", "content": [{ "type": "text", "text": "We will replace MD5 with Auth0." }] },
+    { "type": "taskList", "content": [
+        { "type": "taskItem", "attrs": { "checked": false }, "content": [{ "type": "text", "text": "[Backend] Install Auth0 SDK" }] }
+      ]
+    }
+  ]
+}
+"""
+
+def clean_json_output(response_text):
+    """
+    Sanitizes LLM output to extract just the JSON object.
+    """
+    # Remove markdown code fences if present
+    response_text = re.sub(r'```json', '', response_text)
+    response_text = re.sub(r'```', '', response_text)
+    return response_text.strip()
+
+def generate_blueprint_json(user_intent, context):
+    """
+    Generates a Tiptap-compatible JSON blueprint.
+    """
+    prompt = f"""
+    CONTEXT:
+    {context}
+
+    USER INTENT:
+    {user_intent}
+
+    TASK:
+    Create a detailed Spec-Driven Development plan for this intent.
+    Break it down into:
+    1. Executive Summary (Why?)
+    2. Architecture Changes (What?)
+    3. Step-by-Step Implementation Tasks (How?)
+    """
+    
+    # Call your local LLM (Qwen/Llama)
+    # response = llm_client.generate(system=TIPTAP_SYSTEM_PROMPT, user=prompt)
+    
+    # MOCK RESPONSE (For testing flow without model):
+    mock_response = f"""
+    {{
+      "type": "doc",
+      "content": [
+        {{ "type": "heading", "attrs": {{ "level": 1 }}, "content": [{{ "type": "text", "text": "Refactor: {user_intent}" }}] }},
+        {{ "type": "paragraph", "content": [{{ "type": "text", "text": "This spec defines the migration path." }}] }},
+        {{ "type": "taskList", "content": [
+            {{ "type": "taskItem", "attrs": {{ "checked": false }}, "content": [{{ "type": "text", "text": "Step 1: Audit legacy code" }}] }},
+            {{ "type": "taskItem", "attrs": {{ "checked": false }}, "content": [{{ "type": "text", "text": "Step 2: Create interface adapters" }}] }}
+        ]}}
+      ]
+    }}
+    """
+    
+    try:
+        # data = json.loads(clean_json_output(response.text)) # Real Line
+        data = json.loads(clean_json_output(mock_response)) # Mock Line
+        return data
+    except json.JSONDecodeError:
+        print("Error: AI did not generate valid JSON.")
+        return None
+
+def drive_agent_from_spec(blueprint_json):
+    """
+    Parses the Tiptap JSON and executes tasks from the "Implementation Plan" section.
+    """
+    tasks = []
+    
+    # 1. Find the "Implementation Plan" section
+    content_blocks = blueprint_json.get('content', [])
+    plan_started = False
+    task_list_node = None
+
+    for i, block in enumerate(content_blocks):
+        if block.get('type') == 'heading':
+            heading_text = ""
+            # Ensure content exists and is a list
+            if block.get('content') and isinstance(block.get('content'), list) and len(block.get('content')) > 0:
+                heading_text = block.get('content', [{}])[0].get('text', '')
+
+            if 'Implementation Plan' in heading_text:
+                plan_started = True
+                continue # The next block should be the taskList
+        
+        if plan_started:
+            if block.get('type') == 'taskList':
+                task_list_node = block
+                break # Found the task list, no need to search further
+
+    # 2. Walk the taskList node to find 'taskItem' nodes
+    def extract_tasks_from_list(node):
+        if node.get('type') == 'taskItem':
+            task_text = ""
+            if node.get('content'):
+                for content_part in node.get('content', []):
+                    if content_part.get('type') == 'text':
+                        task_text += content_part.get('text', '')
+
+            is_checked = node.get('attrs', {}).get('checked', False)
+            
+            if task_text and not is_checked:
+                tasks.append(task_text.strip())
+        
+        if 'content' in node and node['content'] is not None:
+            for child in node['content']:
+                extract_tasks_from_list(child)
+
+    if task_list_node:
+        extract_tasks_from_list(task_list_node)
+    else:
+        print("Could not find a 'taskList' under the 'Implementation Plan' heading.")
+
+    if not tasks:
+        print("No actionable tasks found in the Implementation Plan.")
+        return
+
+    print(f"Found {len(tasks)} actionable tasks in Spec.")
+    
+    # 3. Execute with Agent (One by One)
+    for i, task in enumerate(tasks):
+        print(f"\n--- Executing Task {i+1}/{len(tasks)}: {task} ---")
+        
+        # Construct the Prompt for the Agent
+        agent_prompt = f"""
+        You are a coding agent working on a larger refactor.
+        
+        CURRENT TASK:
+        {task}
+        
+        Adhere strictly to this task. Do not hallucinate extra scope.
+        """
+        
+        # Call your Agent (e.g., Aider, Claude, or local function)
+        # execute_agent(agent_prompt)
+        print("Agent finished task.")
+
 def extract_constraints(instruction):
     """
     Uses a small, fast prompt to identify 'Must Haves' in the user instruction.
@@ -519,6 +674,46 @@ def generate_with_retries(system_prompt, initial_user_content, original_files_fu
     print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
     return None
 
+def _perform_llm_refactor_step(instruction, original_files_full_content, context_map, tool_context, auto_confirm=False):
+    """
+    Performs a single LLM refactor step: generates changes, validates, reviews, and applies.
+    Returns updated files content or None if changes are rejected/failed.
+    """
+    print("🚀 Starting Refactoring Process for a step...")
+    system_prompt = f"""
+You are a Principal Engineer. Your primary goal is to successfully refactor the code based on the user's instruction.
+Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file.
+You have access to the full content of all relevant files. Modify them as needed.
+Ensure your changes fully address the user's instruction.
+
+MANDATORY TOOL CONTEXT:
+{tool_context}
+    """
+    context_str = ""
+    for path, content in original_files_full_content.items():
+        context_str += f"--- FILE: {path} ---\n{content}\n\n"
+    
+    user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
+
+    proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_full_content.copy())
+    
+    if not proposed_changes:
+        print("❌ LLM failed to generate any valid changes for this step.")
+        return None
+
+    review_changes(original_files_full_content, proposed_changes)
+    
+    confirm = 'y' if auto_confirm else input(f"\n{Colors.BOLD}Apply proposed changes for this step? (y/n): {Colors.RESET}").lower()
+    if confirm == 'y':
+        # Create a new dictionary to hold the updated state
+        updated_files_content = original_files_full_content.copy()
+        updated_files_content.update(proposed_changes)
+        print("✅ Changes accepted for this step (in-memory).")
+        return updated_files_content
+    else:
+        print("🛑 Changes rejected for this step.")
+        return None
+
 def get_visual_architecture(session, context_map):
     """
     Queries Neo4j to build a textual visualization of the architecture
@@ -546,7 +741,10 @@ def get_visual_architecture(session, context_map):
         # Get outgoing CALLS_API relationships
         api_calls_result = session.run("MATCH ({name: $name})-[r:CALLS_API]->() RETURN r.endpoint as endpoint ORDER BY endpoint", name=item_name)
         for record in api_calls_result:
-            viz_lines.append(f"    ⚡ Found and linked API Call: {item_name} -> {record['endpoint']}")
+            endpoint = record['endpoint']
+            if endpoint:
+                cleaned_endpoint = re.sub(r'\{.*?\}', '', endpoint)
+                viz_lines.append(f"    ⚡ Found and linked API Call: {item_name} -> {cleaned_endpoint}")
 
     return "\n".join(viz_lines)
 
@@ -563,8 +761,8 @@ def draft_and_review_living_blueprint(target_name, instruction, context_map, exp
     # --- END ---
 
     blueprint_prompt = f"""
-You are a senior architect. Your task is to create a "Living Specification" for a refactoring task.
-This specification must be a JSON object that is both human-readable and machine-parseable.
+You are a senior architect. Your task is to create a "Living Specification" for a refactoring task
+in the Tiptap JSON format. You MUST follow all instructions precisely.
 
 **INSTRUCTION:**
 {instruction}
@@ -574,71 +772,41 @@ The user wants to refactor code related to '{target_name}'.
 The following files and items have been identified as relevant:
 {json.dumps(context_map, indent=2)}
 
-Here is a view of the existing architecture based on the context:
+Here is a textual view of the existing architecture based on the context. Use this to create the Mermaid diagrams:
 ```
 {existing_arch_viz}
 ```
 
 **YOUR TASK:**
-Generate a single JSON object with the following structure:
-1.  `"type": "doc"`
-2.  `"content": [...]` - An array of blocks.
+Generate a single, valid JSON object that represents the entire specification.
+The root of the object MUST be `{{"type": "doc", "content": [...]}}`.
 
-**BLOCK TYPES:**
-- **`heading`**: For section titles. e.g., {{"type": "heading", "attrs": {{"level": 1}}, "content": [{{"type": "text", "text": "1. Introduction"}}]}}`
-- **`paragraph`**: For explanatory text. This text provides context for the AI agents.
-- **`taskItem`**: **This is the most important block.** It represents a single, executable refactoring task for an AI agent.
-    - Inside a `taskItem`, you can include `text` content and `mention` content.
-    - A `mention` represents a "Smart Reference" to a code asset. The `id` attribute of the mention MUST be the name of the function or class, not the file path. Use it to link to specific functions or classes that are relevant to the task. e.g., {{"type": "mention", "attrs": {{"id": "UserAuth", "label": "UserAuth"}}, "content": []}}`
+The `content` array MUST contain the following sections in this exact order:
+1.  **Introduction:** A `heading` (level 2) followed by a `paragraph`.
+2.  **Background:** A `heading` (level 2) followed by a `paragraph`.
+3.  **Justification:** A `heading` (level 2) followed by a `paragraph`.
+4.  **Existing Architecture:** A `heading` (level 2), followed by a `paragraph` explaining the details, AND THEN a `codeBlock` with `language: 'mermaid'`.
+5.  **Proposed Architecture:** A `heading` (level 2), followed by a `paragraph` explaining the details, AND THEN a `codeBlock` with `language: 'mermaid'`.
+6.  **Implementation Plan:** A `heading` (level 2) followed by a `taskList` block.
 
-**EXAMPLE JSON STRUCTURE:**
-```json
-{{
-  "type": "doc",
-  "content": [
-    {{
-      "type": "heading",
-      "attrs": {{"level": 1}},
-      "content": [{{"type": "text", "text": "Refactor Authentication Logic"}}]
-    }},
-    {{
-      "type": "paragraph",
-      "content": [{{"type": "text", "text": "The current authentication system uses a monolithic function. We will break it down into smaller, more manageable pieces."}}]
-    }},
-    {{
-      "type": "taskItem",
-      "content": [
-        {{
-          "type": "text",
-          "text": "Create a new function `_authenticate_user` that encapsulates the logic from "
-        }},
-        {{
-          "type": "mention",
-          "attrs": {{
-            "id": "search_monolith",
-            "label": "search_monolith"
-          }}
-        }},
-        {{
-            "type": "text",
-            "text": "."
-        }}
-      ]
-    }},
-    {{
-      "type": "taskItem",
-      "content": [
-        {{
-            "type": "text",
-            "text": "Update the main route to call the new `_authenticate_user` function."
-        }}
-      ]
-    }}
-  ]
-}}
-```
+**ARCHITECTURE DIAGRAM RULES:**
+- You MUST generate valid Mermaid.js graph syntax.
+- **Existing Architecture Diagram:** Visualize the architecture described in the context. All nodes should be default style.
+- **Proposed Architecture Diagram:** Visualize the NEW state of the architecture. You MUST define and apply styles to show changes.
+- At the top of the **Proposed Architecture** diagram, you MUST define these classes:
+  ```mermaid
+  classDef added fill:#9f9,stroke:#333,stroke-width:2px
+  classDef modified fill:#ff9,stroke:#333,stroke-width:2px
+  classDef removed fill:#f99,stroke:#333,stroke-width:2px
+  ```
+- Apply these classes to nodes that are new, modified, or removed. For example: `NewFunction:::added`, `ChangedFunc:::modified`.
 
-Now, generate the complete JSON object for the user's instruction.
+**IMPLEMENTATION PLAN RULES:**
+- The `taskList` must contain one or more `taskItem` blocks.
+- Each `taskItem` is an executable step.
+- Use `mention` nodes to reference code assets like functions or classes. The `id` of the mention MUST be the name of the asset.
+
+Now, generate the complete Tiptap JSON object for the user's instruction, following all rules precisely.
 """
 
     # Call the LLM to generate the blueprint
@@ -789,7 +957,7 @@ def generate_and_review_blueprint(target_name, instruction, context_map, approva
             return approval, blueprint
         print("Invalid input. Please enter 'y', 'n', or 'u'.")
 
-def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint=False, blueprint_export=False):
+def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint=False, blueprint_export=None):
     """
     The main orchestrator for the refactoring process.
     Supports three modes:
@@ -811,16 +979,26 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint
     # --- WORKFLOW DECISION ---
     if blueprint_export:
         # WORKFLOW 3: EXPORT JSON BLUEPRINT
-        _, blueprint_json = draft_and_review_living_blueprint(target_name, instruction, context_map, export_mode=True)
+        blueprint_json = generate_blueprint_json(instruction, json.dumps(context_map, indent=2))
         if blueprint_json:
-            with open("repo_os_blueprint.json", "w") as f:
+            with open(blueprint_export, "w") as f:
                 json.dump(blueprint_json, f, indent=2)
-            print(f"\n{Colors.GREEN}✅ Tiptap JSON blueprint exported to repo_os_blueprint.json{Colors.RESET}")
+            print(f"\n{Colors.GREEN}✅ Tiptap JSON blueprint exported to {blueprint_export}{Colors.RESET}")
         else:
             print(f"\n{Colors.RED}❌ Failed to generate Tiptap JSON blueprint for export.{Colors.RESET}")
         return  # Exit after exporting
+    
+    if blueprint:
+        # WORKFLOW 2: GENERATE AND PRINT JSON BLUEPRINT
+        blueprint_json = generate_blueprint_json(instruction, json.dumps(context_map, indent=2))
+        if blueprint_json:
+            print(json.dumps(blueprint_json, indent=2))
+        else:
+            print(f"\n{Colors.RED}❌ Failed to generate Tiptap JSON blueprint.{Colors.RESET}")
+        return # Exit after printing
 
-    # Load file contents for the remaining workflows
+    # PROCEED WITH REFACTORING (for direct workflow)
+    
     original_files_content = {
         file_path: fetch_file_content(file_path)
         for file_path in context_map.keys()
@@ -830,23 +1008,6 @@ def orchestrate_refactor(target_name, instruction, auto_confirm=False, blueprint
         print("❌ Could not read content for any of the context files. Aborting.")
         return
 
-    if blueprint:
-        # WORKFLOW 2: TEXTUAL BLUEPRINT AND REFACTOR
-        approval, generated_blueprint = generate_and_review_blueprint(target_name, instruction, context_map)
-        if approval == 'n':
-            print("🛑 Blueprint rejected. Aborting refactoring.")
-            return
-        elif approval == 'u':
-            new_instruction = input(f"{Colors.BOLD}Please provide the updated instruction: {Colors.RESET}")
-            # Re-run blueprint generation with the new instruction
-            approval, generated_blueprint = generate_and_review_blueprint(target_name, new_instruction, context_map)
-            if approval != 'y':
-                print("🛑 Blueprint update rejected or aborted. Aborting refactoring.")
-                return
-            instruction = new_instruction # Use the new instruction for the refactoring
-
-    # PROCEED WITH REFACTORING (for blueprint-approved and direct workflows)
-    
     current_files_content = original_files_content.copy()
 
     # The logic from the old `orchestrate_sequential_refactor` and the newer `generate_with_retries`
@@ -863,7 +1024,7 @@ MANDATORY TOOL CONTEXT:
 {tool_context}
     """
     context_str = ""
-    for path, content in original_files_content.items():
+    for path, content in original_files_full_content.items():
         context_str += f"--- FILE: {path} ---\n{content}\n\n"
     
     user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
@@ -886,12 +1047,66 @@ MANDATORY TOOL CONTEXT:
 
 
 if __name__ == "__main__":
-    arg_parser = argparse.ArgumentParser(description="Repo OS Refactoring Orchestrator.")
-    arg_parser.add_argument("target_name", help="The fully qualified name of the function or class to refactor (e.g., Car.start).")
-    arg_parser.add_argument("instruction", nargs='+', help="The refactoring instruction for the AI (e.g., 'Rename to ignite_engine').")
-    arg_parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm the write operation.")
-    arg_parser.add_argument("--blueprint", action="store_true", help="Generate a 'Living Specification' blueprint of the changes and ask for approval before applying them.")
-    arg_parser.add_argument("--blueprint-export", action="store_true", help="Generate and export the 'Living Specification' JSON to a file without execution.")
+    parser = argparse.ArgumentParser(description="Repo OS Refactoring Orchestrator.")
+    parser.add_argument("--blueprint", action="store_true", help="Generate and print a Spec JSON.")
+    parser.add_argument("--blueprint-export", type=str, help="Generate a Spec JSON and save it to the provided path.")
+    parser.add_argument("--drive-spec", type=str, help="Read a Spec JSON from a file and drive the agent.")
+    parser.add_argument("-y", "--yes", action="store_true", help="Automatically confirm write operations in direct refactoring mode.")
     
-    args = arg_parser.parse_args()
-    orchestrate_refactor(args.target_name, " ".join(args.instruction), args.yes, args.blueprint, args.blueprint_export)
+    args, unknown_args = parser.parse_known_args()
+
+    if args.drive_spec:
+        try:
+            with open(args.drive_spec, 'r') as f:
+                spec_json = json.load(f)
+            drive_agent_from_spec(spec_json)
+        except FileNotFoundError:
+            print(f"Error: Spec file not found at {args.drive_spec}")
+        except json.JSONDecodeError:
+            print(f"Error: Could not decode JSON from {args.drive_spec}")
+    elif args.blueprint or args.blueprint_export:
+        instruction_parts = [part for part in unknown_args if part not in (str(args.blueprint), str(args.blueprint_export))]
+
+        if instruction_parts:
+            intent = " ".join(instruction_parts)
+            print(f"Received Intent: {intent}")
+        else:
+            intent = input("Enter Refactor Intent: ")
+
+        # For blueprint generation, we use a generic target name and let the context gathering find it.
+        target_name = 'auto' 
+        context_map, error = get_hybrid_context(intent, explicit_target=target_name)
+
+        if error:
+            print(f"Error gathering context: {error}")
+        else:
+            # Determine if we are in export mode (non-interactive)
+            is_export_mode = args.blueprint_export is not None
+            
+            # Call the real blueprint generation function
+            approval, blueprint_json = draft_and_review_living_blueprint(
+                target_name, intent, context_map, export_mode=is_export_mode
+            )
+
+            if approval == 'y' and blueprint_json:
+                if args.blueprint_export:
+                    with open(args.blueprint_export, "w") as f:
+                        json.dump(blueprint_json, f, indent=2)
+                    print(f"\n{Colors.GREEN}✅ Living Specification exported to {args.blueprint_export}{Colors.RESET}")
+                else:
+                    # The blueprint is already printed to the console by the function
+                    print(f"\n{Colors.GREEN}✅ Living Specification generated.{Colors.RESET}")
+            elif not blueprint_json:
+                 print(f"\n{Colors.RED}❌ Failed to generate a valid Living Specification.{Colors.RESET}")
+            else: # Approval was 'n'
+                print("\n🛑 Blueprint rejected by user. Aborting.")
+    else:
+        # Fallback to original refactoring behavior
+        # We need to re-parse the other arguments.
+        if len(unknown_args) >= 2:
+            target_name = unknown_args[0]
+            instruction = " ".join(unknown_args[1:])
+            orchestrate_refactor(target_name, instruction, args.yes)
+        else:
+            print("For direct refactoring, please provide a target name and an instruction.")
+            parser.print_help()
