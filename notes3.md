@@ -1,317 +1,222 @@
-Now let us build a view for the blueprint we've created.
+We want to make the blueprint we generate (both --blueprint and --blueprint-export options) to make spec-driven development. Below are the instructions on how to make it. 
+Note that we want to retain all the existing sections (like background, justification, existing architecture, proposed architecture, etc) and add a new section called "Implementation Plan" at the end of the blueprint.
+The "Implementation Plan" section should include the spec-driven development checklists. 
 
-We will use **React (Vite)** for the frontend and **FastAPI** as the lightweight bridge between your existing Python logic (`refactor2.py`) and the UI. This separation of concerns is critical for scalability.
-
-### **Phase 1: The Architecture**
-
-* **Backend (Python/FastAPI):** Your AI generates the Blueprint JSON and serves it via a REST API.
-* **Frontend (React/Tiptap):** Consumes the JSON, renders the "Google Doc" interface, and sends edits back to the backend.
+Here is the step-by-step implementation plan to modify `refactor2.py` and your workflow to support **Spec-Driven Development (SDD)** via the JSON Blueprint.
+Ignore anything that already exists.
 
 ---
 
-### **Phase 2: Step-by-Step Implementation**
+### **Phase 1: The New "Mental Model"**
 
-#### **Step 1: Set up the Project Structure**
+We are changing the output of your AI.
 
-We will create a monorepo-style structure to keep your Python and JS clean.
+* **Old:** "Write a plan." -> AI vomits Markdown text.
+* **New:** "Design a Spec." -> AI builds a **JSON Graph**.
 
-```bash
-mkdir backend frontend
+This JSON Graph isn't just for display; it's a **Task Dependency Tree**.
 
-```
+* **Root:** The Feature (e.g., "Auth Refactor").
+* **Branch:** The Component (e.g., "Database Schema").
+* **Leaf:** The Atomic Task (e.g., "Add `auth_provider` column to `users` table").
 
-#### **Step 2: The Backend (Python + FastAPI)**
+---
 
-We need a tiny server to "host" the blueprint so the frontend can fetch it.
+### **Phase 2: Modify `refactor2.py**`
 
-1. **Install FastAPI:**
-```bash
-cd backend
-pip install fastapi uvicorn
+We need to force the LLM to output valid Tiptap JSON. We will use a **"Schema-Enforced System Prompt"** pattern.
 
-```
+#### **1. Define the Schema (The "Contract")**
 
+Update `refactor2.py` with this :
 
-2. **Create `server.py`:**
-This script acts as the API. It mocks the AI generation for now but is ready to import your `refactor2.py` logic later.
 ```python
-# backend/server.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, Any
+# refactor2.py
 
-app = FastAPI()
+TIPTAP_SYSTEM_PROMPT = """
+You are a Principal Software Architect. Your goal is to design a concrete implementation plan.
+DO NOT output conversational text.
+DO NOT output Markdown.
+Output ONLY a valid JSON object matching the Tiptap schema structure below.
 
-# Allow React to talk to Python
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"], # Vite's default port
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+Structure Rules:
+1. Root object must be { "type": "doc", "content": [...] }
+2. Use "heading" nodes for sections (Level 1: Title, Level 2: Component).
+3. Use "paragraph" nodes for architectural reasoning.
+4. Use "taskList" and "taskItem" nodes for actionable steps.
+5. Use "codeBlock" nodes for crucial snippets (schemas, signatures).
 
-# 1. The Data Structure (Tiptap Schema)
-# This is what your AI must generate.
-MOCK_BLUEPRINT = {
-    "type": "doc",
-    "content": [
-        {
-            "type": "heading",
-            "attrs": { "level": 1 },
-            "content": [{ "type": "text", "text": "Repo OS: Auth Refactor Plan" }]
-        },
-        {
-            "type": "paragraph",
-            "content": [{ "type": "text", "text": "The objective is to replace the legacy MD5 hashing with Auth0." }]
-        },
-        {
-            "type": "taskList", 
-            "content": [
-                {
-                    "type": "taskItem",
-                    "attrs": { "checked": False },
-                    "content": [{ "type": "text", "text": "Install Auth0 SDK" }]
-                },
-                {
-                    "type": "taskItem",
-                    "attrs": { "checked": False },
-                    "content": [{ "type": "text", "text": "Migrate User Table" }]
-                }
-            ]
-        }
-    ]
+Example Output:
+{
+  "type": "doc",
+  "content": [
+    { "type": "heading", "attrs": { "level": 1 }, "content": [{ "type": "text", "text": "Plan: OAuth Migration" }] },
+    { "type": "paragraph", "content": [{ "type": "text", "text": "We will replace MD5 with Auth0." }] },
+    { "type": "taskList", "content": [
+        { "type": "taskItem", "attrs": { "checked": false }, "content": [{ "type": "text", "text": "[Backend] Install Auth0 SDK" }] }
+      ]
+    }
+  ]
 }
+"""
 
-class BlueprintRequest(BaseModel):
-    content: Dict[str, Any]
+```
 
-@app.get("/blueprint")
-def get_blueprint():
-    # In the future: return refactor2.generate_blueprint_json()
-    return MOCK_BLUEPRINT
+#### **2. Update the Generation Logic**
 
-@app.post("/save")
-def save_blueprint(data: BlueprintRequest):
-    print("Received updated blueprint from User!")
-    # In the future: save to Neo4j or trigger the coding agent
-    return {"status": "success"}
+Modify your `generate_blueprint` function to use this prompt and parse the result.
 
+```python
+import json
+import re
+
+def clean_json_output(response_text): (ignore if already exists)
+    """
+    Sanitizes LLM output to extract just the JSON object.
+    """
+    # Remove markdown code fences if present
+    response_text = re.sub(r'```json', '', response_text)
+    response_text = re.sub(r'```', '', response_text)
+    return response_text.strip()
+
+def generate_blueprint_json(user_intent, context):
+    """
+    Generates a Tiptap-compatible JSON blueprint.
+    """
+    prompt = f"""
+    CONTEXT:
+    {context}
+
+    USER INTENT:
+    {user_intent}
+
+    TASK:
+    Create a detailed Spec-Driven Development plan for this intent.
+    Break it down into:
+    1. Executive Summary (Why?)
+    2. Architecture Changes (What?)
+    3. Step-by-Step Implementation Tasks (How?)
+    """
+    
+    # Call your local LLM (Qwen/Llama)
+    # response = llm_client.generate(system=TIPTAP_SYSTEM_PROMPT, user=prompt)
+    
+    # MOCK RESPONSE (For testing flow without model):
+    mock_response = """
+    {
+      "type": "doc",
+      "content": [
+        { "type": "heading", "attrs": { "level": 1 }, "content": [{ "type": "text", "text": "Refactor: " + user_intent }] },
+        { "type": "paragraph", "content": [{ "type": "text", "text": "This spec defines the migration path." }] },
+        { "type": "taskList", "content": [
+            { "type": "taskItem", "attrs": { "checked": false }, "content": [{ "type": "text", "text": "Step 1: Audit legacy code" }] },
+            { "type": "taskItem", "attrs": { "checked": false }, "content": [{ "type": "text", "text": "Step 2: Create interface adapters" }] }
+        ]}
+      ]
+    }
+    """
+    
+    try:
+        # data = json.loads(clean_json_output(response.text)) # Real Line
+        data = json.loads(clean_json_output(mock_response)) # Mock Line
+        return data
+    except json.JSONDecodeError:
+        print("Error: AI did not generate valid JSON.")
+        return None
+
+```
+
+#### **3. The "Spec-Driven" CLI Commands**
+
+Update your `main` block to handle the new `--blueprint` flag.
+
+```python
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--blueprint", action="store_true", help="Generate a Spec JSON")
+    parser.add_argument("--blueprint-export", type=str, help="Path to save JSON")
+    args = parser.parse_args()
+
+    if args.blueprint:
+        intent = input("Enter Refactor Intent: ")
+        blueprint = generate_blueprint_json(intent, "Load graph context here...")
+        
+        if args.blueprint_export:
+            with open(args.blueprint_export, "w") as f:
+                json.dump(blueprint, f, indent=2)
+            print(f"Blueprint saved to {args.blueprint_export}")
+        else:
+            print(json.dumps(blueprint, indent=2))
 
 ```
-
-
-3. **Run the Server:**
-```bash
-python server.py
-
-```
-
-
-*Leave this terminal open.*
 
 ---
 
-#### **Step 3: The Frontend (React + Tiptap)**
+### **Phase 3: The "Spec Driver" (Converting Spec -> Agent Tasks)**
 
-Now, let's build the editor.
+This is the most critical part of **Spec-Driven Development**. You need a function that takes the *final* JSON (after you've edited it in React) and turns it into a series of commands for the Coding Agent.
 
-1. **Initialize Vite (in a new terminal):**
-```bash
-cd ../frontend
-npm create vite@latest . -- --template react
-npm install
+Add this function to `refactor2.py` (or a new `spec_driver.py`).
 
-```
-
-
-2. **Install Tiptap Dependencies:**
-We need the core editor, the starter kit (paragraphs, headers), and the task list extension.
-```bash
-npm install @tiptap/react @tiptap/starter-kit @tiptap/extension-task-list @tiptap/extension-task-item axios
-
-```
-
-
-3. **Create the Editor Component (`src/BlueprintEditor.jsx`):**
-This component fetches the JSON from Python and renders it.
-```jsx
-// src/BlueprintEditor.jsx
-import React, { useEffect, useState } from 'react'
-import { useEditor, EditorContent } from '@tiptap/react'
-import StarterKit from '@tiptap/starter-kit'
-import TaskList from '@tiptap/extension-task-list'
-import TaskItem from '@tiptap/extension-task-item'
-import axios from 'axios'
-
-const BlueprintEditor = () => {
-  const [status, setStatus] = useState('Loading...')
-
-  const editor = useEditor({
-    extensions: [
-      StarterKit,
-      TaskList,
-      TaskItem.configure({ nested: true }),
-    ],
-    content: '<p>Initializing...</p>',
-  })
-
-  // Fetch the Blueprint from Python on Mount
-  useEffect(() => {
-    const fetchBlueprint = async () => {
-      try {
-        const response = await axios.get('http://localhost:8000/blueprint')
-        if (editor) {
-          // Load the JSON directly into the editor
-          editor.commands.setContent(response.data)
-          setStatus('Ready')
-        }
-      } catch (error) {
-        console.error("Error fetching blueprint:", error)
-        setStatus('Error connecting to Python')
-      }
-    }
-    fetchBlueprint()
-  }, [editor])
-
-  const handleSave = async () => {
-    if (!editor) return
-    const json = editor.getJSON()
-
-    // Send the edited JSON back to Python
-    await axios.post('http://localhost:8000/save', { content: json })
-    setStatus('Saved to Core!')
-    setTimeout(() => setStatus('Ready'), 2000)
-  }
-
-  if (!editor) return null
-
-  return (
-    <div className="editor-container">
-      <div className="toolbar">
-        <span className="status-indicator">{status}</span>
-        <button onClick={handleSave} className="save-btn">
-          Compile & Run Agent
-        </button>
-      </div>
-
-      <div className="document-sheet">
-        <EditorContent editor={editor} />
-      </div>
-    </div>
-  )
-}
-
-export default BlueprintEditor
+```python
+def drive_agent_from_spec(blueprint_json):
+    """
+    Parses the Tiptap JSON and executes tasks one by one.
+    """
+    tasks = []
+    
+    # 1. Walk the JSON tree to find 'taskItem' nodes
+    def extract_tasks(node):
+        if node['type'] == 'taskItem':
+            # Extract text from the task
+            task_text = node['content'][0]['text']
+            is_checked = node['attrs'].get('checked', False)
+            
+            # Only execute unchecked tasks (allows resuming)
+            if not is_checked:
+                tasks.append(task_text)
+        
+        if 'content' in node:
+            for child in node['content']:
+                extract_tasks(child)
+                
+    extract_tasks(blueprint_json)
+    
+    print(f"Found {len(tasks)} actionable tasks in Spec.")
+    
+    # 2. Execute with Agent (One by One)
+    for i, task in enumerate(tasks):
+        print(f"\n--- Executing Task {i+1}/{len(tasks)}: {task} ---")
+        
+        # Construct the Prompt for the Agent
+        agent_prompt = f"""
+        You are a coding agent working on a larger refactor.
+        
+        CURRENT TASK:
+        {task}
+        
+        Adhere strictly to this task. Do not hallucinate extra scope.
+        """
+        
+        # Call your Agent (e.g., Aider, Claude, or local function)
+        # execute_agent(agent_prompt)
+        print("Agent finished task.")
 
 ```
 
+### **Phase 4: The Workflow Summary**
 
-4. **Add Basic Styling (`src/index.css`):**
-Tiptap is "headless" (unstyled). You must add CSS to make it look like a document. Append this to your existing CSS:
-```css
-/* src/index.css */
-body {
-  background-color: #f3f4f6;
-  font-family: 'Inter', sans-serif;
-}
-
-.editor-container {
-  max-width: 800px;
-  margin: 40px auto;
-}
-
-.toolbar {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 10px;
-  align-items: center;
-}
-
-.save-btn {
-  background-color: #2563eb;
-  color: white;
-  padding: 8px 16px;
-  border-radius: 6px;
-  border: none;
-  cursor: pointer;
-  font-weight: 600;
-}
-
-.document-sheet {
-  background: white;
-  min-height: 800px;
-  padding: 60px;
-  border-radius: 8px;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-}
-
-/* Tiptap Specific Styles */
-.ProseMirror {
-  outline: none;
-}
-
-.ProseMirror ul[data-type="taskList"] {
-  list-style: none;
-  padding: 0;
-}
-
-.ProseMirror li[data-type="taskItem"] {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-
-```
+1. **Generate:** `python refactor2.py --blueprint --blueprint-export spec.json`
+2. **Visualise & Refine:** Open `spec.json` in your React/Tiptap Dashboard.
+* *You act as the Architect.* You edit the text, reorder tasks, and fix assumptions.
+* *You save the file.*
 
 
-5. **Update `App.jsx`:**
-```jsx
-import BlueprintEditor from './BlueprintEditor'
-
-function App() {
-  return (
-    <div>
-      <BlueprintEditor />
-    </div>
-  )
-}
-
-export default App
-
-```
+3. **Drive:** `python refactor2.py --drive-spec spec.json`
+* The script reads your *refined* spec.
+* It dispatches agents to do the work, checking off items as it goes.
 
 
-
-#### **Step 4: Run It**
-
-In your frontend terminal:
-
-```bash
-npm run dev
-
-```
-
-Open `http://localhost:5173`.
-
-### **Phase 3: The "Aha!" Moment**
-
-You will see a document titled **"Repo OS: Auth Refactor Plan"**.
-
-1. **Edit it:** Click the text. Change "Auth0" to "Cognito".
-2. **Check boxes:** Click the checkbox next to "Install Auth0 SDK".
-3. **Click Save:** Hit "Compile & Run Agent".
-4. **Check Python Terminal:** You will see `Received updated blueprint from User!` printed in your terminal.
-
-### **Next Architectural Move**
-
-You now have the **Loop**.
-
-* **Input:** User prompts in Python.
-* **Process:** AI generates JSON.
-* **Visualize:** React renders JSON.
-* **Refine:** User edits in React.
-* **Execute:** React sends final JSON back to Python to drive the Agent.
+Double check if you've included 1. existing architecture diagram (rendered using mermaid js) 2. proposed delta architecture diagram (also using mermaid js) 3. Only specs in implementation plan must be used
+   when I run "--drive-spec" option, ignoring rest of the sections in the tiptap json.

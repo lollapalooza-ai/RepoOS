@@ -16,7 +16,9 @@ source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && 
 source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python refactor2.py search_monolith "First, modify hello_world endpoint to return a random uuid. The callers of /search endpoint must first call the hello_world endpoint to get a uuid and then calls the search endpoint with the uuid.Make sure to also update the callers of the /search endpoint to use the new uuid parameter." --blueprint
 
 Refactor:
-source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python refactor2.py "First, modify hello_world endpoint to return a random uuid. The callers of /search endpoint must first call the hello_world endpoint to get a uuid and then calls the search endpoint with the uuid.Make sure to also update the callers of the /search endpoint to use the new uuid parameter." --blueprint
+source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python refactor2.py "First, modify hello_world endpoint to return a random uuid. The callers of /search endpoint must first call the hello_world endpoint to get a uuid and then calls the search endpoint with the uuid.Make sure to also update the callers of the /search endpoint to use the new uuid parameter." --blueprint-export repo_os_blueprint.json
+Drive spec
+python refactor2.py --drive-spec repo_os_blueprint.json
 
 Subway map:
 source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python mapper.py "/search"

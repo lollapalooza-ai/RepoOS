@@ -142,7 +142,7 @@ def generate_blueprint_json(user_intent, context):
         print("Error: AI did not generate valid JSON.")
         return None
 
-def drive_agent_from_spec(blueprint_json):
+def drive_agent_from_spec(blueprint_json, auto_confirm=False):
     """
     Parses the Tiptap JSON and executes tasks from the "Implementation Plan" section.
     """
@@ -158,53 +158,43 @@ def drive_agent_from_spec(blueprint_json):
             if node_content.get('type') == 'text':
                 text += node_content.get('text', '')
             elif node_content.get('type') == 'mention':
-                # Use 'label' if available, otherwise fallback to 'id'
                 text += node_content.get('attrs', {}).get('label', node_content.get('attrs', {}).get('id', ''))
             elif 'content' in node_content:
                 text += get_text_from_node(node_content['content'])
         return text
 
-    # 1. Find the "Implementation Plan" section
     content_blocks = blueprint_json.get('content', [])
     plan_started = False
     task_list_node = None
 
     for i, block in enumerate(content_blocks):
         if block.get('type') == 'heading':
-            heading_text = ""
-            # Ensure content exists and is a list
-            if block.get('content') and isinstance(block.get('content'), list) and len(block.get('content')) > 0:
-                heading_text = block.get('content', [{}])[0].get('text', '')
-
+            heading_text = get_text_from_node(block.get('content', []))
             if 'Implementation Plan' in heading_text:
                 plan_started = True
-                continue # The next block should be the taskList
+                continue
         
         if plan_started:
             if block.get('type') == 'taskList':
                 task_list_node = block
-                break # Found the task list, no need to search further
+                break
 
-    # 2. Walk the taskList node to find 'taskItem' nodes
     def extract_tasks_from_list(node):
         if node.get('type') == 'taskItem':
-            # Use the helper to get text from potentially nested content
-            task_text = get_text_from_node(node.get('content', []))
+            task_text = get_text_from_node(node.get('content', [])).strip()
             is_checked = node.get('attrs', {}).get('checked', False)
-            
             if task_text and not is_checked:
-                tasks.append(task_text.strip())
+                tasks.append(task_text)
         
         if 'content' in node and node['content'] is not None:
             for child in node['content']:
-                # Recursively call extract_tasks_from_list for any nested taskItems
-                # This also handles cases where other nodes (like paragraphs) contain taskItems
                 extract_tasks_from_list(child)
 
     if task_list_node:
         extract_tasks_from_list(task_list_node)
     else:
         print("Could not find a 'taskList' under the 'Implementation Plan' heading.")
+        return
 
     if not tasks:
         print("No actionable tasks found in the Implementation Plan.")
@@ -212,23 +202,71 @@ def drive_agent_from_spec(blueprint_json):
 
     print(f"Found {len(tasks)} actionable tasks in Spec.")
     
-    # 3. Execute with Agent (One by One)
+    # --- Context Gathering ---
+    all_mentioned_items = []
+    def find_all_mentions(node):
+        if node.get('type') == 'mention':
+            all_mentioned_items.append(node['attrs']['id'])
+        if 'content' in node and node['content'] is not None:
+            for child in node['content']:
+                find_all_mentions(child)
+    
+    find_all_mentions(blueprint_json)
+    
+    initial_context_map = {}
+    if all_mentioned_items:
+        print("Gathering context from @mentions...")
+        with driver.session() as session:
+            for item_name in set(all_mentioned_items):
+                result = session.run("MATCH (n {name: $name}) RETURN n.file as file_path", name=item_name).single()
+                if result and result['file_path']:
+                    file_path = result['file_path']
+                    if file_path not in initial_context_map: initial_context_map[file_path] = []
+                    initial_context_map[file_path].append(item_name)
+    else:
+        print("No @mentions found. Falling back to regex-based file path extraction from task text.")
+        all_task_text = " ".join(tasks)
+        # Regex to find file paths like 'Repo1/app.py' or 'path/to/file.py'
+        found_files = re.findall(r'([\w/]+\.py)', all_task_text)
+        for file_path in set(found_files):
+            initial_context_map[file_path] = [] # We don't know the specific functions, just the file
+
+    current_files_content = {
+        file_path: fetch_file_content(file_path)
+        for file_path in initial_context_map.keys()
+        if fetch_file_content(file_path) is not None
+    }
+
+    if not current_files_content:
+        print(f"{Colors.RED}Error: Could not read the content of any files mentioned in the spec. Aborting.{Colors.RESET}")
+        return
+
+    # --- Task Execution ---
     for i, task in enumerate(tasks):
         print(f"\n--- Executing Task {i+1}/{len(tasks)}: {task} ---")
         
-        # Construct the Prompt for the Agent
-        agent_prompt = f"""
-        You are a coding agent working on a larger refactor.
-        
-        CURRENT TASK:
-        {task}
-        
-        Adhere strictly to this task. Do not hallucinate extra scope.
-        """
-        
-        # Call your Agent (e.g., Aider, Claude, or local function)
-        # execute_agent(agent_prompt)
-        print("Agent finished task.")
+        # We pass the full set of files we have loaded for each step.
+        # A more advanced implementation might try to filter this down per-task.
+        context_map_for_step = {path: [] for path in current_files_content.keys()}
+
+        updated_files = _perform_llm_refactor_step(
+            instruction=task,
+            original_files_full_content=current_files_content,
+            context_map=context_map_for_step,
+            tool_context="",
+            auto_confirm=auto_confirm
+        )
+
+        if updated_files:
+            current_files_content = updated_files
+            print(f"✅ Task {i+1} completed and changes applied to in-memory state.")
+        else:
+            print(f"🛑 Task {i+1} was rejected or failed. Aborting sequential execution.")
+            return
+
+    print("\n💾 Applying all accepted changes to disk...")
+    apply_updates(current_files_content)
+    print("✅ Spec-driven refactoring complete.")
 
 def extract_constraints(instruction):
     """
@@ -1073,7 +1111,7 @@ if __name__ == "__main__":
         try:
             with open(args.drive_spec, 'r') as f:
                 spec_json = json.load(f)
-            drive_agent_from_spec(spec_json)
+            drive_agent_from_spec(spec_json, auto_confirm=args.yes)
         except FileNotFoundError:
             print(f"Error: Spec file not found at {args.drive_spec}")
         except json.JSONDecodeError:
