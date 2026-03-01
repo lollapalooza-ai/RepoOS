@@ -128,6 +128,8 @@ export class CityscapeRenderer {
   public setData(data: CityscapeData) {
     this.clearScene();
 
+    if (data.nodes.length === 0) return;
+
     // 1. Instanced Mesh for Buildings
     const geometry = new THREE.BoxGeometry(1, 1, 1);
     const material = new THREE.MeshPhongMaterial({ shininess: 100 });
@@ -137,6 +139,7 @@ export class CityscapeRenderer {
     
     const matrix = new THREE.Matrix4();
     const color = new THREE.Color();
+    const box = new THREE.Box3();
 
     data.nodes.forEach((node, i) => {
       matrix.makeScale(node.width, node.height, node.depth);
@@ -145,6 +148,10 @@ export class CityscapeRenderer {
       
       color.set(node.color);
       this.instancedMesh!.setColorAt(i, color);
+
+      // Expand bounding box for camera fitting
+      box.expandByPoint(new THREE.Vector3(node.x, 0, node.z));
+      box.expandByPoint(new THREE.Vector3(node.x, node.height, node.z));
     });
 
     this.scene.add(this.instancedMesh);
@@ -172,6 +179,23 @@ export class CityscapeRenderer {
       const lines = new THREE.LineSegments(lineGeo, lineMat);
       this.scene.add(lines);
     }
+
+    // 4. Fit Camera to Screen
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+
+    const maxDim = Math.max(size.x, size.z);
+    const fov = this.camera.fov * (Math.PI / 180);
+    let cameraDistance = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+    
+    // Position camera at an angle
+    cameraDistance *= 1.5; 
+    this.camera.position.set(center.x + cameraDistance, center.y + cameraDistance, center.z + cameraDistance);
+    this.camera.lookAt(center);
+    this.controls.target.copy(center);
+    this.controls.update();
   }
 
   public setPause(paused: boolean) {

@@ -30,7 +30,7 @@ self.onmessage = function(e) {
   // 2. Calculate district grid
   const districtCount = districts.length;
   const districtGridSize = Math.ceil(Math.sqrt(districtCount));
-  const DISTRICT_SPACING = 150; // Large spacing between folders
+  const DISTRICT_SPACING = 80; // Compact spacing between folders
   
   districts.forEach((d, i) => {
     const row = Math.floor(i / districtGridSize);
