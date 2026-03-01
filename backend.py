@@ -6,6 +6,7 @@ import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from api_cityscape import router as cityscape_router
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,7 @@ except ImportError as e:
     REFACTOR_READY = False
 
 app = FastAPI()
+app.include_router(cityscape_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,8 +63,14 @@ async def route_intent(websocket: WebSocket, prompt: str):
             "payload": {"message": "Neo4j connection failed. Using local file fallback."}
         })
 
-    # Flow 1: Generate Architecture/Blueprint (Mermaid)
-    if any(k in p_lower for k in ["cityscape", "mermaid", "architecture", "graph", "flow"]):
+    # Flow 1: Generate Architecture/Blueprint (Cityscape or Mermaid)
+    if "cityscape" in p_lower:
+        logger.info("Flow 1: Generating Cityscape View")
+        from api_cityscape import get_cityscape_view
+        cityscape_data = await get_cityscape_view()
+        await websocket.send_json(cityscape_data)
+
+    elif any(k in p_lower for k in ["mermaid", "architecture", "graph", "flow"]):
         logger.info("Flow 1: Generating Living Specification")
         
         # Use refactor2 to generate the architectural blueprint

@@ -5,11 +5,13 @@ import type { IntentPayload } from '../hooks/useIntentSocket';
 const MermaidViewer = React.lazy(() => import('./MermaidViewer'));
 const DiffEditor = React.lazy(() => import('./DiffEditor'));
 const MonacoEditor = React.lazy(() => import('./MonacoEditor'));
+const Cityscape3D = React.lazy(() => import('./views/CityscapeView'));
 
 const Registry: Record<string, React.FC<any>> = {
   MermaidViewer,
   DiffEditor,
   MonacoEditor,
+  Cityscape3D,
 };
 
 export const DynamicComponent: React.FC<{ intent: IntentPayload, sendIntent: Function }> = ({ intent, sendIntent }) => {

@@ -23,7 +23,8 @@ python refactor2.py --drive-spec repo_os_blueprint.json
 Subway map:
 source venv/bin/activate && python clear_neo4j.py && python ingest2.py Repo1 && python ingest2.py Repo2 && python mapper.py "/search"
 
-
+Cityscape:
+Show me the cityscape
 
 Tell me how this feature in repoOS is going to add value to existing AI engines like Claude code. Be very honest about this idea. Say RepoOS is a tool that can automatically refactor codebases to improve their structure, maintainability, and performance. The way it does is, it utilizes the neo4J graph to understand what and how to change. It then build detailed and smaller prompts and send to an engine like Calude to perform refactoring in smaller units. 
 After claude completes its step, RepoOS checks the results and continues to build the next promopts accordingly based on the refactoring progress. 
