@@ -11,11 +11,11 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
   const [layoutData, setLayoutData] = useState<any>(null);
   const [isLLMGenerating, setIsLLMGenerating] = useState(false);
   const [tooltip, setTooltip] = useState<{ x: number, y: number, content: string } | null>(null);
+  const [edgeLabels, setEdgeLabels] = useState<any[]>([]);
   const workerRef = useRef<Worker | null>(null);
 
   useEffect(() => {
     // Initialize Worker
-    // Note: In a real Vite project, you'd use ?worker suffix or new URL syntax
     workerRef.current = new Worker(new URL('../../workers/cityscapeLayoutWorker.js', import.meta.url));
     
     workerRef.current.onmessage = (e) => {
@@ -23,9 +23,6 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
     };
 
     if (data) {
-      // Phase 1 JSON schema: data is inside payload or as described
-      // The backend returns { "intent": "MOUNT_COMPONENT", "component": "Cityscape3D", "data": { ... } }
-      // But Canvas.tsx passes the whole intent to DynamicComponent.
       workerRef.current.postMessage(data);
     }
 
@@ -48,8 +45,8 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
   if (!layoutData) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-gray-400 bg-black">
-        <div className="text-xl mb-2 animate-pulse">Constructing Cityscape...</div>
-        <div className="text-xs uppercase tracking-widest">Processing Repository Graph</div>
+        <div className="text-xl mb-2 animate-pulse">Constructing Semantic Cityscape...</div>
+        <div className="text-xs uppercase tracking-widest">Applying Architectural Metaphors</div>
       </div>
     );
   }
@@ -65,6 +62,7 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
           data={layoutData} 
           pauseRender={isLLMGenerating} 
           onHover={(info) => setTooltip(info)}
+          onLabels={(labels) => setEdgeLabels(labels)}
           onClick={(fileId) => {
             // Dispatch intent to open file
             sendIntent({ 
@@ -75,17 +73,29 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
         />
       </Suspense>
 
+      {/* Floating Edge Labels */}
+      {edgeLabels.map((label, i) => label.visible && (
+        <div 
+          key={i}
+          className="absolute z-40 bg-black/60 text-cyan-400 px-2 py-1 rounded text-[10px] font-bold border border-cyan-500/30 whitespace-nowrap pointer-events-none"
+          style={{ left: label.x, top: label.y, transform: 'translate(-50%, -50%)' }}
+        >
+          {label.text}
+        </div>
+      ))}
+
       {/* 2D Overlay for Tooltips */}
       {tooltip && (
         <div 
-          className="absolute z-50 bg-gray-900 text-white p-2 rounded shadow-2xl pointer-events-none border border-blue-500/30 backdrop-blur-md"
+          className="absolute z-50 bg-gray-900 text-white p-3 rounded shadow-2xl pointer-events-none border border-blue-500/30 backdrop-blur-md"
           style={{ left: tooltip.x + 15, top: tooltip.y + 15 }}
         >
-          <div className="text-[10px] text-blue-400 font-mono uppercase mb-1">Source File</div>
+          <div className="text-[10px] text-blue-400 font-mono uppercase mb-1">Asset Identity</div>
           <div className="font-bold text-sm truncate max-w-xs">{tooltip.content}</div>
-          <div className="mt-2 flex gap-3 text-[10px] text-gray-400">
-             <span>LOC: {layoutData.nodes.find((n:any) => n.id === tooltip.content)?.loc}</span>
-             <span>Complexity: {layoutData.nodes.find((n:any) => n.id === tooltip.content)?.complexity}</span>
+          <div className="mt-2 flex flex-col gap-1 text-[10px] text-gray-400">
+             <span>TYPE: {layoutData.nodes.find((n:any) => n.id === tooltip.content)?.asset_type}</span>
+             <span>VOLUME: {layoutData.nodes.find((n:any) => n.id === tooltip.content)?.volume}</span>
+             <span>HEAT: {layoutData.nodes.find((n:any) => n.id === tooltip.content)?.heat}</span>
           </div>
         </div>
       )}
@@ -100,9 +110,9 @@ export const CityscapeView: React.FC<CityscapeViewProps> = ({ data, sendIntent }
 
       {/* Stats Overlay */}
       <div className="absolute bottom-6 left-6 text-white/50 text-[10px] font-mono pointer-events-none">
-        <div>TOTAL_NODES: {layoutData.nodes.length}</div>
-        <div>TOTAL_DISTRICTS: {Object.keys(layoutData.districts).length}</div>
-        <div>RENDER_MODE: INSTANCED_MESH_PHONG</div>
+        <div>TOTAL_ASSETS: {layoutData.nodes.length}</div>
+        <div>DOMAINS: {Object.keys(layoutData.districts).length}</div>
+        <div>RENDER_MODE: SEMANTIC_METAPHOR_3D</div>
       </div>
     </div>
   );

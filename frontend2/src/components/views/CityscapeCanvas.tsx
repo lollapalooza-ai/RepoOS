@@ -7,9 +7,10 @@ interface CityscapeCanvasProps {
   pauseRender: boolean;
   onHover: (info: { x: number, y: number, content: string } | null) => void;
   onClick: (id: string) => void;
+  onLabels: (labels: any[]) => void;
 }
 
-const CityscapeCanvas: React.FC<CityscapeCanvasProps> = ({ data, pauseRender, onHover, onClick }) => {
+const CityscapeCanvas: React.FC<CityscapeCanvasProps> = ({ data, pauseRender, onHover, onClick, onLabels }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<CityscapeRenderer | null>(null);
 
@@ -20,7 +21,7 @@ const CityscapeCanvas: React.FC<CityscapeCanvasProps> = ({ data, pauseRender, on
     const initTimeout = setTimeout(() => {
       try {
         if (canvasRef.current) {
-          rendererRef.current = new CityscapeRenderer(canvasRef.current, onHover, onClick);
+          rendererRef.current = new CityscapeRenderer(canvasRef.current, onHover, onClick, onLabels);
           rendererRef.current.setData(data);
         }
       } catch (err) {

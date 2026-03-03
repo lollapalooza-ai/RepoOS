@@ -5,101 +5,94 @@ self.onmessage = function(e) {
   const payload = e.data;
   if (!payload) return;
 
-  // Extract data from either payload.payload (if the whole intent was sent) or directly
   const data = payload.payload || payload.data || payload;
-  const { districts, nodes } = data;
+  const { nodes, edges } = data;
   
-  if (!districts || !nodes) return;
-  
-  // 1. Group nodes by district
-  const districtMap = {};
-  districts.forEach(d => {
-    districtMap[d] = {
-      nodes: [],
-      x: 0,
-      z: 0
-    };
-  });
-  
+  if (!nodes) return;
+
+  // 1. Group nodes by asset_type
+  const groups = {};
   nodes.forEach(node => {
-    if (districtMap[node.district]) {
-      districtMap[node.district].nodes.push(node);
+    if (!groups[node.asset_type]) {
+      groups[node.asset_type] = {
+        nodes: [],
+        x: 0,
+        z: 0
+      };
     }
+    groups[node.asset_type].nodes.push(node);
   });
   
-  // 2. Calculate district grid
-  const districtCount = districts.length;
-  const districtGridSize = Math.ceil(Math.sqrt(districtCount));
-  const DISTRICT_SPACING = 80; // Compact spacing between folders
-  
-  districts.forEach((d, i) => {
-    const row = Math.floor(i / districtGridSize);
-    const col = i % districtGridSize;
-    districtMap[d].x = (col - districtGridSize / 2) * DISTRICT_SPACING;
-    districtMap[d].z = (row - districtGridSize / 2) * DISTRICT_SPACING;
+  // 2. Arrange groups in a circle
+  const assetTypes = Object.keys(groups);
+  const RADIUS = 150;
+  assetTypes.forEach((type, i) => {
+    const angle = (i / assetTypes.length) * Math.PI * 2;
+    groups[type].x = Math.cos(angle) * RADIUS;
+    groups[type].z = Math.sin(angle) * RADIUS;
   });
   
-  // 3. Arrange nodes within districts
+  // 3. Arrange nodes within groups
   const finalNodes = [];
   const nodeIndexMap = {};
 
-  nodes.forEach((node, i) => {
-    const district = districtMap[node.district];
-    const nodesInDistrict = district.nodes;
-    const nodeIdx = nodesInDistrict.indexOf(node);
+  nodes.forEach((node) => {
+    const group = groups[node.asset_type];
+    const nodesInGroup = group.nodes;
+    const nodeIdx = nodesInGroup.indexOf(node);
     
-    const nodeGridSize = Math.ceil(Math.sqrt(nodesInDistrict.length));
-    const NODE_SPACING = 20; // Spacing between buildings
+    // Grid within group
+    const nodeGridSize = Math.ceil(Math.sqrt(nodesInGroup.length));
+    const NODE_SPACING = 30;
     
     const row = Math.floor(nodeIdx / nodeGridSize);
     const col = nodeIdx % nodeGridSize;
     
-    // Position building relative to district center
-    const x = district.x + (col - nodeGridSize / 2) * NODE_SPACING;
-    const z = district.z + (row - nodeGridSize / 2) * NODE_SPACING;
+    const x = group.x + (col - nodeGridSize / 2) * NODE_SPACING;
+    const z = group.z + (row - nodeGridSize / 2) * NODE_SPACING;
     
-    // Scale height by LOC (Lines of Code)
-    const height = Math.max(5, node.loc / 10);
+    // Scale height by volume
+    const height = Math.max(10, (node.volume || 50) / 2);
     
-    // Scale complexity (0-20+) to Color
-    // Low complexity = Green (#2ecc71), High = Red (#e74c3c)
-    const complexityFactor = Math.min(1, node.complexity / 30);
-    const color = interpolateColor("#2ecc71", "#e74c3c", complexityFactor);
+    // Scale heat to Color
+    const heatFactor = Math.min(1, (node.heat || 0) / 50);
+    const color = interpolateColor("#3498db", "#e74c3c", heatFactor);
     
     const nodeData = {
       id: node.id,
+      asset_type: node.asset_type,
       x,
-      y: height / 2, // Center Y for box geometry
+      y: height / 2,
       z,
-      width: 8,
+      width: 15,
       height,
-      depth: 8,
+      depth: 15,
       color,
-      loc: node.loc,
-      complexity: node.complexity,
-      dependencies: node.dependencies || []
+      volume: node.volume,
+      heat: node.heat
     };
     
     finalNodes.push(nodeData);
     nodeIndexMap[node.id] = nodeData;
   });
 
-  // 4. Resolve dependencies for lines
+  // 4. Resolve explicit edges
   const connections = [];
-  nodes.forEach(sourceNode => {
-    if (sourceNode.dependencies) {
-      sourceNode.dependencies.forEach(targetId => {
-        if (nodeIndexMap[sourceNode.id] && nodeIndexMap[targetId]) {
-          connections.push({
-            start: [nodeIndexMap[sourceNode.id].x, nodeIndexMap[sourceNode.id].height, nodeIndexMap[sourceNode.id].z],
-            end: [nodeIndexMap[targetId].x, nodeIndexMap[targetId].height, nodeIndexMap[targetId].z]
-          });
-        }
-      });
-    }
-  });
+  if (edges) {
+    edges.forEach(edge => {
+      const source = nodeIndexMap[edge.source];
+      const target = nodeIndexMap[edge.target];
+      if (source && target) {
+        connections.push({
+          start: [source.x, source.height, source.z],
+          end: [target.x, target.height, target.z],
+          label: edge.label
+        });
+      }
+    });
+  }
 
-  self.postMessage({ nodes: finalNodes, connections, districts: districtMap });
+  self.postMessage({ nodes: finalNodes, connections, districts: groups });
 };
 
 function interpolateColor(color1, color2, factor) {
@@ -107,18 +100,14 @@ function interpolateColor(color1, color2, factor) {
     const s = Math.round(c).toString(16);
     return s.length === 1 ? '0' + s : s;
   };
-
   const r1 = parseInt(color1.substring(1, 3), 16);
   const g1 = parseInt(color1.substring(3, 5), 16);
   const b1 = parseInt(color1.substring(5, 7), 16);
-  
   const r2 = parseInt(color2.substring(1, 3), 16);
   const g2 = parseInt(color2.substring(3, 5), 16);
   const b2 = parseInt(color2.substring(5, 7), 16);
-  
   const r = r1 + factor * (r2 - r1);
   const g = g1 + factor * (g2 - g1);
   const b = b1 + factor * (b2 - b1);
-  
   return "#" + hex(r) + hex(g) + hex(b);
 }

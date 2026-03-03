@@ -65,9 +65,9 @@ async def route_intent(websocket: WebSocket, prompt: str):
 
     # Flow 1: Generate Architecture/Blueprint (Cityscape or Mermaid)
     if "cityscape" in p_lower:
-        logger.info("Flow 1: Generating Cityscape View")
-        from api_cityscape import get_cityscape_view
-        cityscape_data = await get_cityscape_view()
+        logger.info("Flow 1: Generating Semantic Cityscape View")
+        from api_cityscape import get_semantic_cityscape
+        cityscape_data = await get_semantic_cityscape()
         await websocket.send_json(cityscape_data)
 
     elif any(k in p_lower for k in ["mermaid", "architecture", "graph", "flow"]):
