@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 import time
-import uuid
+
+app = Flask(__name__)
+
 def _authenticate_user(token):
     """Simulates user authentication."""
     time.sleep(0.05) # Simulate network/DB delay
@@ -50,7 +52,6 @@ def search_monolith():
     """
     auth_token = request.headers.get('Authorization')
     query = request.args.get('q', '')
-    uuid_param = request.args.get('uuid', '')
 
     if not auth_token:
         return jsonify({"error": "Authorization token missing"}), 401
@@ -73,7 +74,6 @@ def search_monolith():
     return jsonify(final_output)
 @app.route('/', methods=['GET'])
 def hello_world():
-    unique_uuid = str(uuid.uuid4())
-    return jsonify({"uuid": unique_uuid})
+    return "Hello from Repo1 Search Monolith!"
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
