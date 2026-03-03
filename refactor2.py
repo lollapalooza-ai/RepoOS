@@ -53,16 +53,19 @@ def generate_code_from_agent(provider, system_prompt, user_prompt, temperature, 
     print(f"\n🧠 Calling Agent '{provider}' (Model: {model_name}, Temp: {temperature:.1f})...")
     if provider == "gemini":
         if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY not set.")
+        # If the model_name looks like an Ollama model, use a Gemini default
+        actual_model = 'gemini-1.5-pro-latest' if "qwen" in model_name or "llama" in model_name else (model_name or 'gemini-1.5-pro-latest')
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(model_name or 'gemini-1.5-pro-latest')
+        model = genai.GenerativeModel(actual_model)
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
         response = model.generate_content(full_prompt, generation_config={"temperature": temperature, "response_mime_type": "application/json"})
         return response.text
     elif provider == "anthropic":
         if not ANTHROPIC_API_KEY: raise ValueError("ANTHROPIC_API_KEY not set.")
+        actual_model = "claude-3-opus-20240229" if "qwen" in model_name or "llama" in model_name else (model_name or "claude-3-opus-20240229")
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         message = client.messages.create(
-            model=model_name or "claude-3-opus-20240229", max_tokens=4096, temperature=temperature,
+            model=actual_model, max_tokens=4096, temperature=temperature,
             system=system_prompt, messages=[{"role": "user", "content": user_prompt}]
         )
         return message.content[0].text
@@ -246,9 +249,13 @@ def generate_with_retries(system_prompt, user_prompt, context, provider, mode="c
                             all_valid = False
                             errors_feedback.extend([f"  - {e}" for e in file_errors])
             elif mode == "tasks":
+                # Handle both direct list or dict with 'tasks' key
+                if isinstance(response_json, dict) and 'tasks' in response_json:
+                    response_json = response_json['tasks']
+                
                 if not isinstance(response_json, list):
                     all_valid = False
-                    errors_feedback.append("Response must be a JSON list of tasks.")
+                    errors_feedback.append("Response must be a JSON list of tasks or a dict with a 'tasks' key.")
                 else:
                     for idx, t in enumerate(response_json):
                         if not isinstance(t, dict) or 'task' not in t or 'context' not in t:
