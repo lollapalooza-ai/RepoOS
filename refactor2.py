@@ -143,7 +143,8 @@ def drive_agent_from_spec(blueprint_json=None, task_items=None, auto_confirm=Fal
         provider = "ollama" if local_only or not is_complex else "gemini"
         
         # 5. Prepare the specific context for THIS step from the master state
-        step_files_content = {path: master_files_content[path] for path in task_context if path in master_files_content}
+        # Include paths even if they don't exist yet (for new file creation)
+        step_files_content = {path: master_files_content.get(path, "") for path in task_context}
 
         # 6. Perform the refactor step
         updated_files_for_step = _perform_llm_refactor_step(

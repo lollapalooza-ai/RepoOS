@@ -54,6 +54,10 @@ INFRASTRUCTURE_PATTERNS = {
         r"\.(?P<operation>send|poll)\(\s*[\"'](?P<topic>[a-zA-Z0-9_-]+)[\"']",
         re.IGNORECASE
     ),
+    'DJANGO_ORM': re.compile(
+       r"(?P<model>[a-zA-Z0-9_]+)\.objects\.(?P<method>filter|get|create|update|delete|all)",
+       re.IGNORECASE
+    ),
     # A simple keyword-based detection for other infra types
     'REDIS': re.compile(r"redis\.Redis"),
     'MONGO': re.compile(r"pymongo\.MongoClient"),
