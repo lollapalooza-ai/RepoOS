@@ -73,30 +73,34 @@ def generate_code_from_agent(provider, system_prompt, user_prompt, temperature, 
         )
         return response['message']['content']
 
-def drive_agent_from_spec(blueprint_json, auto_confirm=False, local_only=False):
+def drive_agent_from_spec(blueprint_json=None, task_items=None, auto_confirm=False, local_only=False):
     """Parses Tiptap JSON, determines agent strategy, and executes tasks sequentially."""
     
     # 1. Extract all task nodes from the implementation plan
-    task_items = []
-    content_blocks = blueprint_json.get('content', [])
-    plan_started = False
-    for block in content_blocks:
-        if block.get('type') == 'heading' and 'Implementation Plan' in get_text_from_node(block.get('content', [])):
-            plan_started = True
-            continue
-        if plan_started and block.get('type') == 'taskList':
-            def find_task_items(node):
-                if node.get('type') == 'taskItem': task_items.append(node)
-                if 'content' in node and node['content']:
-                    for child in node['content']: find_task_items(child)
-            find_task_items(block)
-            break
+    if task_items is None:
+        if not blueprint_json:
+            print("No blueprint or tasks provided.")
+            return
+        task_items = []
+        content_blocks = blueprint_json.get('content', [])
+        plan_started = False
+        for block in content_blocks:
+            if block.get('type') == 'heading' and 'Implementation Plan' in get_text_from_node(block.get('content', [])):
+                plan_started = True
+                continue
+            if plan_started and block.get('type') == 'taskList':
+                def find_task_items(node):
+                    if node.get('type') == 'taskItem': task_items.append(node)
+                    if 'content' in node and node['content']:
+                        for child in node['content']: find_task_items(child)
+                find_task_items(block)
+                break
             
     if not task_items:
-        print("No actionable tasks found in the Implementation Plan.")
+        print("No actionable tasks found.")
         return
         
-    print(f"Found {len(task_items)} actionable tasks in Spec.")
+    print(f"Found {len(task_items)} actionable tasks.")
 
     # 2. Pre-scan all tasks to gather the complete set of files for state management
     all_files = set()
@@ -105,9 +109,19 @@ def drive_agent_from_spec(blueprint_json, auto_confirm=False, local_only=False):
         if task_context: all_files.update(task_context.keys())
 
     master_files_content = {path: fetch_file_content(path) for path in all_files if fetch_file_content(path) is not None}
-    if not master_files_content:
+    if not master_files_content and all_files:
         print(f"{Colors.RED}Error: Could not read content for any files mentioned in the spec's task contexts. Aborting.{Colors.RESET}")
         return
+
+    # Confirmation step before proceeding
+    if not auto_confirm:
+        print(f"\n{Colors.BOLD}📋 Planned Tasks:{Colors.RESET}")
+        for i, item in enumerate(task_items):
+            print(f"  {i+1}. {get_text_from_node(item.get('content', []))}")
+        confirm = input(f"\n{Colors.BOLD}Do you want to proceed with these {len(task_items)} tasks? (y/n): {Colors.RESET}").lower()
+        if confirm != 'y':
+            print("Aborting.")
+            return
 
     # 3. Execute tasks sequentially
     for i, item in enumerate(task_items):
@@ -208,8 +222,8 @@ Now, generate the complete and valid Tiptap JSON object.
         print(f"❌ Error decoding/processing blueprint: {e}\n--- RAW LLM OUTPUT ---\n{response['message']['content']}\n----------------------")
         return 'n', None
 
-def generate_with_retries(system_prompt, user_prompt, original_files_content, provider, max_retries=MAX_RETRIES):
-    """Attempts to generate a valid refactor plan with retries and self-correction."""
+def generate_with_retries(system_prompt, user_prompt, context, provider, mode="code", max_retries=MAX_RETRIES):
+    """Attempts to generate valid output with retries and self-correction. mode can be 'code' or 'tasks'."""
     current_user_content = user_prompt
     for attempt in range(max_retries):
         temp = max(0.2 - (attempt * 0.1), 0.0)
@@ -218,18 +232,29 @@ def generate_with_retries(system_prompt, user_prompt, original_files_content, pr
             response_json = json.loads(_repair_llm_json_string(raw_response_content))
             
             all_valid, errors_feedback = True, []
-            if not isinstance(response_json, dict):
-                all_valid = False
-                errors_feedback.append(f"Response was not a JSON object, but a {type(response_json)}.")
-            
-            for file_path, new_content in response_json.items():
-                if file_path not in original_files_content:
-                    all_valid, errors_feedback.append(f"Hallucinated file '{file_path}' was not in the original context.")
-                file_errors = validate_code(new_content)
-                if file_errors:
+            if mode == "code":
+                if not isinstance(response_json, dict):
                     all_valid = False
-                    errors_feedback.extend([f"  - {e}" for e in file_errors])
-
+                    errors_feedback.append(f"Response was not a JSON object, but a {type(response_json)}.")
+                else:
+                    for file_path, new_content in response_json.items():
+                        if file_path not in context:
+                            all_valid = False
+                            errors_feedback.append(f"Hallucinated file '{file_path}' was not in the original context.")
+                        file_errors = validate_code(new_content)
+                        if file_errors:
+                            all_valid = False
+                            errors_feedback.extend([f"  - {e}" for e in file_errors])
+            elif mode == "tasks":
+                if not isinstance(response_json, list):
+                    all_valid = False
+                    errors_feedback.append("Response must be a JSON list of tasks.")
+                else:
+                    for idx, t in enumerate(response_json):
+                        if not isinstance(t, dict) or 'task' not in t or 'context' not in t:
+                            all_valid = False
+                            errors_feedback.append(f"Task {idx} is missing 'task' or 'context'.")
+            
             if all_valid:
                 print(f"✅ Attempt {attempt + 1} succeeded.")
                 return response_json
@@ -240,7 +265,7 @@ def generate_with_retries(system_prompt, user_prompt, original_files_content, pr
         except Exception as e:
             print(f"❌ Attempt {attempt + 1} failed: {e}")
             current_user_content += f"\n\n--- FEEDBACK ---\nYour previous attempt failed with this error: {e}. Please correct it."
-    print("🛑 Max retries reached. Failed to generate a valid refactor plan.")
+    print(f"🛑 Max retries reached. Failed to generate a valid {mode}.")
     return None
 
 def _perform_llm_refactor_step(instruction, original_files_full_content, provider, auto_confirm=False):
@@ -249,7 +274,7 @@ def _perform_llm_refactor_step(instruction, original_files_full_content, provide
     context_str = "\n\n".join(f"--- FILE: {path} ---\n{content}" for path, content in original_files_full_content.items())
     user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
     
-    proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_full_content, provider)
+    proposed_changes = generate_with_retries(system_prompt, user_prompt, original_files_full_content, provider, mode="code")
     if not proposed_changes:
         print("❌ LLM failed to generate any valid changes for this step.")
         return None
@@ -338,7 +363,7 @@ if __name__ == "__main__":
     if args.drive_spec:
         try:
             with open(args.drive_spec, 'r') as f: spec_json = json.load(f)
-            drive_agent_from_spec(spec_json, auto_confirm=args.yes, local_only=args.local)
+            drive_agent_from_spec(blueprint_json=spec_json, auto_confirm=args.yes, local_only=args.local)
         except (FileNotFoundError, json.JSONDecodeError) as e:
             print(f"Error with spec file: {e}")
     elif args.blueprint_export:
@@ -353,5 +378,23 @@ if __name__ == "__main__":
         else:
             print(f"\n{Colors.RED}❌ Failed to generate or get approval for the Living Specification.{Colors.RESET}")
     else:
-        print("Please specify either --blueprint-export or --drive-spec.")
-        parser.print_help()
+        intent = " ".join(unknown_args) if unknown_args else input("Enter Refactor Intent: ")
+        context_map, error = get_hybrid_context(intent)
+        if error: print(f"Error gathering context: {error}"); sys.exit(1)
+        
+        print(f"🧠 Generating tasks for intent: {intent}")
+        task_sys_prompt = "You are a senior architect. Generate a list of tasks for a refactoring plan. Your response MUST be a JSON list of task objects."
+        task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}\n\nReturn a JSON list of tasks. Each task MUST have 'task' (string description) and 'context' (dict mapping file paths to lists of symbols)."
+        
+        raw_tasks = generate_with_retries(task_sys_prompt, task_user_prompt, context_map, "ollama", mode="tasks")
+        if raw_tasks:
+            task_items = []
+            for t in raw_tasks:
+                task_items.append({
+                    "type": "taskItem",
+                    "attrs": {"checked": False, "context": t.get('context', {})},
+                    "content": [{"type": "text", "text": t.get('task', '')}]
+                })
+            drive_agent_from_spec(task_items=task_items, auto_confirm=args.yes, local_only=args.local)
+        else:
+            print("❌ Failed to generate tasks.")
