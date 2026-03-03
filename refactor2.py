@@ -278,7 +278,13 @@ def generate_with_retries(system_prompt, user_prompt, context, provider, mode="c
 
 def _perform_llm_refactor_step(instruction, original_files_full_content, provider, auto_confirm=False):
     """Performs a single LLM refactor step: generates, validates, reviews, and applies."""
-    system_prompt = "You are a Principal Engineer. Your response MUST be a JSON object where keys are filenames and values are the NEW, complete source code for that file."
+    rules = [
+        "Use 'self.request' instead of 'request' when refactoring methods within a class (e.g., Django Class-Based Views).",
+        "Ensure all necessary imports (e.g., Http404, redirect, get_class) are added to the top of the file if they are missing.",
+        "Maintain existing indentation and coding style (PEP 8).",
+        "Your response MUST be a valid JSON object where keys are filenames and values are the NEW, complete source code for those files."
+    ]
+    system_prompt = f"You are a Principal Engineer. Follow these rules strictly:\n" + "\n".join(f"- {r}" for r in rules)
     context_str = "\n\n".join(f"--- FILE: {path} ---\n{content}" for path, content in original_files_full_content.items())
     user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{instruction}"
     
