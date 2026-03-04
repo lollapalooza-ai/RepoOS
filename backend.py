@@ -34,8 +34,48 @@ async def process_refactor(websocket: WebSocket, prompt: str):
         await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "No relevant code context found."}})
         return
 
-    # Fetch initial file state
-    files_content = {path: refactor2.fetch_file_content(path) for path in context_map if refactor2.fetch_file_content(path)}
+    # Fetch initial file state and checksums (Step 3A: Pre-Flight Checksums)
+    files_content = {}
+    master_checksums = {}
+    for path in context_map:
+        content = refactor2.fetch_file_content(path)
+        if content:
+            files_content[path] = content
+            master_checksums[path] = refactor2.calculate_checksum(content)
+
+            # Step 2A: The Native Gatekeeper (Syntax Check)
+            if not refactor2.is_valid_python(content):
+                logger.warning(f"⚠️ Syntax Error in {path}. Escalating to SyntaxFracture UI.")
+                session_id = f"syntax_fracture_{int(asyncio.get_event_loop().time())}"
+                pending_resolutions[session_id] = {"event": asyncio.Event(), "decision": None}
+                
+                await websocket.send_json({
+                    "type": "MOUNT_COMPONENT",
+                    "component_name": "SyntaxFracture",
+                    "session_id": session_id,
+                    "payload": {
+                        "file_path": path,
+                        "content": content,
+                        "error_type": "SyntaxError"
+                    }
+                })
+                
+                # Step 2C: Wait for user to manually fix the syntax
+                await pending_resolutions[session_id]["event"].wait()
+                # Decision 'y' means the user fixed it and wants to retry
+                if pending_resolutions[session_id]["decision"] == 'y':
+                    # Refresh content and checksum after fix
+                    new_content = refactor2.fetch_file_content(path)
+                    if new_content and refactor2.is_valid_python(new_content):
+                        files_content[path] = new_content
+                        master_checksums[path] = refactor2.calculate_checksum(new_content)
+                    else:
+                        await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "File still has syntax errors. Aborting."}})
+                        return
+                else:
+                    await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "Refactor aborted by user during syntax triage."}})
+                    return
+                del pending_resolutions[session_id]
     
     # 2. Sequential Task Generation (Streaming)
     task_sys_prompt = "You are a senior architect. Generate a sequential list of refactoring tasks."
@@ -58,7 +98,7 @@ async def process_refactor(websocket: WebSocket, prompt: str):
     for i, task in enumerate(task_list.tasks):
         await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": f"Executing Task {i+1}: {task.task}"}})
         
-        step_files = {p: master_state.get(p, "") for p in task.context}
+        step_files = {p: master_state.get(p, "") for p in task.context if p in master_state}
         context_str = "\n\n".join(f"--- FILE: {p} ---\n{c}" for p, c in step_files.items())
         
         sys_prompt = "You are a Principal Engineer. Provide surgical SearchAndReplace patches."
@@ -71,15 +111,18 @@ async def process_refactor(websocket: WebSocket, prompt: str):
 
         try:
             proposal = refactor2.RefactorProposal.model_validate_json(full_patch_json)
-            new_state = refactor2.apply_patches_to_state(master_state, proposal.patches)
+            # Use original checksums to detect external modifications during the session
+            new_state = refactor2.apply_patches_to_state(master_state, proposal.patches, master_checksums)
             
-            # 4. Human-in-the-Loop Approval via WebSocket
+            # 4. Human-in-the-Loop Approval (Step 3C: Strict Draft Mode)
             session_id = f"task_{i}_{int(asyncio.get_event_loop().time())}"
             pending_resolutions[session_id] = {"event": asyncio.Event(), "decision": None}
             
-            # Send diff for preview (Simplified: first changed file)
+            # Send diff for preview
+            changed_path = None
             for path, new_content in new_state.items():
                 if master_state.get(path) != new_content:
+                    changed_path = path
                     await websocket.send_json({
                         "type": "MOUNT_COMPONENT",
                         "component_name": "DiffEditor",
@@ -92,10 +135,14 @@ async def process_refactor(websocket: WebSocket, prompt: str):
                     })
                     break
 
+            if not changed_path:
+                logger.info(f"Task {i+1} resulted in no changes.")
+                continue
+
             await pending_resolutions[session_id]["event"].wait()
             if pending_resolutions[session_id]["decision"] == 'y':
                 master_state.update(new_state)
-                await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": f"Task {i+1} applied."}})
+                await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": f"Task {i+1} applied in-memory."}})
             else:
                 await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "Refactor aborted by user."}})
                 return
@@ -106,9 +153,9 @@ async def process_refactor(websocket: WebSocket, prompt: str):
             logger.error(f"Error in task execution: {e}")
             return
 
-    # 5. Final Disk Write
-    await asyncio.to_thread(refactor2.apply_updates, master_state)
-    await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "All changes applied to disk."}})
+    # 5. Final Disk Write (Strict Checksum Verification)
+    await asyncio.to_thread(refactor2.apply_updates, master_state, master_checksums)
+    await websocket.send_json({"type": "SYSTEM_NOTIFICATION", "payload": {"message": "All changes persisted to disk."}})
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
