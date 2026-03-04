@@ -26,45 +26,7 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 # Cache builtins for filtering
 PYTHON_BUILTINS = set(dir(builtins))
 
-# --- NEW INFRASTRUCTURE PATTERNS (v3) ---
-# This dictionary holds regex patterns to detect various infrastructure interactions.
-# Each pattern uses named capture groups to extract specific details.
-INFRASTRUCTURE_PATTERNS = {
-    'SQL_QUERY': re.compile(
-        r"(?P<operation>SELECT|UPDATE|DELETE)\s+.*\s+FROM\s+(?P<table>[a-zA-Z0-9_]+)",
-        re.IGNORECASE
-    ),
-    'SQL_INSERT': re.compile(
-        r"(?P<operation>INSERT)\s+INTO\s+(?P<table>[a-zA-Z0-9_]+)",
-        re.IGNORECASE
-    ),
-    'API_REQUESTS': re.compile(
-        r"requests\.(?P<method>get|post|put|delete)\(\s*f?[\"'](?P<endpoint>[^\"']+)[\"']",
-        re.IGNORECASE
-    ),
-    'API_HTTPX': re.compile(
-        r"httpx\.(?P<method>get|post|put|delete)\(\s*f?[\"'](?P<endpoint>[^\"']+)[\"']",
-        re.IGNORECASE
-    ),
-    'BOTO3': re.compile(
-        r"boto3\.(?:client|resource)\(\s*[\"'](?P<service>[a-zA-Z0-9_-]+)[\"']",
-        re.IGNORECASE
-    ),
-    'KAFKA': re.compile(
-        r"\.(?P<operation>send|poll)\(\s*[\"'](?P<topic>[a-zA-Z0-9_-]+)[\"']",
-        re.IGNORECASE
-    ),
-    'DJANGO_ORM': re.compile(
-       r"(?P<model>[a-zA-Z0-9_]+)\.objects\.(?P<method>filter|get|create|update|delete|all)",
-       re.IGNORECASE
-    ),
-    # A simple keyword-based detection for other infra types
-    'REDIS': re.compile(r"redis\.Redis"),
-    'MONGO': re.compile(r"pymongo\.MongoClient"),
-}
-
-# --- QUERIES ---
-# Find top-level function definitions (global functions)
+# --- TREE-SITTER QUERIES (v4) ---
 GLOBAL_FUNC_QUERY = PY_LANGUAGE.query("""
 (function_definition
   name: (identifier) @func.name
@@ -72,7 +34,6 @@ GLOBAL_FUNC_QUERY = PY_LANGUAGE.query("""
 ) @func.def
 """)
 
-# Find class definitions, including inherited base classes
 CLASS_DEF_QUERY = PY_LANGUAGE.query("""
 (class_definition
   name: (identifier) @class.name
@@ -82,7 +43,6 @@ CLASS_DEF_QUERY = PY_LANGUAGE.query("""
 ) @class.def
 """)
 
-# Find method definitions within a class
 METHOD_DEF_QUERY = PY_LANGUAGE.query("""
 (class_definition
   body: (block
@@ -93,18 +53,43 @@ METHOD_DEF_QUERY = PY_LANGUAGE.query("""
 )
 """)
 
-# Find calls inside a function or method
-CALL_QUERY = PY_LANGUAGE.query("""
+# Combined query for calls, attributes, and arguments
+INFRA_CALL_QUERY = PY_LANGUAGE.query("""
 (call
-  function: (identifier) @call.name
+  function: [
+    (attribute 
+      object: (identifier) @obj 
+      attribute: (identifier) @method)
+    (identifier) @func
+  ]
+  arguments: (argument_list
+    (string) @arg
+  )?
 ) @call
 """)
 
+# Query for tracking aliases and imports
+ALIAS_QUERY = PY_LANGUAGE.query("""
+(import_statement
+  name: (aliased_import
+    name: (dotted_name) @name
+    alias: (identifier) @alias))
+(import_from_statement
+  module_name: (dotted_name) @mod
+  name: (aliased_import
+    name: (dotted_name) @name
+    alias: (identifier) @alias))
+(assignment
+  left: (identifier) @alias
+  right: (identifier) @name)
+""")
+
+# SQL Extraction regex (still useful for the string literal itself)
+SQL_REGEX = re.compile(r"(?P<operation>SELECT|UPDATE|DELETE|INSERT)\s+.*\s+FROM\s+(?P<table>[a-zA-Z0-9_]+)", re.IGNORECASE)
+SQL_INSERT_REGEX = re.compile(r"(?P<operation>INSERT)\s+INTO\s+(?P<table>[a-zA-Z0-9_]+)", re.IGNORECASE)
+
 def create_vector_indexes():
-    """
-    Creates the Vector Index in Neo4j (v5.x+ Syntax).
-    Allows us to query: "Find code related to 'payment retry logic'"
-    """
+    """Creates the Vector Index in Neo4j."""
     query_func = """
     CREATE VECTOR INDEX `function_embeddings` IF NOT EXISTS
     FOR (n:Function) ON (n.embedding)
@@ -113,7 +98,6 @@ def create_vector_indexes():
       `vector.similarity_function`: 'cosine'
     }}
     """
-    # Optional: Index Classes too if needed
     query_class = """
     CREATE VECTOR INDEX `class_embeddings` IF NOT EXISTS
     FOR (n:Class) ON (n.embedding)
@@ -130,31 +114,18 @@ def create_vector_indexes():
     except Exception as e:
         print(f"   ⚠️ Vector Index Warning: {e}")
 
-
 def calculate_complexity(source_code):
-    """
-    Simple heuristic: Count 'if', 'for', 'while', 'try' statements.
-    """
     complexity = 0
     keywords = ['if ', 'for ', 'while ', 'try:', 'except ', 'with ']
     for word in keywords:
         complexity += source_code.count(word)
     return complexity
 
-
 def write_function_node(func_name, file_path, source_code, docstring, node_type='function'):
-    """
-    Now includes 'Right Brain' vector generation and complexity calculation.
-    We embed: Name + Docstring + First 500 chars of code (Context)
-    """
-    # 1. Generate the Semantic Fingerprint
     text_representation = f"Function: {func_name}\nDocstring: {docstring}\nCode: {source_code[:500]}"
     vector = embedder.encode(text_representation).tolist()
-
-    # 2. Calculate Complexity
     complexity_score = calculate_complexity(source_code)
 
-    # 3. Write to Graph + Vector Store
     query = """
     MERGE (f:Function {name: $name})
     ON CREATE SET 
@@ -171,69 +142,29 @@ def write_function_node(func_name, file_path, source_code, docstring, node_type=
         f.complexity = $complexity
     """
     with driver.session() as session:
-        session.run(query, 
-                    name=func_name, 
-                    file=file_path, 
-                    node_type=node_type, 
-                    embedding=vector, 
-                    complexity=complexity_score)
+        session.run(query, name=func_name, file=file_path, node_type=node_type, embedding=vector, complexity=complexity_score)
 
 def write_class_node(class_name, file_path):
-    """
-    Creates or Updates a class node.
-    """
-    query = """
-    MERGE (c:Class {name: $name})
-    ON CREATE SET c.file = $file, c.scanned = true
-    ON MATCH SET c.file = $file, c.scanned = true
-    """
+    query = "MERGE (c:Class {name: $name}) ON CREATE SET c.file = $file, c.scanned = true ON MATCH SET c.file = $file, c.scanned = true"
     with driver.session() as session:
         session.run(query, name=class_name, file=file_path)
 
 def create_inheritance_relationship(sub_class_name, super_class_name):
-    """
-    Links a subclass to its superclass.
-    (:Class)-[:IMPLEMENTS]->(:Class)
-    """
-    query = """
-    MATCH (sub:Class {name: $sub_class})
-    MERGE (super:Class {name: $super_class})
-    MERGE (sub)-[:IMPLEMENTS]->(super)
-    """
+    query = "MATCH (sub:Class {name: $sub_class}) MERGE (super:Class {name: $super_class}) MERGE (sub)-[:IMPLEMENTS]->(super)"
     with driver.session() as session:
         session.run(query, sub_class=sub_class_name, super_class=super_class_name)
 
 def create_has_method_relationship(class_name, method_name):
-    """
-    Links a class to its method.
-    (:Class)-[:HAS_METHOD]->(:Function)
-    """
-    query = """
-    MATCH (c:Class {name: $class_name})
-    MERGE (m:Function {name: $method_name})
-    MERGE (c)-[:HAS_METHOD]->(m)
-    """
+    query = "MATCH (c:Class {name: $class_name}) MERGE (m:Function {name: $method_name}) MERGE (c)-[:HAS_METHOD]->(m)"
     with driver.session() as session:
         session.run(query, class_name=class_name, method_name=method_name)
 
 def create_dependency(caller_name, callee_name):
-    """
-    Links Caller -> Callee.
-    If Callee doesn't exist yet, it is created as a 'Ghost Node'
-    (no file path yet).
-    """
-    query = """
-    MERGE (a {name: $caller})
-    MERGE (b {name: $callee})
-    MERGE (a)-[:CALLS]->(b)
-    """
+    query = "MERGE (a {name: $caller}) MERGE (b {name: $callee}) MERGE (a)-[:CALLS]->(b)"
     with driver.session() as session:
         session.run(query, caller=caller_name, callee=callee_name)
 
 def create_sql_touch_relationship(func_name, operation, table):
-    """
-    (:Function)-[:TOUCHES {operation, table}]->(:Infrastructure {type: 'SQL'})
-    """
     query = """
     MATCH (f:Function {name: $func_name})
     MERGE (i:Infrastructure {type: 'SQL'})
@@ -243,157 +174,139 @@ def create_sql_touch_relationship(func_name, operation, table):
     """
     with driver.session() as session:
         session.run(query, func_name=func_name, operation=operation, table=table)
-        print(f"   ⚡ Found SQL: {func_name} -> {operation} on {table}")
 
 def create_api_call_relationship(func_name, method, endpoint):
-    """
-    Tries to resolve an API endpoint to a specific function in the graph.
-    If successful, creates a direct [:CALLS] relationship.
-    Otherwise, creates a generic [:CALLS_API] relationship to an Infrastructure node.
-    """
-    # Extract the path from a potentially complex URL string
     path_match = re.search(r"/(?P<path>[a-zA-Z0-9_-]+)$", endpoint)
     if not path_match:
-        # Fallback for non-standard or unresolved paths
-        query = """
-        MATCH (f:Function {name: $func_name})
-        MERGE (i:Infrastructure {type: 'ExternalAPI'})
-        MERGE (f)-[r:CALLS_API]->(i)
-        SET r.method = $method, r.endpoint = $endpoint
-        """
+        query = "MATCH (f:Function {name: $func_name}) MERGE (i:Infrastructure {type: 'ExternalAPI'}) MERGE (f)-[r:CALLS_API]->(i) SET r.method = $method, r.endpoint = $endpoint"
         with driver.session() as session:
             session.run(query, func_name=func_name, method=method, endpoint=endpoint)
-            print(f"   ⚡ Found unresolved API Call: {func_name} -> {method} {endpoint}")
         return
-
     path = "/" + path_match.group("path")
-
-    # Query to find the function with the matching route
-    resolve_query = """
-    MATCH (caller:Function {name: $func_name})
-    MATCH (callee:Function) WHERE callee.route = $path
-    MERGE (caller)-[:CALLS]->(callee)
-    """
+    resolve_query = "MATCH (caller:Function {name: $func_name}) MATCH (callee:Function) WHERE callee.route = $path MERGE (caller)-[:CALLS]->(callee)"
     with driver.session() as session:
         result = session.run(resolve_query, func_name=func_name, path=path)
-        summary = result.consume()
-        if summary.counters.relationships_created > 0:
-            print(f"   ⚡ Found and linked API Call: {func_name} -> {path}")
-        else:
-            # Fallback if no function with that route is found
-            fallback_query = """
-            MATCH (f:Function {name: $func_name})
-            MERGE (i:Infrastructure {type: 'ExternalAPI'})
-            MERGE (f)-[r:CALLS_API]->(i)
-            SET r.method = $method, r.endpoint = $endpoint
-            """
+        if result.consume().counters.relationships_created == 0:
+            fallback_query = "MATCH (f:Function {name: $func_name}) MERGE (i:Infrastructure {type: 'ExternalAPI'}) MERGE (f)-[r:CALLS_API]->(i) SET r.method = $method, r.endpoint = $endpoint"
             session.run(fallback_query, func_name=func_name, method=method, endpoint=endpoint)
-            print(f"   ⚡ Found unresolved API Call: {func_name} -> {method} {endpoint}")
 
 def create_aws_touch_relationship(func_name, service):
-    """
-    (:Function)-[:TOUCHES {service}]->(:Infrastructure {type: 'AWS'})
-    """
-    query = """
-    MATCH (f:Function {name: $func_name})
-    MERGE (i:Infrastructure {type: 'AWS'})
-    MERGE (f)-[r:TOUCHES]->(i)
-    ON CREATE SET r.service = $service
-    ON MATCH SET r.service = $service
-    """
+    query = "MATCH (f:Function {name: $func_name}) MERGE (i:Infrastructure {type: 'AWS'}) MERGE (f)-[r:TOUCHES]->(i) SET r.service = $service"
     with driver.session() as session:
         session.run(query, func_name=func_name, service=service)
-        print(f"   ⚡ Found AWS: {func_name} -> service: {service}")
 
 def create_kafka_touch_relationship(func_name, operation, topic):
-    """
-    (:Function)-[:TOUCHES {operation, topic}]->(:Infrastructure {type: 'Kafka'})
-    """
-    query = """
-    MATCH (f:Function {name: $func_name})
-    MERGE (i:Infrastructure {type: 'Kafka'})
-    MERGE (f)-[r:TOUCHES]->(i)
-    ON CREATE SET r.operation = $operation, r.topic = $topic
-    ON MATCH SET r.operation = $operation, r.topic = $topic
-    """
+    query = "MATCH (f:Function {name: $func_name}) MERGE (i:Infrastructure {type: 'Kafka'}) MERGE (f)-[r:TOUCHES]->(i) SET r.operation = $operation, r.topic = $topic"
     with driver.session() as session:
         session.run(query, func_name=func_name, operation=operation, topic=topic)
-        print(f"   ⚡ Found Kafka: {func_name} -> {operation} on topic: {topic}")
 
 def create_other_infra_relationship(func_name, infra_type):
-    """
-    Creates a generic relationship for other infra types like Boto3, Kafka, etc.
-    (:Function)-[:TOUCHES]->(:Infrastructure {type: 'AWS'})
-    """
-    query = """
-    MATCH (f:Function {name: $func_name})
-    MERGE (i:Infrastructure {type: $infra_type})
-    MERGE (f)-[:TOUCHES]->(i)
-    """
+    query = "MATCH (f:Function {name: $func_name}) MERGE (i:Infrastructure {type: $infra_type}) MERGE (f)-[:TOUCHES]->(i)"
     with driver.session() as session:
         session.run(query, func_name=func_name, infra_type=infra_type)
-        print(f"   ⚡ Found Infra: {func_name} -> {infra_type}")
 
-def analyze_infra_usage(func_or_method_name, code_snippet):
+def analyze_ast_infra(node, func_name, source_code, aliases):
     """
-    Scans code body for Infrastructure signals using the new patterns.
+    Traverses the AST of a function/method and detects infrastructure usage using aliases.
     """
-    # SQL Detection
-    for pattern_name in ['SQL_QUERY', 'SQL_INSERT']:
-        for match in INFRASTRUCTURE_PATTERNS[pattern_name].finditer(code_snippet):
-            details = match.groupdict()
-            create_sql_touch_relationship(
-                func_or_method_name,
-                details.get('operation', 'UNKNOWN').upper(),
-                details.get('table', 'UNKNOWN')
-            )
-
-    # API Detection (Requests)
-    for match in INFRASTRUCTURE_PATTERNS['API_REQUESTS'].finditer(code_snippet):
-        details = match.groupdict()
-        create_api_call_relationship(
-            func_or_method_name,
-            details.get('method', 'UNKNOWN').upper(),
-            details.get('endpoint', 'UNKNOWN')
-        )
-
-    # API Detection (HTTPX)
-    for match in INFRASTRUCTURE_PATTERNS['API_HTTPX'].finditer(code_snippet):
-        details = match.groupdict()
-        create_api_call_relationship(
-            func_or_method_name,
-            details.get('method', 'UNKNOWN').upper(),
-            details.get('endpoint', 'UNKNOWN')
-        )
-
-    # AWS Boto3 Detection
-    for match in INFRASTRUCTURE_PATTERNS['BOTO3'].finditer(code_snippet):
-        details = match.groupdict()
-        create_aws_touch_relationship(
-            func_or_method_name,
-            details.get('service', 'UNKNOWN')
-        )
-
-    # Kafka Detection
-    for match in INFRASTRUCTURE_PATTERNS['KAFKA'].finditer(code_snippet):
-        details = match.groupdict()
-        create_kafka_touch_relationship(
-            func_or_method_name,
-            details.get('operation', 'UNKNOWN'),
-            details.get('topic', 'UNKNOWN')
-        )
+    captures = INFRA_CALL_QUERY.captures(node)
+    if isinstance(captures, dict):
+        captures = [(n, c) for c, nodes in captures.items() for n in nodes]
     
-    # Other keyword-based infrastructure
-    other_infra = ['REDIS', 'MONGO']
-    for infra_key in other_infra:
-        if INFRASTRUCTURE_PATTERNS[infra_key].search(code_snippet):
-            # We use the key as the type, e.g., 'REDIS' becomes type 'REDIS'
-            create_other_infra_relationship(func_or_method_name, infra_key)
+    # Restructure captures for easy access
+    call_nodes = {}
+    for capture_node, capture_name in captures:
+        if capture_node not in call_nodes:
+            call_nodes[capture_node] = {}
+        call_nodes[capture_node][capture_name] = capture_node
+
+    for call_node, data in call_nodes.items():
+        obj_node = data.get('obj')
+        method_node = data.get('method')
+        func_node = data.get('func')
+        arg_node = data.get('arg')
+
+        obj_name = source_code[obj_node.start_byte:obj_node.end_byte] if obj_node else None
+        method_name = source_code[method_node.start_byte:method_node.end_byte] if method_node else None
+        func_call_name = source_code[func_node.start_byte:func_node.end_byte] if func_node else None
+        arg_value = source_code[arg_node.start_byte:arg_node.end_byte].strip("'\"") if arg_node else ""
+
+        # Resolve Alias
+        resolved_obj = aliases.get(obj_name, obj_name)
+        resolved_func = aliases.get(func_call_name, func_call_name)
+
+        # 1. API Calls (Requests / HTTPX)
+        if resolved_obj in ['requests', 'httpx'] and method_name in ['get', 'post', 'put', 'delete']:
+            create_api_call_relationship(func_name, method_name.upper(), arg_value)
+            # print(f"   ⚡ [AST] API: {func_name} -> {method_name.upper()} {arg_value}")
+
+        # 2. AWS Boto3
+        elif resolved_obj == 'boto3' and method_name in ['client', 'resource']:
+            create_aws_touch_relationship(func_name, arg_value)
+            # print(f"   ⚡ [AST] AWS: {func_name} -> {arg_value}")
+
+        # 3. SQL (execute/run)
+        elif method_name in ['execute', 'run']:
+            match = SQL_REGEX.search(arg_value) or SQL_INSERT_REGEX.search(arg_value)
+            if match:
+                create_sql_touch_relationship(func_name, match.group('operation').upper(), match.group('table'))
+                # print(f"   ⚡ [AST] SQL: {func_name} -> {match.group('operation')} on {match.group('table')}")
+
+        # 4. Kafka
+        elif method_name in ['send', 'poll']:
+            # Topic is usually the first argument
+            create_kafka_touch_relationship(func_name, method_name, arg_value)
+            # print(f"   ⚡ [AST] Kafka: {func_name} -> {method_name} on {arg_value}")
+
+        # 5. Django ORM
+        # This is trickier as 'objects' is an attribute of a model. 
+        # For now, we look for '.objects.filter' etc.
+        elif method_name in ['filter', 'get', 'create', 'update', 'delete', 'all']:
+            # In node.children[0] (the attribute), child 0 is the 'Model.objects' part
+            # This is a bit deep, but we can check if obj_name ends with '.objects'
+            if obj_name and obj_name.endswith('.objects'):
+                create_other_infra_relationship(func_name, 'DJANGO_ORM')
+                # print(f"   ⚡ [AST] Django: {func_name} -> {method_name}")
+
+        # 6. Redis / Mongo
+        elif resolved_obj in ['redis', 'pymongo'] or resolved_func in ['Redis', 'MongoClient']:
+            infra_type = 'REDIS' if 'redis' in (resolved_obj or resolved_func).lower() else 'MONGO'
+            create_other_infra_relationship(func_name, infra_type)
+            # print(f"   ⚡ [AST] Infra: {func_name} -> {infra_type}")
+
+def get_file_aliases(tree, source_code):
+    """Detects imports and assignments to build an alias map."""
+    aliases = {}
+    captures = ALIAS_QUERY.captures(tree.root_node)
+    if isinstance(captures, dict):
+        captures = [(n, c) for c, nodes in captures.items() for n in nodes]
+    for node, name in captures:
+        # This is a bit simplified, but captures 'alias' and 'name'
+        # We need to correlate them by parent node
+        pass
+    
+    # Manual traversal for robust alias mapping
+    for node in tree.root_node.children:
+        if node.type in ['import_statement', 'import_from_statement']:
+            for child in node.children:
+                if child.type == 'aliased_import':
+                    orig = source_code[child.child_by_field_name('name').start_byte:child.child_by_field_name('name').end_byte]
+                    alias = source_code[child.child_by_field_name('alias').start_byte:child.child_by_field_name('alias').end_byte]
+                    aliases[alias] = orig
+        elif node.type == 'expression_statement':
+            assign = node.children[0]
+            if assign.type == 'assignment':
+                left = assign.child_by_field_name('left')
+                right = assign.child_by_field_name('right')
+                if left and right and left.type == 'identifier' and right.type == 'identifier':
+                    l_val = source_code[left.start_byte:left.end_byte]
+                    r_val = source_code[right.start_byte:right.end_byte]
+                    if r_val in ['requests', 'httpx', 'boto3', 'redis', 'pymongo']:
+                        aliases[l_val] = r_val
+    return aliases
 
 def process_file(file_path):
-    """Parses a single file and pushes it to the Graph."""
-    print(f"📄 Scanning: {file_path}")
-    
+    # print(f"📄 Scanning: {file_path}")
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             source_code = f.read()
@@ -402,194 +315,119 @@ def process_file(file_path):
         return
 
     tree = parser.parse(bytes(source_code, "utf8"))
+    aliases = get_file_aliases(tree, source_code)
+    # if aliases:
+    #     print(f"   🆔 Aliases detected: {aliases}")
     
-    # --- 1. Process Class Definitions and their Methods ---
+    # --- 1. Classes ---
     class_captures = CLASS_DEF_QUERY.captures(tree.root_node)
-
-    # Convert captures to a flat list for easier processing
     if isinstance(class_captures, dict):
-        flat_class_captures = []
-        for capture_name, nodes in class_captures.items():
-            for capture_node in nodes:
-                flat_class_captures.append((capture_node, capture_name))
-        class_captures = flat_class_captures
-
+        class_captures = [(n, c) for c, nodes in class_captures.items() for n in nodes]
+        
     for node, name in class_captures:
         if name == 'class.name':
             class_name = source_code[node.start_byte:node.end_byte]
             write_class_node(class_name, file_path)
-            
-            print(f"   ➕ Class: {class_name}")
+            # print(f"   ➕ Class: {class_name}")
 
-            # Find inherited classes
             class_def_node = node.parent
-            # Need to get the full source code for this class definition node to scan for infra
-            class_def_source = source_code[class_def_node.start_byte:class_def_node.end_byte]
-
-            base_class_captures = CLASS_DEF_QUERY.captures(class_def_node)
-
-            if isinstance(base_class_captures, dict):
-                flat_base_class_captures = []
-                for capture_name, nodes in base_class_captures.items():
-                    for capture_node in nodes:
-                        flat_base_class_captures.append((capture_node, capture_name))
-                base_class_captures = flat_base_class_captures
-
-            for base_node, base_name in base_class_captures:
+            base_captures = CLASS_DEF_QUERY.captures(class_def_node)
+            if isinstance(base_captures, dict):
+                base_captures = [(n, c) for c, nodes in base_captures.items() for n in nodes]
+            for base_node, base_name in base_captures:
                 if base_name == 'base.class':
-                    super_class_name = source_code[base_node.start_byte:base_node.end_byte]
-                    if super_class_name: # Ensure it's not an empty match
-                        create_inheritance_relationship(class_name, super_class_name)
-                        print(f"      🔗 Inherits: {super_class_name}")
+                    super_name = source_code[base_node.start_byte:base_node.end_byte]
+                    create_inheritance_relationship(class_name, super_name)
 
-            # Find methods within this class
             method_captures = METHOD_DEF_QUERY.captures(class_def_node)
-            
             if isinstance(method_captures, dict):
-                flat_method_captures = []
-                for capture_name, nodes in method_captures.items():
-                    for capture_node in nodes:
-                        flat_method_captures.append((capture_node, capture_name))
-                method_captures = flat_method_captures
-
+                method_captures = [(n, c) for c, nodes in method_captures.items() for n in nodes]
             for method_node, method_name_capture in method_captures:
                 if method_name_capture == 'method.name':
-                    method_name = source_code[method_node.start_byte:method_node.end_byte]
-                    full_method_name = f"{class_name}.{method_name}" # e.g., MyClass.my_method
-                    method_def_node = method_node.parent
-                    method_source_code = source_code[method_def_node.start_byte:method_def_node.end_byte]
+                    m_name = source_code[method_node.start_byte:method_node.end_byte]
+                    full_m_name = f"{class_name}.{m_name}"
+                    m_def_node = method_node.parent
+                    m_source = source_code[m_def_node.start_byte:m_def_node.end_byte]
                     
-                    # EXTRACT DOCSTRING (Simple Regex or Tree-sitter check)
-                    docstring = ""
-                    if method_def_node.child_count > 0:
-                        # Simple heuristic: Check if first statement is a string expression
-                        body_node = method_def_node.child_by_field_name('body')
-                        if body_node and body_node.child_count > 0:
-                            first_child = body_node.children[0]
-                            if first_child.type == 'expression_statement' and first_child.children[0].type == 'string':
-                                docstring = source_code[first_child.start_byte:first_child.end_byte]
+                    doc = ""
+                    body = m_def_node.child_by_field_name('body')
+                    if body and body.child_count > 0:
+                        first = body.children[0]
+                        if first.type == 'expression_statement' and first.children[0].type == 'string':
+                            doc = source_code[first.start_byte:first.end_byte]
 
-                    write_function_node(full_method_name, file_path, method_source_code, docstring, node_type='method')
-                    create_has_method_relationship(class_name, full_method_name)
-                    print(f"      - Method: {full_method_name}")
-
-                    # Get the source code for the method definition for infra analysis
-                    method_def_node = method_node.parent
-                    method_source_code = source_code[method_def_node.start_byte:method_def_node.end_byte]
-                    analyze_infra_usage(full_method_name, method_source_code) # Analyze infra usage for methods
+                    write_function_node(full_m_name, file_path, m_source, doc, node_type='method')
+                    create_has_method_relationship(class_name, full_m_name)
+                    analyze_ast_infra(m_def_node, full_m_name, source_code, aliases)
                     
-                    call_captures = CALL_QUERY.captures(method_def_node)
-                    
+                    # Dependency tracking
+                    call_captures = CALL_QUERY.captures(m_def_node)
                     if isinstance(call_captures, dict):
-                        flat_calls = []
-                        for capture_name, nodes in call_captures.items():
-                            for capture_node in nodes:
-                                flat_calls.append((capture_node, capture_name))
-                        call_captures = flat_calls
+                        call_captures = [(n, c) for c, nodes in call_captures.items() for n in nodes]
+                    for c_node, c_name in call_captures:
+                        if c_name == 'call.name':
+                            callee = source_code[c_node.start_byte:c_node.end_byte]
+                            if callee not in PYTHON_BUILTINS:
+                                create_dependency(full_m_name, callee)
 
-                    for call_node, capture_name in call_captures:
-                        if capture_name == 'call.name':
-                            callee_name = source_code[call_node.start_byte:call_node.end_byte]
-                            if callee_name not in PYTHON_BUILTINS:
-                                create_dependency(full_method_name, callee_name)
-                                print(f"         ➡️ Calls: {callee_name}")
-
-    # --- 2. Process Global Functions ---
-    global_func_captures = GLOBAL_FUNC_QUERY.captures(tree.root_node)
-
-    if isinstance(global_func_captures, dict):
-        flat_global_func_captures = []
-        for capture_name, nodes in global_func_captures.items():
-            for capture_node in nodes:
-                flat_global_func_captures.append((capture_node, capture_name))
-        global_func_captures = flat_global_func_captures
-
-    for node, name in global_func_captures:
+    # --- 2. Global Functions ---
+    global_captures = GLOBAL_FUNC_QUERY.captures(tree.root_node)
+    if isinstance(global_captures, dict):
+        global_captures = [(n, c) for c, nodes in global_captures.items() for n in nodes]
+    for node, name in global_captures:
         if name == 'func.name':
-            func_name = source_code[node.start_byte:node.end_byte]
+            f_name = source_code[node.start_byte:node.end_byte]
+            f_def_node = node.parent
+            f_source = source_code[f_def_node.start_byte:f_def_node.end_byte]
             
-            func_def_node = node.parent
-            func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
-            
-            # EXTRACT DOCSTRING (Simple Regex or Tree-sitter check)
-            docstring = ""
-            if func_def_node.child_count > 0:
-                # Simple heuristic: Check if first statement is a string expression
-                body_node = func_def_node.child_by_field_name('body')
-                if body_node and body_node.child_count > 0:
-                    first_child = body_node.children[0]
-                    if first_child.type == 'expression_statement' and first_child.children[0].type == 'string':
-                        docstring = source_code[first_child.start_byte:first_child.end_byte]
+            doc = ""
+            body = f_def_node.child_by_field_name('body')
+            if body and body.child_count > 0:
+                first = body.children[0]
+                if first.type == 'expression_statement' and first.children[0].type == 'string':
+                    doc = source_code[first.start_byte:first.end_byte]
 
-            # Call the new Write Function
-            write_function_node(func_name, file_path, func_source_code, docstring, node_type='function')
-            print(f"   ➕ Function (with Vector): {func_name}")
-
-            # Check for @app.route decorator
-            if func_def_node.prev_sibling and func_def_node.prev_sibling.type == 'decorator':
-                decorator_text = source_code[func_def_node.prev_sibling.start_byte:func_def_node.prev_sibling.end_byte]
-                route_match = re.search(r"@app\.route\(['\"](.*?)['\"]", decorator_text)
-                if route_match:
-                    route = route_match.group(1)
-                    with driver.session() as session:
-                        session.run("MATCH (f:Function {name: $name}) SET f.route = $route", name=func_name, route=route)
-                        print(f"      - Route: {route}")
+            write_function_node(f_name, file_path, f_source, doc, node_type='function')
             
-            func_def_node = node.parent
-            func_source_code = source_code[func_def_node.start_byte:func_def_node.end_byte]
-            analyze_infra_usage(func_name, func_source_code) # Analyze infra usage for global functions
+            # Decorator check (routes)
+            if f_def_node.prev_sibling and f_def_node.prev_sibling.type == 'decorator':
+                dec_text = source_code[f_def_node.prev_sibling.start_byte:f_def_node.prev_sibling.end_byte]
+                r_match = re.search(r"@app\.route\(['\"](.*?)['\"]", dec_text)
+                if r_match:
+                    with driver.session() as s:
+                        s.run("MATCH (f:Function {name: $name}) SET f.route = $route", name=f_name, route=r_match.group(1))
 
-            # Look for dependencies inside this function
-            call_captures = CALL_QUERY.captures(func_def_node)
-            
+            analyze_ast_infra(f_def_node, f_name, source_code, aliases)
+
+            call_captures = CALL_QUERY.captures(f_def_node)
             if isinstance(call_captures, dict):
-                flat_calls = []
-                for capture_name, nodes in call_captures.items():
-                    for capture_node in nodes:
-                        flat_calls.append((capture_node, capture_name))
-                call_captures = flat_calls
-            
-            for call_node, capture_name in call_captures:
-                # Only process the function name identifier, not the entire call expression
-                if capture_name == 'call.name':
-                    callee_name = source_code[call_node.start_byte:call_node.end_byte]
-                    
-                    # Filter noise (standard python types)
-                    if callee_name not in PYTHON_BUILTINS:
-                        create_dependency(func_name, callee_name)
-                        print(f"      ➡️ Calls: {callee_name}")
+                call_captures = [(n, c) for c, nodes in call_captures.items() for n in nodes]
+            for c_node, c_name in call_captures:
+                if c_name == 'call.name':
+                    callee = source_code[c_node.start_byte:c_node.end_byte]
+                    if callee not in PYTHON_BUILTINS:
+                        create_dependency(f_name, callee)
 
 def ingest_folder(folder_path):
-    """Recursively walks the directory and ingests all Python files."""
     if not os.path.exists(folder_path):
         print(f"❌ Error: Folder '{folder_path}' not found.")
         return
-
-    print(f"🚀 Starting Ingestion for: {folder_path}")
-    
-    file_count = 0
+    print(f"🚀 Starting Ingestion: {folder_path}")
     for root, dirs, files in os.walk(folder_path):
-        # Optional: Skip hidden folders like .git or venv
-        if '.git' in dirs: dirs.remove('.git')
-        if 'venv' in dirs: dirs.remove('venv')
-        if '.venv' in dirs: dirs.remove('.venv')
-        if '__pycache__' in dirs: dirs.remove('__pycache__')
-
+        for d in ['.git', 'venv', '.venv', '__pycache__']:
+            if d in dirs: dirs.remove(d)
         for file in files:
             if file.endswith(".py"):
-                full_path = os.path.join(root, file)
-                process_file(full_path)
-                file_count += 1
-                
-    print(f"\n✅ Ingestion Complete. Processed {file_count} files.")
+                process_file(os.path.join(root, file))
+    print("\n✅ Ingestion Complete.")
+
+# Mock CALL_QUERY for compatibility with existing code structure
+CALL_QUERY = PY_LANGUAGE.query("(call function: (identifier) @call.name) @call")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python ingest.py <path_to_repo>")
+        print("Usage: python ingest2.py <path_to_repo>")
     else:
-        target_folder = sys.argv[1]
         create_vector_indexes()
-        ingest_folder(target_folder)
+        ingest_folder(sys.argv[1])
         driver.close()
-        sys.exit(0)
-    # ingest_folder("testRepo")
