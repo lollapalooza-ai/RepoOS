@@ -1,3 +1,5 @@
+# Milestone 1: Efficieny Improvements
+
 ## Engineering Directive: Repo OS Intent Manager Architecture Upgrade
 
 **To:** Senior Software Engineer
@@ -48,7 +50,7 @@ Eliminate `_repair_llm_json_string` entirely. We will enforce strict JSON schema
 3. Stream these tokens directly over the WebSocket to the React frontend.
 4. Replace the CLI `input()` prompt with an `asyncio.Event()`. When the LLM finishes streaming the visual diff, suspend the backend execution. Resume and apply the disk patch only when the React UI sends a `RESOLVE_INTENT` payload back through the WebSocket.
 
-# Phase 2: Reliability Improvements
+# Milestone 2: Reliability Improvements
 
 ## Engineering Directive: Resilient Patching & State Sync Orchestration
 
@@ -95,3 +97,91 @@ We must prevent Repo OS from corrupting files if the user hits `Cmd+Z` in their 
 
 
 * **Step B: IDE Event Bridge:** Build a minimal VS Code extension/MCP that listens to `onDidChangeTextDocument`. Plumb this into the existing FastAPI WebSocket server. If a text mutation event fires for a file currently locked in an active `RefactorSession`, send an interrupt signal to kill the Ollama inference thread to save compute. * **Step C: Strict Draft Mode:** Never write to the physical file directly. Always pipe the proposed changes to the `DiffEditor` via the `MOUNT_COMPONENT` event. Only execute the physical disk write when the React frontend sends back the `RESOLVE_INTENT` payload with `decision: "y"` .
+
+
+# Milestone3: Repo OS Agentic Refactor & Ingestion Pipeline Upgrade
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Upgrading Repo OS from Scripted Refactoring to an Agentic AST-Aware State Machine
+**Context:** Our current 14B parameter local LLM setup is failing on system-wide refactors due to context saturation, brittle string-matching, and a lack of post-patch validation. We are transitioning our `ingest2.py` and `refactor2.py` pipelines into a modern, AST-aware GraphRAG system with a self-healing execution loop.
+
+Please implement the following architectural upgrades in the respective modules.
+
+---
+
+## Phase 1: Knowledge Graph & Ingestion Overhaul (`ingest2.py`)
+
+Our current graph lacks the relational depth required to safely move code or audit dependencies. We need to upgrade our Tree-sitter parsing and Neo4j schema to build a true representation of the codebase's impact radius.
+
+**1. Map Global `IMPORTED_BY` Edges:**
+
+* **Task:** Upgrade the Tree-sitter `ALIAS_QUERY` logic. When a file is parsed, do not just track local imports. Construct a global index of exports and map `IMPORTED_BY` relationships in Neo4j.
+* **Why:** If the LLM moves a class (e.g., `UnicodeCSVWriter`), the Model Context Protocol (MCP) must immediately query the graph for all `IMPORTED_BY` nodes to update upstream consumers.
+
+**2. Link Tests to Implementation (`TESTS` Edges):**
+
+* **Task:** Write a Tree-sitter query/heuristic to identify test files (e.g., files matching `test_*.py` or within a `tests/` directory). Map these files to the functions/classes they test using a `TESTS` edge.
+* **Why:** Prevents the LLM from hallucinating new tests by providing exact mappings of what test logic covers what implementation logic.
+
+**3. Extract Docstrings as First-Class Properties:**
+
+* **Task:** Isolate docstrings using Tree-sitter and store them as distinct properties on the Neo4j function/class nodes, separate from the raw execution code block.
+* **Why:** Allows for documentation audits without ever exposing the model to the execution logic, mathematically eliminating the risk of accidental indentation or syntax regressions during docstring updates.
+
+---
+
+## Phase 2: Execution Engine & Pydantic Schemas (`refactor2.py`)
+
+We are deprecating the legacy `SearchAndReplace` schema. The execution engine must act like an agentic compiler, utilizing constrained decoding and strict validation boundaries.
+
+**1. Expand Action Schemas (Constrained Decoding):**
+
+* **Task:** Overhaul the Pydantic models used for the LLM's structured output. Replace the monolithic `SearchAndReplace` with a Union of distinct operations: `CreateFile`, `DeleteFile`, `ModifyNode`, and `AddImport`.
+* **Why:** `AddImport` should specifically target the top of the AST to safely inject dependencies (like `from typing import Any`) without requiring the LLM to regex-match the existing import block. `CreateFile` ensures we can actually move classes to new files rather than just deleting them from the old ones.
+
+**2. Transition to Targeted AST Replacements:**
+
+* **Task:** Deprecate `exact_search_string`. Force the LLM to output a `target_node_signature` (e.g., `def get_model(app_label, model_name):`). Use Tree-sitter to find this exact node in the file and replace the *entire* node with the LLM's `proposed_replace_string`.
+
+**3. Implement the Self-Healing CoT Loop:**
+
+* **Task:** Break the monolithic execution into a Plan -> Execute -> Verify loop.
+* **Plan:** LLM outputs an array of discrete steps.
+* **Execute:** Engine applies *one* patch to the in-memory state.
+* **Verify:** Engine runs `is_valid_python` (AST compilation check) on the modified file *immediately*.
+* **Self-Heal:** If `SyntaxError` occurs, catch the traceback, reject the patch, and send the error back to the LLM as a system message: `"Applying this patch resulted in a SyntaxError: [Traceback]. Please correct the indentation or syntax and retry."`
+
+
+
+---
+
+## Phase 3: Prompt Engineering & Context Management
+
+To prevent the "Lost in the Middle" phenomenon and hallucinated scope creep, we must tightly control what the model "sees" using precision routing and strict XML framing.
+
+**1. Precision Routing via Sub-Tree GraphRAG:**
+
+* **Task:** Do not pass entire files to `context_str`. Query the Neo4j graph for the exact AST node targeted for refactoring, plus the docstrings of immediately adjacent nodes. Pass only this sub-tree.
+
+**2. Strict XML Delimiters:**
+
+* **Task:** Wrap all injected context in the prompt builder with strict XML tags. This acts as a hard boundary for the attention heads of Qwen/Claude/Gemini.
+* **Implementation Example:**
+
+```xml
+<file_context path="{file_path}">
+<node type="{node_type}" signature="{node_signature}">
+{node_code}
+</node>
+<dependencies>
+{adjacent_docstrings}
+</dependencies>
+</file_context>
+
+<instruction>
+{user_prompt}
+Output MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds.
+</instruction>
+
+```

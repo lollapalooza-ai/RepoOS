@@ -133,21 +133,38 @@ def write_function_node(func_name, file_path, source_code, docstring, node_type=
         f.type = $node_type, 
         f.scanned = true,
         f.embedding = $embedding,
-        f.complexity = $complexity
+        f.complexity = $complexity,
+        f.docstring = $docstring
     ON MATCH SET 
         f.file = $file, 
         f.type = $node_type, 
         f.scanned = true,
         f.embedding = $embedding,
-        f.complexity = $complexity
+        f.complexity = $complexity,
+        f.docstring = $docstring
     """
     with driver.session() as session:
-        session.run(query, name=func_name, file=file_path, node_type=node_type, embedding=vector, complexity=complexity_score)
+        session.run(query, name=func_name, file=file_path, node_type=node_type, embedding=vector, complexity=complexity_score, docstring=docstring)
 
-def write_class_node(class_name, file_path):
-    query = "MERGE (c:Class {name: $name}) ON CREATE SET c.file = $file, c.scanned = true ON MATCH SET c.file = $file, c.scanned = true"
+def write_class_node(class_name, file_path, docstring=""):
+    text_representation = f"Class: {class_name}\nDocstring: {docstring}"
+    vector = embedder.encode(text_representation).tolist()
+    
+    query = """
+    MERGE (c:Class {name: $name}) 
+    ON CREATE SET 
+        c.file = $file, 
+        c.scanned = true, 
+        c.docstring = $docstring,
+        c.embedding = $embedding
+    ON MATCH SET 
+        c.file = $file, 
+        c.scanned = true, 
+        c.docstring = $docstring,
+        c.embedding = $embedding
+    """
     with driver.session() as session:
-        session.run(query, name=class_name, file=file_path)
+        session.run(query, name=class_name, file=file_path, docstring=docstring, embedding=vector)
 
 def create_inheritance_relationship(sub_class_name, super_class_name):
     query = "MATCH (sub:Class {name: $sub_class}) MERGE (super:Class {name: $super_class}) MERGE (sub)-[:IMPLEMENTS]->(super)"
@@ -305,8 +322,34 @@ def get_file_aliases(tree, source_code):
                         aliases[l_val] = r_val
     return aliases
 
+def write_file_node(file_path):
+    query = "MERGE (f:File {path: $path}) ON CREATE SET f.scanned = true ON MATCH SET f.scanned = true"
+    with driver.session() as session:
+        session.run(query, path=file_path)
+
+def create_file_import_relationship(importer_path, imported_module):
+    # This is heuristic-based; resolving module name to path
+    # For now, we'll store the raw module name and a potential match if found
+    query = """
+    MERGE (f1:File {path: $importer_path})
+    MERGE (f2:File {path: $imported_module})
+    MERGE (f2)-[:IMPORTED_BY]->(f1)
+    """
+    with driver.session() as session:
+        session.run(query, importer_path=importer_path, imported_module=imported_module)
+
+def create_test_relationship(test_node_name, target_node_name):
+    query = """
+    MATCH (t {name: $test_node})
+    MATCH (target {name: $target_node})
+    MERGE (t)-[:TESTS]->(target)
+    """
+    with driver.session() as session:
+        session.run(query, test_node=test_node_name, target_node=target_node_name)
+
 def process_file(file_path):
     # print(f"📄 Scanning: {file_path}")
+    write_file_node(file_path)
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             source_code = f.read()
@@ -316,6 +359,33 @@ def process_file(file_path):
 
     tree = parser.parse(bytes(source_code, "utf8"))
     aliases = get_file_aliases(tree, source_code)
+    
+    # Track imports for IMPORTED_BY
+    for node in tree.root_node.children:
+        if node.type == 'import_statement':
+            for child in node.children:
+                if child.type == 'dotted_name':
+                    mod_name = source_code[child.start_byte:child.end_byte]
+                    create_file_import_relationship(file_path, mod_name)
+        elif node.type == 'import_from_statement':
+            mod_node = node.child_by_field_name('module_name')
+            if mod_node:
+                mod_name = source_code[mod_node.start_byte:mod_node.end_byte]
+                create_file_import_relationship(file_path, mod_name)
+
+    is_test_file = "test" in os.path.basename(file_path).lower() or "/tests/" in file_path
+    if is_test_file:
+        # Heuristic: File-level TESTS relationship
+        impl_candidate = os.path.basename(file_path).replace("test_", "").replace("_test", "")
+        # This is very simple; real resolution would check existence
+        query = """
+        MATCH (t:File {path: $test_file})
+        MATCH (impl:File) WHERE impl.path ENDS WITH $impl_candidate
+        MERGE (t)-[:TESTS]->(impl)
+        """
+        with driver.session() as s:
+            s.run(query, test_file=file_path, impl_candidate=impl_candidate)
+
     # if aliases:
     #     print(f"   🆔 Aliases detected: {aliases}")
     
@@ -327,10 +397,19 @@ def process_file(file_path):
     for node, name in class_captures:
         if name == 'class.name':
             class_name = source_code[node.start_byte:node.end_byte]
-            write_class_node(class_name, file_path)
+            class_def_node = node.parent
+            
+            # Extract class docstring
+            class_doc = ""
+            body = class_def_node.child_by_field_name('body')
+            if body and body.child_count > 0:
+                first = body.children[0]
+                if first.type == 'expression_statement' and first.children[0].type == 'string':
+                    class_doc = source_code[first.start_byte:first.end_byte].strip("'\"")
+
+            write_class_node(class_name, file_path, docstring=class_doc)
             # print(f"   ➕ Class: {class_name}")
 
-            class_def_node = node.parent
             base_captures = CLASS_DEF_QUERY.captures(class_def_node)
             if isinstance(base_captures, dict):
                 base_captures = [(n, c) for c, nodes in base_captures.items() for n in nodes]
@@ -369,6 +448,8 @@ def process_file(file_path):
                             callee = source_code[c_node.start_byte:c_node.end_byte]
                             if callee not in PYTHON_BUILTINS:
                                 create_dependency(full_m_name, callee)
+                                if is_test_file and f_name.startswith("test_") and not callee.startswith("test_"):
+                                    create_test_relationship(full_m_name, callee)
 
     # --- 2. Global Functions ---
     global_captures = GLOBAL_FUNC_QUERY.captures(tree.root_node)
@@ -407,6 +488,8 @@ def process_file(file_path):
                     callee = source_code[c_node.start_byte:c_node.end_byte]
                     if callee not in PYTHON_BUILTINS:
                         create_dependency(f_name, callee)
+                        if is_test_file and f_name.startswith("test_") and not callee.startswith("test_"):
+                            create_test_relationship(f_name, callee)
 
 def ingest_folder(folder_path):
     if not os.path.exists(folder_path):

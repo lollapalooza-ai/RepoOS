@@ -11,7 +11,7 @@ from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, Union, AsyncGenerator
+from typing import List, Dict, Optional, Union, AsyncGenerator, Literal
 import hashlib
 import ast
 
@@ -24,14 +24,28 @@ class TaskItem(BaseModel):
 class TaskList(BaseModel):
     tasks: List[TaskItem] = Field(..., description="A sequential list of tasks to complete the refactor.")
 
-class SearchAndReplace(BaseModel):
+class CreateFile(BaseModel):
+    action: Literal["create_file"] = "create_file"
+    file_path: str = Field(..., description="Path to the new file.")
+    content: str = Field(..., description="The complete content of the new file.")
+
+class DeleteFile(BaseModel):
+    action: Literal["delete_file"] = "delete_file"
+    file_path: str = Field(..., description="Path to the file to delete.")
+
+class ModifyNode(BaseModel):
+    action: Literal["modify_node"] = "modify_node"
     file_path: str = Field(..., description="Path to the file to modify.")
-    target_node_signature: Optional[str] = Field(None, description="Optional: The function or class name where this change occurs (e.g., 'my_func' or 'MyClass.my_method').")
-    exact_search_string: str = Field(..., description="The EXACT literal text to find in the file. MUST BE EXACT and unique.")
-    proposed_replace_string: str = Field(..., description="The text to replace it with.")
+    target_node_signature: str = Field(..., description="The function or class name to replace (e.g., 'my_func' or 'MyClass.my_method').")
+    proposed_replace_string: str = Field(..., description="The NEW complete code for that node (function/class).")
+
+class AddImport(BaseModel):
+    action: Literal["add_import"] = "add_import"
+    file_path: str = Field(..., description="Path to the file to modify.")
+    import_statement: str = Field(..., description="The import statement to add (e.g., 'import os' or 'from typing import Any').")
 
 class RefactorProposal(BaseModel):
-    patches: List[SearchAndReplace] = Field(..., description="A list of surgical search-and-replace blocks.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport]] = Field(..., description="A list of discrete refactoring actions.")
 
 # --- Config ---
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
@@ -83,45 +97,51 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
                 return node.start_byte, node.end_byte
     return None
 
-def apply_patches_to_state(master_state: Dict[str, str], patches: List[SearchAndReplace], original_checksums: Dict[str, str] = None) -> Dict[str, str]:
+def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport]], original_checksums: Dict[str, str] = None) -> Dict[str, str]:
     """
-    Programmatically applies surgical patches (Phase 2 Upgrade).
+    Programmatically applies surgical actions (Phase 2 Upgrade).
     """
     new_state = master_state.copy()
-    for patch in patches:
-        path = patch.file_path
-        if path not in new_state: continue
+    for action in actions:
+        path = action.file_path
         
         # Step 3A: Pre-flight checksum check
-        if original_checksums and path in original_checksums:
+        if original_checksums and path in original_checksums and path in new_state:
             current_content = fetch_file_content(path)
             if current_content and calculate_checksum(current_content) != original_checksums[path]:
-                print(f"❌ STATE_MUTATION_DETECTED: {path} was modified externally. Aborting patch.")
+                print(f"❌ STATE_MUTATION_DETECTED: {path} was modified externally. Aborting action.")
                 continue
 
-        content = new_state[path]
-        
-        # Strategy 1: Exact Match (Fastest)
-        if patch.exact_search_string in content and content.count(patch.exact_search_string) == 1:
-            new_state[path] = content.replace(patch.exact_search_string, patch.proposed_replace_string)
-            print(f"   ✨ Applied exact match patch to {path}")
-            continue
+        if action.action == "create_file":
+            new_state[path] = action.content
+            print(f"   🆕 Created file: {path}")
 
-        # Strategy 2: AST Anchor Targeting (Step 1A)
-        if patch.target_node_signature:
-            node_range = find_node_range(content, patch.target_node_signature)
+        elif action.action == "delete_file":
+            if path in new_state:
+                del new_state[path]
+                print(f"   🗑️ Deleted file: {path}")
+
+        elif action.action == "modify_node":
+            if path not in new_state:
+                print(f"❌ Modify Error: File {path} not found in state.")
+                continue
+            content = new_state[path]
+            node_range = find_node_range(content, action.target_node_signature)
             if node_range:
                 start, end = node_range
-                node_content = content[start:end]
-                # Try exact match WITHIN the node
-                if patch.exact_search_string in node_content:
-                    new_node_content = node_content.replace(patch.exact_search_string, patch.proposed_replace_string)
-                    new_state[path] = content[:start] + new_node_content + content[end:]
-                    print(f"   🎯 Applied AST-targeted patch to {path} at node '{patch.target_node_signature}'")
-                    continue
-        
-        # Strategy 3: Fuzzy / Fallback
-        print(f"❌ Patch Error: Search block not found in {path}. Use 'target_node_signature' for better accuracy.")
+                new_state[path] = content[:start] + action.proposed_replace_string + content[end:]
+                print(f"   🎯 Applied AST-targeted replacement to {path} at node '{action.target_node_signature}'")
+            else:
+                print(f"❌ Modify Error: Node '{action.target_node_signature}' not found in {path}.")
+
+        elif action.action == "add_import":
+            if path not in new_state:
+                new_state[path] = ""
+            content = new_state[path]
+            if action.import_statement not in content:
+                # Add at the top
+                new_state[path] = action.import_statement + "\n" + content
+                print(f"   ⚓ Added import to {path}: {action.import_statement}")
         
     return new_state
 
@@ -134,7 +154,9 @@ def apply_updates(file_updates: Dict[str, str], original_checksums: Dict[str, st
                 print(f"❌ CRITICAL: State mismatch for {path} just before write. Aborting.")
                 continue
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
         print(f"   💾 Persisted changes to {path}")
@@ -243,47 +265,91 @@ async def main():
     for i, task in enumerate(task_list.tasks):
         print(f"\n--- Executing Task {i+1}/{len(task_list.tasks)}: {task.task} ---")
         
-        step_files = {p: master_state.get(p, "") for p in task.context if p in master_state}
-        context_str = "\n\n".join(f"--- FILE: {p} ---\n{c}" for p, c in step_files.items())
-        
-        sys_prompt = "You are a Principal Engineer. Provide surgical SearchAndReplace patches."
-        user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}"
-        
-        print("🧠 Generating Patches...", end="")
-        full_patch_json = ""
-        async for token in generate_streaming_json(sys_prompt, user_prompt, RefactorProposal):
-            full_patch_json += token
-        print(" Done.\n")
-        
-        try:
-            proposal = RefactorProposal.model_validate_json(full_patch_json)
-            new_state = apply_patches_to_state(master_state, proposal.patches, master_checksums)
+        # Phase 3: Precision Routing via Sub-Tree GraphRAG
+        context_blocks = []
+        for path, node_names in task.context.items():
+            content = master_state.get(path, "")
+            if not content: continue
             
-            # Show diff
-            print("\n🔍 REVIEW PROPOSED CHANGES:")
-            has_changes = False
-            for path, new_content in new_state.items():
-                old_content = master_state.get(path, "")
-                if old_content == new_content: continue
-                has_changes = True
-                print(f"\n--- File: {path} ---")
-                diff = difflib.unified_diff(old_content.splitlines(keepends=True), new_content.splitlines(keepends=True), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="")
-                for line in diff:
-                    print(line.rstrip())
-            
-            if not has_changes:
-                print("No changes proposed for this task.")
-                    
-            print(f"\nApply changes for Task {i+1}? (y/n): ", end="", flush=True)
-            confirm = 'y' if args.yes else sys.stdin.readline().strip().lower()
-            if confirm == 'y':
-                master_state.update(new_state)
-                print("✅ Changes accepted in-memory.")
+            file_block = f'<file_context path="{path}">'
+            for node_name in node_names:
+                node_range = find_node_range(content, node_name)
+                if node_range:
+                    start, end = node_range
+                    node_code = content[start:end]
+                    # In a real implementation, we'd also fetch adjacent docstrings from Neo4j
+                    file_block += f'\n<node signature="{node_name}">\n{node_code}\n</node>'
+            file_block += "\n</file_context>"
+            context_blocks.append(file_block)
+        
+        context_str = "\n\n".join(context_blocks)
+        
+        sys_prompt = "You are a Principal Engineer. Provide discrete refactoring actions (create_file, delete_file, modify_node, add_import)."
+        user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
+        
+        max_retries = 3
+        retry_count = 0
+        error_msg = ""
+        
+        while retry_count < max_retries:
+            if error_msg:
+                print(f"   🔄 Self-Healing Retry {retry_count}/{max_retries} due to: {error_msg}")
+                current_user_prompt = f"{user_prompt}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: {error_msg}\nPlease correct the indentation or syntax and retry."
             else:
-                print("🛑 Task rejected. Aborting.")
-                return
-        except Exception as e:
-            print(f"❌ Failed to parse or apply patches: {e}")
+                current_user_prompt = user_prompt
+                print("🧠 Generating Actions...", end="")
+
+            full_patch_json = ""
+            async for token in generate_streaming_json(sys_prompt, current_user_prompt, RefactorProposal):
+                full_patch_json += token
+            print(" Done.\n")
+            
+            try:
+                proposal = RefactorProposal.model_validate_json(full_patch_json)
+                new_state = apply_actions_to_state(master_state, proposal.actions, master_checksums)
+                
+                # Step 3: Verification
+                syntax_error = False
+                for path, content in new_state.items():
+                    if path.endswith(".py") and not is_valid_python(content):
+                        error_msg = f"SyntaxError in {path} after applying changes."
+                        syntax_error = True
+                        break
+                
+                if not syntax_error:
+                    # Show diff and confirm
+                    print("\n🔍 REVIEW PROPOSED CHANGES:")
+                    has_changes = False
+                    for path, new_content in new_state.items():
+                        old_content = master_state.get(path, "")
+                        if old_content == new_content: continue
+                        has_changes = True
+                        print(f"\n--- File: {path} ---")
+                        diff = difflib.unified_diff(old_content.splitlines(keepends=True), new_content.splitlines(keepends=True), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="")
+                        for line in diff:
+                            print(line.rstrip())
+                    
+                    if not has_changes:
+                        print("No changes proposed for this task. Skipping confirmation.")
+                        break # Exit retry loop and move to next task
+                            
+                    print(f"\nApply changes for Task {i+1}? (y/n): ", end="", flush=True)
+                    confirm = 'y' if args.yes else sys.stdin.readline().strip().lower()
+                    if confirm == 'y':
+                        master_state.update(new_state)
+                        print("✅ Changes accepted in-memory.")
+                        break # Exit retry loop
+                    else:
+                        print("🛑 Task rejected. Aborting.")
+                        return
+                else:
+                    retry_count += 1
+            except Exception as e:
+                error_msg = str(e)
+                retry_count += 1
+        
+        if retry_count == max_retries:
+            print(f"❌ Failed to generate valid patches for task after {max_retries} attempts. Aborting.")
             return
             
     print("\n💾 Writing all changes to disk...")
