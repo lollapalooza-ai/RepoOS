@@ -61,3 +61,63 @@ Perform a comprehensive audit and standardization of the docstrings within `osca
 The `deprecated` decorator in `oscar/core/decorators.py` currently does not use `functools.wraps`, which means it loses the metadata (like `__name__`, `__doc__`, etc.) of the decorated functions.
 **Prompt:**
 Enhance the `deprecated` decorator in `oscar/core/decorators.py` by utilizing `functools.wraps` to preserve the metadata of decorated functions and classes. Additionally, update the decorator to allow for more informative warning messages, such as including the specific version in which the feature will be removed.
+
+## 11. Extract Basket Merge Logic into a Mixin
+**Description:**
+The `merge` method in `AbstractBasket` (oscar/apps/basket/abstract_models.py) handles the complex logic of merging two baskets. This logic could be encapsulated in a mixin to improve the readability and maintainability of the main basket model.
+**Prompt:**
+Refactor `oscar/apps/basket/abstract_models.py` by extracting the `merge` logic from `AbstractBasket` into a dedicated mixin class named `BasketMergeMixin`. Ensure `AbstractBasket` inherits from this mixin and that all internal references to fields and methods remain functional.
+
+## 12. Add Type Hinting to `oscar/apps/basket/utils.py`
+**Description:**
+Utility functions in the basket app, such as those in `oscar/apps/basket/utils.py` (e.g., `get_basket`), currently lack type hints.
+**Prompt:**
+Implement Python 3 type hints for all public functions in `oscar/apps/basket/utils.py`. This includes `get_basket`, `get_or_create_basket`, and any other helper functions, ensuring proper imports from `typing` and relevant Oscar models.
+
+## 13. Modernize `Order.number` Generation
+**Description:**
+The `AbstractOrder` model in `oscar/apps/order/abstract_models.py` uses a custom `number` field. The logic for generating this number is often overridden.
+**Prompt:**
+Refactor `oscar/apps/order/abstract_models.py` to provide a more extensible way of generating order numbers. Extract the default number generation logic into a separate method `generate_order_number` within `AbstractOrder` that can be easily overridden by sub-classes, ensuring it's called during the initial save of a new order.
+
+## 14. Standardize Address Formatting Logic
+**Description:**
+Address models in `oscar/apps/address/abstract_models.py` and `oscar/apps/order/abstract_models.py` (for `BillingAddress` and `ShippingAddress`) have similar but slightly different methods for returning a summary or a formatted string.
+**Prompt:**
+Audit the address-related models in `oscar/apps/address/abstract_models.py` and `oscar/apps/order/abstract_models.py`. Standardize the `active_address_fields`, `get_address_summary`, and `as_text` methods to ensure consistent behavior and formatting across the entire codebase.
+
+## 15. Extract Stock Level Validation into a Utility
+**Description:**
+The logic for checking if a product is in stock is spread across `AbstractStockRecord` (oscar/apps/partner/abstract_models.py) and various availability wrappers.
+**Prompt:**
+Refactor the stock availability logic by extracting the core stock level checks from `AbstractStockRecord` into a standalone utility function in `oscar/apps/partner/utils.py`. Update `AbstractStockRecord` and the default availability wrappers to use this new utility for better code reuse.
+
+## 16. Improve Error Handling in `CheckoutSessionMixin`
+**Description:**
+The `CheckoutSessionMixin` in `oscar/apps/checkout/session.py` manages the checkout process state. Some of its methods for retrieving data from the session could benefit from more descriptive error messages when data is missing.
+**Prompt:**
+Enhance the error handling in `oscar/apps/checkout/session.py` by improving the exception messages raised when required checkout data (like shipping address or payment method) is missing from the session. Use specific exception classes where appropriate to allow for better error catching in views.
+
+## 17. Add Type Hinting to `oscar/apps/partner/abstract_models.py`
+**Description:**
+The `AbstractPartner` and `AbstractStockRecord` models and their methods lack type hints.
+**Prompt:**
+Implement comprehensive Python 3 type hints for the primary methods of `AbstractPartner` and `AbstractStockRecord` in `oscar/apps/partner/abstract_models.py`. This includes methods like `display_name`, `primary_address`, and `is_allocation_consumption_possible`.
+
+## 18. Consolidate Currency Formatting Logic
+**Description:**
+Currency formatting is handled by a template filter in `oscar/templatetags/currency_filters.py`, but sometimes it's needed in Python code as well.
+**Prompt:**
+Move the core currency formatting logic from the template filter in `oscar/templatetags/currency_filters.py` to a reusable utility function in `oscar/core/utils.py`. Update the template filter to call this new utility, and ensure it handles different currencies and decimal places correctly.
+
+## 19. Refactor `OrderNote` Model for Better Extensibility
+**Description:**
+The `AbstractOrderNote` model in `oscar/apps/order/abstract_models.py` has a fixed set of note types.
+**Prompt:**
+Refactor the `AbstractOrderNote` model in `oscar/apps/order/abstract_models.py` to make the `note_type` field more extensible. Instead of a hardcoded list of constants, use a setting or a registry-based approach to allow developers to easily add new note types without modifying the core Oscar code.
+
+## 20. Add Docstrings to `oscar/apps/basket/middleware.py`
+**Description:**
+The basket middleware is a critical part of Oscar, but its `process_template_response` and other methods could be better documented.
+**Prompt:**
+Perform a documentation audit of `oscar/apps/basket/middleware.py`. Add clear, concise, and Sphinx-compatible docstrings to the `BasketMiddleware` class and all its methods, explaining how it manages the basket in the request and response lifecycle.
