@@ -832,3 +832,132 @@ class CreateFile(BaseModel):
         return v
 
 ```
+
+# Milestone 3.5 : The Final Primitives
+
+### Engineering Brief: The Final Primitives
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Finalizing Repo OS Action Primitives (Suite 3.4 Fixes)
+
+#### Phase 1: Introduce `InsertNode` and `UpdateDocstring` Primitives
+
+We must give the LLM the ability to append code and modify documentation without rewriting entire class bodies.
+
+**Step 1:** Add these to your Pydantic schemas in `refactor2.py`.
+
+```python
+class InsertNode(BaseModel):
+    action: Literal["insert_node"] = "insert_node"
+    file_path: str = Field(..., description="Path to the existing file.")
+    new_node_code: str = Field(..., description="The complete code for the new function or class.")
+    insert_after_node: Optional[str] = Field(None, description="The signature of the node to insert after. If null, appends to EOF.")
+
+class UpdateDocstring(BaseModel):
+    action: Literal["update_docstring"] = "update_docstring"
+    file_path: str
+    target_node_signature: str
+    new_docstring: str = Field(..., description="The new docstring text, including quotes.")
+
+# IMPORTANT: Add these to RefactorProposalSafe and RefactorProposalUnsafe unions!
+
+```
+
+**Step 2:** Implement the execution logic in `apply_actions_to_state`.
+
+```python
+        # Inside apply_actions_to_state loop:
+        
+        elif action.action == "insert_node":
+            if path not in new_state: continue
+            content = new_state[path]
+            
+            if hasattr(action, 'insert_after_node') and action.insert_after_node:
+                node_range = find_node_range(content, action.insert_after_node)
+                if node_range:
+                    _, end = node_range
+                    new_state[path] = content[:end] + "\n\n" + action.new_node_code + content[end:]
+                    continue
+            
+            # Fallback: Append to End of File
+            new_state[path] = content.rstrip() + "\n\n" + action.new_node_code
+            print(f"   ➕ Inserted new node into {path}")
+
+        elif action.action == "update_docstring":
+            if path not in new_state: continue
+            content = new_state[path]
+            node_range = find_node_range(content, action.target_node_signature)
+            
+            if node_range:
+                start, end = node_range
+                node_code = content[start:end]
+                # Regex to safely replace or insert docstring just after the def/class signature
+                # Matches `def foo(...):` or `class Foo(...):` and inserts docstring
+                pattern = re.compile(r'(^(?:[ \t]*)(?:def|class)\s+[^\:]+\:\s*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
+                
+                def replacement(match):
+                    signature_line = match.group(1)
+                    indent = match.group(1).split(match.group(1).lstrip())[0] + "    " # Infer indent
+                    return f"{signature_line}{indent}{action.new_docstring}\n"
+                
+                updated_node = pattern.sub(replacement, node_code, count=1)
+                new_state[path] = content[:start] + updated_node + content[end:]
+                print(f"   📝 Updated docstring for {action.target_node_signature}")
+
+```
+
+#### Phase 2: Fix the `DeleteFile` False Positive Regex
+
+We must only allow `DeleteFile` if the user explicitly mentions deleting a *file*, not just "removing comments."
+
+**Step 1:** Update the schema selection logic (around line 1185).
+
+```python
+# Phase 1: Dynamic Schema Pruning (Hardened Regex)
+user_intent_lower = intent.lower()
+# Only trigger unsafe schema if they explicitly mention deleting a file/module
+requires_deletion = bool(re.search(r'\b(delete|remove|drop)\s+(the\s+)?(file|module|script)\b', user_intent_lower))
+ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
+print(f"🛡️  Using active schema: {ActiveSchema.__name__}")
+
+```
+
+#### Phase 3: Robust Downstream Import Replacement
+
+We must handle comma-separated imports when executing a `MoveNode` downstream update.
+
+**Step 1:** Upgrade the Python string replacement logic in `apply_actions_to_state` (around line 1050).
+
+```python
+        # 2. Deterministic Regex String Replacement for Imports
+        old_module_path = path_to_python_module(source_path)
+        new_module_path = path_to_python_module(target_path)
+
+        for file_path in affected_files:
+            content = new_state.get(file_path, master_state.get(file_path))
+            if content:
+                # Regex to match: from oscar.core.compat import A, UnicodeCSVWriter, B
+                # And safely extract UnicodeCSVWriter while leaving the rest
+                import_pattern = re.compile(rf"^(from\s+{re.escape(old_module_path)}\s+import\s+)(.*)$", re.MULTILINE)
+                
+                def import_replacer(match):
+                    prefix = match.group(1)
+                    imported_items = [item.strip() for item in match.group(2).split(',')]
+                    
+                    if node_name in imported_items:
+                        imported_items.remove(node_name)
+                        new_import_line = f"from {new_module_path} import {node_name}"
+                        
+                        if not imported_items:
+                            return new_import_line # Replaced entirely
+                        else:
+                            # Keep the old line (minus the moved node) and append the new line
+                            remaining_import = f"{prefix}{', '.join(imported_items)}"
+                            return f"{remaining_import}\n{new_import_line}"
+                    return match.group(0)
+
+                new_state[file_path] = import_pattern.sub(import_replacer, content)
+                print(f"   ⚓ Safely re-routed downstream import in {file_path}")
+
+```
