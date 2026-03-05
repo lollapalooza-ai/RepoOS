@@ -701,3 +701,134 @@ for i, task in enumerate(task_list):
     print(f"✅ Task {i+1} applied successfully.")
 
 ```
+
+# Phase 3.4 : Hardening (3.4)
+
+# ENGINEERING BRIEF: Hardening the Execution Engine
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Implementing Baseline Linting, Graph-Automated Imports, and AST Conservation
+
+Please implement the following four upgrades into `refactor2.py` and the MCP tools.
+
+---
+
+### Phase 1: Baseline Differential Linting
+
+**Task:** Upgrade `validate_virtual_workspace` to ignore pre-existing type errors.
+
+```python
+import subprocess
+import os
+
+def get_mypy_errors(filepath: str) -> set:
+    """Runs mypy and returns a set of error strings, ignoring line numbers for baseline comparison."""
+    result = subprocess.run(
+        ["python", "-m", "mypy", filepath, "--ignore-missing-imports", "--follow-imports=silent"],
+        capture_output=True, text=True, check=False
+    )
+    # Strip line numbers so we can compare the exact error signatures
+    errors = set()
+    for line in result.stdout.splitlines():
+        if "error:" in line:
+            # Extract everything after "error:" to ignore line shifts
+            errors.add(line.split("error:")[1].strip())
+    return errors
+
+def validate_virtual_workspace(state: dict, modified_paths: list, pre_state_cache: dict) -> tuple[bool, str]:
+    # 1. Get Baseline Errors (run on the pre_state_cache versions of the files)
+    # 2. Get Post-Patch Errors (run on the newly modified tmpdir files)
+    
+    for path in modified_paths:
+        baseline_errors = get_mypy_errors(pre_state_cache[path])
+        new_errors = get_mypy_errors(os.path.join(tmpdir, path))
+        
+        # Find strictly new errors that didn't exist in the baseline
+        introduced_errors = new_errors - baseline_errors
+        
+        if introduced_errors:
+            return False, f"Type Error(s) introduced: {introduced_errors}"
+            
+    return True, ""
+
+```
+
+### Phase 2: Graph-Automated Downstream Imports
+
+**Task:** Remove the burden of updating downstream imports from the LLM.
+
+```python
+# Inside apply_actions_to_state for MoveNode:
+# 1. Execute the move (copy node to target_file, delete from source_file)
+# ...
+
+# 2. Query Neo4j to find downstream consumers
+node_name = extract_name_from_signature(action.node_signature)
+cypher_query = f"""
+MATCH (f:File)-[:IMPORTS]->(n:Node {{name: '{node_name}'}})
+RETURN f.path
+"""
+# Assume `execute_graph_query` fetches this from Neo4j
+affected_files = execute_graph_query(cypher_query)
+
+# 3. Deterministic Python string replacement
+old_module_path = path_to_python_module(action.source_file) # e.g., oscar.core.compat
+new_module_path = path_to_python_module(action.target_file) # e.g., oscar.core.csv_utils
+
+for file_path in affected_files:
+    if file_path in master_state:
+        content = master_state[file_path]
+        # Replace the old import with the new one
+        updated_content = content.replace(
+            f"from {old_module_path} import {node_name}", 
+            f"from {new_module_path} import {node_name}"
+        )
+        new_state[file_path] = updated_content
+
+```
+
+### Phase 3: AST Volume Conservation Guardrail
+
+**Task:** Prevent the LLM from replacing massive classes with dummy simplifications.
+
+```python
+# Inside the ModifyNode action logic:
+original_node_text = extract_node_from_ast(master_state[path], action.node_signature)
+
+# Calculate volume
+orig_len = len(original_node_text.strip())
+new_len = len(action.proposed_replace_string.strip())
+
+# If the new code is less than 50% the size of the old code, raise an alarm
+if new_len < (orig_len * 0.5):
+    # Check if the user explicitly asked to delete/remove code
+    if "remove" not in user_intent.lower() and "delete" not in user_intent.lower():
+        raise ValueError(
+            "Action Rejected: AST Volume Conservation Check failed. "
+            "You attempted to replace a large block of code with a significantly smaller one. "
+            "Do not use dummy implementations or placeholders."
+        )
+
+```
+
+### Phase 4: Pydantic Anti-Hallucination Validators
+
+**Task:** Block placeholder paths directly at the schema validation layer.
+
+```python
+from pydantic import BaseModel, field_validator
+
+class CreateFile(BaseModel):
+    action: str = "create_file"
+    file_path: str
+    content: str
+    
+    @field_validator('file_path')
+    def validate_paths(cls, v):
+        forbidden_substrings = ["path/to", "your/file", "source/file"]
+        if any(sub in v.lower() for sub in forbidden_substrings):
+            raise ValueError(f"Invalid path hallucination detected: {v}. You MUST output exact repository paths.")
+        return v
+
+```

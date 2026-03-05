@@ -10,7 +10,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Optional, Union, AsyncGenerator, Literal
 import hashlib
 import ast
@@ -24,9 +24,41 @@ import subprocess
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
 VENV_PYTHON = "./venv/bin/python3"
 
-def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str]) -> tuple[bool, str]:
-    """Phase 2: Differential Static Analysis. Runs mypy ONLY on the files that were modified."""
+def get_mypy_errors(filepath: str) -> set:
+    """Runs mypy and returns a set of error strings, ignoring line numbers for baseline comparison."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-m", "mypy", filepath, "--ignore-missing-imports", "--follow-imports=silent"],
+        capture_output=True, text=True, check=False
+    )
+    # Strip line numbers so we can compare the exact error signatures
+    errors = set()
+    for line in result.stdout.splitlines():
+        if "error:" in line:
+            # Extract everything after "error:" to ignore line shifts
+            # Format is usually: path/to/file.py:line: error: message
+            parts = line.split("error:")
+            if len(parts) > 1:
+                errors.add(parts[1].strip())
+    return errors
+
+def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str], pre_state_cache: Dict[str, str] = None) -> tuple[bool, str]:
+    """Phase 1: Baseline Differential Linting. Runs mypy and only reports errors introduced by the patch."""
     with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Get Baseline Errors if pre_state_cache is provided
+        baseline_errors_map = {}
+        if pre_state_cache:
+            for path in modified_paths:
+                if path in pre_state_cache:
+                    # Create a temporary file for the baseline
+                    with tempfile.NamedTemporaryFile(suffix=".py", mode='w', delete=False) as f:
+                        f.write(pre_state_cache[path])
+                        f_path = f.name
+                    try:
+                        baseline_errors_map[path] = get_mypy_errors(f_path)
+                    finally:
+                        if os.path.exists(f_path): os.remove(f_path)
+
+        # 2. Setup the virtual workspace for the new state
         for path, content in state.items():
             tmp_path = os.path.join(tmpdir, path)
             os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
@@ -34,24 +66,25 @@ def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str])
                 f.write(content)
         
         try:
-            # Construct absolute paths for only the modified files
             target_files = [os.path.join(tmpdir, p) for p in modified_paths if p in state]
-            
             if not target_files:
-                return True, "" # Nothing to lint
+                return True, ""
                 
-            # Run mypy only on target_files
-            result = subprocess.run(
-                [VENV_PYTHON, "-m", "mypy", *target_files, "--ignore-missing-imports", "--follow-imports=silent", "--no-error-summary"],
-                capture_output=True, text=True, check=False
-            )
+            introduced_errors = []
+            for path in modified_paths:
+                if path not in state: continue
+                tmp_target_path = os.path.join(tmpdir, path)
+                new_errors = get_mypy_errors(tmp_target_path)
+                
+                baseline = baseline_errors_map.get(path, set())
+                diff = new_errors - baseline
+                
+                if diff:
+                    introduced_errors.append(f"File {path} introduced:\n" + "\n".join(f"  - {e}" for e in diff))
             
-            if result.returncode != 0:
-                # Clean up output to hide temp paths
-                errors = result.stdout.replace(tmpdir + "/", "")
-                # Only return errors if they are relevant to cross-file attribute/module lookup
-                if "has no attribute" in errors or "Module" in errors:
-                    return False, f"Type Error introduced in modified files:\n{errors.strip()}"
+            if introduced_errors:
+                return False, "Type Error(s) introduced in modified files:\n" + "\n".join(introduced_errors)
+                
             return True, ""
         except Exception as e:
             return True, f"Type check skipped due to error: {str(e)}"
@@ -109,6 +142,15 @@ def is_semantically_valid(content: str) -> tuple[bool, str]:
 
     return True, ""
 
+# --- Pydantic Validators (Phase 4: Anti-Hallucination) ---
+def validate_no_placeholder_paths(v: str) -> str:
+    forbidden_substrings = ["path/to", "your/file", "source/file", "target/file", "...", "<"]
+    v_lower = v.lower()
+    for sub in forbidden_substrings:
+        if sub in v_lower:
+            raise ValueError(f"Invalid path hallucination detected: '{v}'. You MUST output exact repository paths from the context.")
+    return v
+
 # --- Pydantic Models (Step 2: Constrained Decoding) ---
 
 class TaskItem(BaseModel):
@@ -122,10 +164,18 @@ class CreateFile(BaseModel):
     action: Literal["create_file"] = "create_file"
     file_path: str = Field(..., description="Path to the new file.")
     content: str = Field(..., description="The complete content of the new file.")
+    
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 class DeleteFile(BaseModel):
     action: Literal["delete_file"] = "delete_file"
     file_path: str = Field(..., description="Path to the file to delete.")
+
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 class ModifyNode(BaseModel):
     action: Literal["modify_node"] = "modify_node"
@@ -133,10 +183,18 @@ class ModifyNode(BaseModel):
     target_node_signature: str = Field(..., description="The function or class name to replace (e.g., 'my_func' or 'MyClass.my_method').")
     proposed_replace_string: str = Field(..., description="The NEW complete code for that node (function/class).")
 
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
+
 class AddImport(BaseModel):
     action: Literal["add_import"] = "add_import"
     file_path: str = Field(..., description="Path to the file to modify.")
     import_statement: str = Field(..., description="The import statement to add (e.g., 'import os' or 'from typing import Any').")
+
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 class MoveNode(BaseModel):
     action: Literal["move_node"] = "move_node"
@@ -147,6 +205,10 @@ class MoveNode(BaseModel):
         default=[], 
         description="List of import statements required for this node to run in the target file (e.g., ['import csv', 'from typing import Any'])."
     )
+
+    @field_validator('source_file', 'target_file')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 # --- Define the dynamic Unions (Phase 1: Dynamic Schema Pruning) ---
 class RefactorProposalSafe(BaseModel):
@@ -267,6 +329,28 @@ def calculate_checksum(content: str) -> str:
     import hashlib
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
+def path_to_python_module(filepath: str) -> str:
+    """Converts a file path to a python module path (e.g., src/oscar/core/compat.py -> oscar.core.compat)."""
+    # Remove .py extension
+    path = filepath
+    if path.endswith(".py"): path = path[:-3]
+    
+    # Common project roots to strip (heuristic)
+    roots = ["src/", "oscar/"] # Add more as needed based on the repo structure
+    for root in roots:
+        if path.startswith(root):
+            path = path[len(root):]
+            break
+            
+    # Normalize separators
+    return path.replace("/", ".").replace("\\", ".")
+
+def execute_graph_query(query: str, parameters: dict = None) -> list:
+    """Executes a Cypher query and returns the results as a list of dictionaries."""
+    with driver.session() as session:
+        result = session.run(query, parameters or {})
+        return [record for record in result]
+
 def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]], original_checksums: Dict[str, str] = None, intent: str = "") -> Dict[str, str]:
     """
     Programmatically applies surgical actions (Phase 2 Upgrade).
@@ -312,6 +396,22 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             node_range = find_node_range(content, action.target_node_signature)
             if node_range:
                 start, end = node_range
+                
+                # Phase 3: AST Volume Conservation Guardrail
+                original_node_text = content[start:end]
+                orig_len = len(original_node_text.strip())
+                new_len = len(action.proposed_replace_string.strip())
+                
+                # If the new code is less than 50% the size of the old code, raise an alarm
+                if orig_len > 100 and new_len < (orig_len * 0.5):
+                    # Check if the user explicitly asked to delete/remove code
+                    if "remove" not in intent.lower() and "delete" not in intent.lower():
+                        raise ValueError(
+                            f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
+                            f"You attempted to replace a large block of code ({orig_len} chars) with a significantly smaller one ({new_len} chars). "
+                            "Do not use dummy implementations or placeholders. Write the COMPLETE executable code."
+                        )
+
                 new_state[path] = content[:start] + action.proposed_replace_string + content[end:]
                 print(f"   🎯 Applied AST-targeted replacement to {path} at node '{action.target_node_signature}'")
             else:
@@ -368,6 +468,34 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 new_state[target_path] = existing_content + ("\n\n" if existing_content else "") + node_code
             
             print(f"   🚀 Moved node '{action.node_signature}' from {source_path} to {target_path}")
+
+            # Phase 2: Graph-Automated Downstream Imports
+            # 1. Query Neo4j to find downstream consumers
+            node_name = extract_name_from_signature(action.node_signature)
+            cypher_query = f"""
+            MATCH (f:File)-[:IMPORTS]->(n:Node {{name: $node_name}})
+            RETURN f.path as affected_path
+            """
+            affected_records = execute_graph_query(cypher_query, {"node_name": node_name})
+            affected_files = [r["affected_path"] for r in affected_records]
+
+            # 2. Deterministic Python string replacement
+            old_module_path = path_to_python_module(source_path)
+            new_module_path = path_to_python_module(target_path)
+
+            for file_path in affected_files:
+                # We update the file in new_state if it's there, or master_state otherwise
+                # But we should really look at what we've already modified
+                content = new_state.get(file_path, master_state.get(file_path))
+                if content:
+                    # Replace the old import with the new one
+                    # This is a simple string replacement; a more robust way would be AST or regex
+                    old_import = f"from {old_module_path} import {node_name}"
+                    new_import = f"from {new_module_path} import {node_name}"
+                    
+                    if old_import in content:
+                        new_state[file_path] = content.replace(old_import, new_import)
+                        print(f"   ⚓ Automatically updated downstream import in {file_path}")
 
         elif action.action == "add_import":
             if path not in new_state:
@@ -599,7 +727,7 @@ async def main():
                 
                 if not syntax_error:
                     # Phase 2: Differential Static Analysis
-                    valid, error = validate_virtual_workspace(new_state, modified_paths)
+                    valid, error = validate_virtual_workspace(new_state, modified_paths, pre_state_cache=master_state)
                     if not valid:
                         error_msg = error
                         syntax_error = True
