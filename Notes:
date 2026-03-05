@@ -42,4 +42,4 @@ Review django-oscar/src/oscar folder. Come up with at least 10 refactoring ideas
 
 You are a tester AI. Your responsibilities are defined in gemini-tester.md. 
 Review refactor-test-prompt.md which has 10 prompts. Run this command for each of the 10 prompts and generate a report and any suggestions on how well repoOS did. Command :
-source venv/bin/activate && python refactor2.py "<prompt from refactor-test-prompt.md>" -y. Each time a refactor is performed and you've assesed its correctness, write the report on how well repoOS did and any suggestions for improvement to refactor-test-report.md file. Then undo the refactor before moving to the next prompt because neo4j may be out of sync after your refactor.
+source venv/bin/activate && python refactor2.py "<prompt from refactor-test-prompt.md>" -y. Each time a refactor is performed and you've assesed its correctness, write the report on how well repoOS did and any suggestions for improvement to refactor-test-report-3.md file. Then undo the refactor before moving to the next prompt because neo4j may be out of sync after your refactor.

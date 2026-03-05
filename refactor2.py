@@ -97,13 +97,59 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
                 return node.start_byte, node.end_byte
     return None
 
+def resolve_path(target_path: str, master_state: dict) -> str:
+    """
+    Repo-agnostic path resolution. Maps an LLM's potentially truncated 
+    or relative path to the true workspace path.
+    """
+    known_paths = list(master_state.keys())
+    if not known_paths:
+        return target_path
+
+    # 1. Exact Match (The LLM provided the perfect path)
+    if target_path in known_paths:
+        return target_path
+
+    # 2. Suffix Match (Handles Modification of existing files)
+    # If LLM outputs "core/csv_utils.py", we match it to "src/app/core/csv_utils.py"
+    suffix_matches = [p for p in known_paths if p.endswith(target_path)]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
+    # 3. Path Reconstruction (Handles CreateFile)
+    # Infer the working directory from the common path of all files currently in context
+    try:
+        common_dir = os.path.commonpath(known_paths)
+    except ValueError:
+        common_dir = "" # Fallback if paths are on different drives
+
+    if common_dir and not target_path.startswith(common_dir):
+        # Normalize separators for cross-platform compatibility
+        target_parts = target_path.replace('\\', '/').split('/')
+        common_parts = common_dir.replace('\\', '/').split('/')
+
+        # Detect overlap to prevent directory duplication 
+        # (e.g., common_dir="src/app", target="app/new.py" -> "src/app/new.py")
+        overlap_idx = 0
+        for i in range(1, min(len(common_parts), len(target_parts)) + 1):
+            if common_parts[-i:] == target_parts[:i]:
+                overlap_idx = i
+
+        if overlap_idx > 0:
+            return os.path.join(common_dir, *target_parts[overlap_idx:])
+        else:
+            return os.path.join(common_dir, target_path)
+
+    return target_path
+
 def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport]], original_checksums: Dict[str, str] = None) -> Dict[str, str]:
     """
     Programmatically applies surgical actions (Phase 2 Upgrade).
     """
     new_state = master_state.copy()
     for action in actions:
-        path = action.file_path
+        # 1. Resolve the path dynamically (Phase 1: Repo-Agnostic Path Resolution)
+        path = resolve_path(action.file_path, master_state)
         
         # Step 3A: Pre-flight checksum check
         if original_checksums and path in original_checksums and path in new_state:
@@ -113,6 +159,12 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 continue
 
         if action.action == "create_file":
+            # 2. Block destructive overwrites (Phase 2: State Machine Guardrails)
+            if path in master_state:
+                raise ValueError(
+                    f"Action Rejected: Cannot use 'create_file' on existing file '{path}'. "
+                    f"You MUST use 'modify_node' or 'add_import'."
+                )
             new_state[path] = action.content
             print(f"   🆕 Created file: {path}")
 
@@ -167,11 +219,29 @@ def fetch_file_content(path: str) -> Optional[str]:
     except: return None
 
 def is_valid_python(content: str) -> bool:
+    # 1. Anti-Placeholder Guardrail (Phase 3: Semantic Sanity Checks)
+    forbidden_phrases = [
+        "# placeholder", 
+        "# ...", 
+        "pass  #", 
+        "# rest of code",
+        "# existing code"
+    ]
+    
+    content_lower = content.lower()
+    for phrase in forbidden_phrases:
+        if phrase in content_lower:
+            raise ValueError(
+                f"Code contains forbidden placeholder: '{phrase}'. "
+                f"Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
+            )
+    
+    # 2. Syntax Check
     try:
         ast.parse(content)
         return True
-    except SyntaxError:
-        return False
+    except SyntaxError as e:
+        raise ValueError(f"SyntaxError during AST parse: {str(e)}")
 
 # --- Graph Engine ---
 NEO4J_URI, NEO4J_AUTH = "bolt://localhost:7687", ("neo4j", "password")
@@ -223,9 +293,12 @@ async def main():
         # Step 2A: The Native Gatekeeper
         for path in context_map:
             content = fetch_file_content(path)
-            if content and not is_valid_python(content):
-                print(f"❌ Syntax Error detected in {path}. Aborting main pipeline for triage.")
-                return
+            if content:
+                try:
+                    is_valid_python(content)
+                except ValueError as e:
+                    print(f"❌ Syntax/Semantic Error detected in {path}: {str(e)}. Aborting main pipeline for triage.")
+                    return
 
         task_sys_prompt = "You are a senior architect. Generate a sequential list of refactoring tasks."
         task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}"
@@ -284,7 +357,15 @@ async def main():
         
         context_str = "\n\n".join(context_blocks)
         
-        sys_prompt = "You are a Principal Engineer. Provide discrete refactoring actions (create_file, delete_file, modify_node, add_import)."
+        sys_prompt = (
+            "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+            "You will be provided with a strict sub-tree of the codebase. "
+            "CRITICAL RULES: \n"
+            "1. NEVER use the 'create_file' action to modify an existing file. It will wipe the file.\n"
+            "2. NO TOKEN LAZINESS. You are strictly forbidden from using placeholders like '# ...' or '# existing code'. "
+            "If you use a 'modify_node' action, you MUST output the entire, unbroken, executable code for that node.\n"
+            "3. When creating new files, ensure you include ALL necessary imports."
+        )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
         max_retries = 3
@@ -311,10 +392,13 @@ async def main():
                 # Step 3: Verification
                 syntax_error = False
                 for path, content in new_state.items():
-                    if path.endswith(".py") and not is_valid_python(content):
-                        error_msg = f"SyntaxError in {path} after applying changes."
-                        syntax_error = True
-                        break
+                    if path.endswith(".py"):
+                        try:
+                            is_valid_python(content)
+                        except ValueError as e:
+                            error_msg = f"Verification failed for {path}: {str(e)}"
+                            syntax_error = True
+                            break
                 
                 if not syntax_error:
                     # Show diff and confirm

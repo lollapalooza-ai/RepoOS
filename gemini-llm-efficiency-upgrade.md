@@ -185,3 +185,157 @@ Output MUST strictly conform to the Pydantic Action Union. DO NOT modify any cod
 </instruction>
 
 ```
+
+# Milestone: 3.1 : Additional fixes - Execution Guardrails & Anti-Laziness Heuristics
+
+# ENGINEERING BRIEF: Execution Guardrails & Repo-Agnostic Path Resolution
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching Destructive Overwrites, Token Laziness, and Path Truncation in Repo OS
+**Context:** Our 14B execution engine (`refactor2.py`) is currently vulnerable to token laziness (outputting placeholders), destructive file overwrites, and LLM path truncation. We are moving to a hardened, repo-agnostic execution loop that treats the LLM as an untrusted input source.
+
+Please implement the following four phases directly into `refactor2.py`.
+
+---
+
+### Phase 1: Repo-Agnostic Path Resolution (Virtual Filesystem Routing)
+
+LLMs notoriously truncate paths, dropping the workspace root (e.g., outputting `core/csv_utils.py` instead of `django-oscar/src/oscar/core/csv_utils.py`). We must dynamically resolve these paths based on the `master_state` context map without hardcoding repository-specific strings like `oscar/`.
+
+**Task:** Inject this standalone utility function into `refactor2.py` to handle path reconstruction via overlap detection.
+
+```python
+import os
+
+def resolve_path(target_path: str, master_state: dict) -> str:
+    """
+    Repo-agnostic path resolution. Maps an LLM's potentially truncated 
+    or relative path to the true workspace path.
+    """
+    known_paths = list(master_state.keys())
+    if not known_paths:
+        return target_path
+
+    # 1. Exact Match (The LLM provided the perfect path)
+    if target_path in known_paths:
+        return target_path
+
+    # 2. Suffix Match (Handles Modification of existing files)
+    # If LLM outputs "core/csv_utils.py", we match it to "src/app/core/csv_utils.py"
+    suffix_matches = [p for p in known_paths if p.endswith(target_path)]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
+    # 3. Path Reconstruction (Handles CreateFile)
+    # Infer the working directory from the common path of all files currently in context
+    try:
+        common_dir = os.path.commonpath(known_paths)
+    except ValueError:
+        common_dir = "" # Fallback if paths are on different drives
+
+    if common_dir and not target_path.startswith(common_dir):
+        # Normalize separators for cross-platform compatibility
+        target_parts = target_path.replace('\\', '/').split('/')
+        common_parts = common_dir.replace('\\', '/').split('/')
+
+        # Detect overlap to prevent directory duplication 
+        # (e.g., common_dir="src/app", target="app/new.py" -> "src/app/new.py")
+        overlap_idx = 0
+        for i in range(1, min(len(common_parts), len(target_parts)) + 1):
+            if common_parts[-i:] == target_parts[:i]:
+                overlap_idx = i
+
+        if overlap_idx > 0:
+            return os.path.join(common_dir, *target_parts[overlap_idx:])
+        else:
+            return os.path.join(common_dir, target_path)
+
+    return target_path
+
+```
+
+---
+
+### Phase 2: State Machine Guardrails (Block Destructive Overwrites)
+
+We must protect the `master_state` from being overwritten by an accidental `CreateFile` action.
+
+**Task:** Modify the action processing loop in `apply_actions_to_state` to utilize the new `resolve_path` function and explicitly reject `CreateFile` on existing files.
+
+```python
+for action in actions:
+    # 1. Resolve the path dynamically
+    resolved_path = resolve_path(action.file_path, master_state)
+    
+    # 2. Block destructive overwrites
+    if action.action == "create_file":
+        if resolved_path in master_state:
+            raise ValueError(
+                f"Action Rejected: Cannot use 'create_file' on existing file '{resolved_path}'. "
+                f"You MUST use 'modify_node' or 'add_import'."
+            )
+        new_state[resolved_path] = action.content
+    
+    # (Continue with other action handling...)
+
+```
+
+---
+
+### Phase 3: Semantic Sanity Checks (Anti-Placeholder Validation)
+
+A syntactically valid AST is useless if the semantics are destroyed by placeholders. We must upgrade the validation loop to mathematically reject token laziness.
+
+**Task:** Upgrade your `is_valid_python` function. Inject a string-matching heuristic *before* the AST parse to catch common LLM placeholders.
+
+```python
+def is_valid_python(content: str) -> bool:
+    # 1. Anti-Placeholder Guardrail
+    forbidden_phrases = [
+        "# placeholder", 
+        "# ...", 
+        "pass  #", 
+        "# rest of code",
+        "# existing code"
+    ]
+    
+    content_lower = content.lower()
+    for phrase in forbidden_phrases:
+        if phrase in content_lower:
+            raise ValueError(
+                f"Code contains forbidden placeholder: '{phrase}'. "
+                f"Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
+            )
+    
+    # 2. Syntax Check
+    try:
+        ast.parse(content)
+        return True
+    except SyntaxError as e:
+        raise ValueError(f"SyntaxError during AST parse: {str(e)}")
+
+```
+
+*Note: Ensure your execution loop catches this `ValueError` and pipes the exception string back into the LLM's retry message array.*
+
+---
+
+### Phase 4: Aggressive System Prompting
+
+Smaller models (14B) require aggressive, negative constraints in the system prompt to properly align their generation weights with our strict Pydantic schema.
+
+**Task:** Rewrite the system prompt initialization to explicitly forbid the failure modes we observed in Suite 3.
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "You will be provided with a strict sub-tree of the codebase. "
+    "CRITICAL RULES: \n"
+    "1. NEVER use the 'create_file' action to modify an existing file. It will wipe the file.\n"
+    "2. NO TOKEN LAZINESS. You are strictly forbidden from using placeholders like '# ...' or '# existing code'. "
+    "If you use a 'modify_node' action, you MUST output the entire, unbroken, executable code for that node.\n"
+    "3. When creating new files, ensure you include ALL necessary imports."
+)
+
+```

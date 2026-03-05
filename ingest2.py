@@ -448,7 +448,7 @@ def process_file(file_path):
                             callee = source_code[c_node.start_byte:c_node.end_byte]
                             if callee not in PYTHON_BUILTINS:
                                 create_dependency(full_m_name, callee)
-                                if is_test_file and f_name.startswith("test_") and not callee.startswith("test_"):
+                                if is_test_file and full_m_name.startswith("test_") and not callee.startswith("test_"):
                                     create_test_relationship(full_m_name, callee)
 
     # --- 2. Global Functions ---
