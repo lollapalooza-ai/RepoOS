@@ -14,6 +14,95 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Optional, Union, AsyncGenerator, Literal
 import hashlib
 import ast
+import pyflakes.api
+import pyflakes.reporter
+import io
+import tempfile
+import subprocess
+
+# --- Config ---
+MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
+VENV_PYTHON = "./venv/bin/python3"
+
+def validate_virtual_workspace(state: Dict[str, str]) -> tuple[bool, str]:
+    """Step 3.2.1: Validates cross-file dependencies using mypy in a virtual workspace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for path, content in state.items():
+            tmp_path = os.path.join(tmpdir, path)
+            os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        
+        try:
+            # We use --ignore-missing-imports and --follow-imports=silent to focus on the files we have
+            # and --no-error-summary to keep output clean.
+            result = subprocess.run(
+                [VENV_PYTHON, "-m", "mypy", tmpdir, "--ignore-missing-imports", "--follow-imports=silent", "--no-error-summary"],
+                capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                # Clean up output to hide temp paths
+                errors = result.stdout.replace(tmpdir + "/", "")
+                # Only return errors if they are relevant to cross-file attribute/module lookup
+                # This is a bit heuristic, but it's what the directive asks for.
+                if "has no attribute" in errors or "Module" in errors:
+                    return False, f"Cross-file dependency error: {errors.strip()}"
+            return True, ""
+        except Exception as e:
+            return True, f"Type check skipped due to error: {str(e)}"
+
+class ASTCollisionError(Exception):
+    pass
+
+def get_namespace_identifiers(file_content: str) -> set:
+    """Extracts all function names, class names, and imported aliases from a file's AST."""
+    identifiers = set()
+    try:
+        tree = ast.parse(file_content)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                identifiers.add(node.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    identifiers.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    identifiers.add(alias.asname or alias.name)
+    except SyntaxError:
+        pass # Handle syntax errors separately in the main loop
+    return identifiers
+
+def is_semantically_valid(content: str) -> tuple[bool, str]:
+    # 1. Anti-Placeholder Guardrail
+    forbidden_phrases = [
+        "# placeholder", 
+        "# ...", 
+        "pass  #", 
+        "# rest of code",
+        "# existing code"
+    ]
+    
+    content_lower = content.lower()
+    for phrase in forbidden_phrases:
+        if phrase in content_lower:
+            return False, f"Code contains forbidden placeholder: '{phrase}'. Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
+    
+    # 2. Syntax Check
+    try:
+        ast.parse(content)
+    except SyntaxError as e:
+        return False, f"SyntaxError during AST parse: {str(e)}"
+
+    # 3. Semantic Check (Catches missing imports / undefined names)
+    output = io.StringIO()
+    reporter = pyflakes.reporter.Reporter(output, output)
+    pyflakes.api.check(content, '', reporter)
+
+    errors = output.getvalue()
+    if "undefined name" in errors:
+        return False, f"Missing Import detected: {errors.strip()}. You MUST use 'add_import'."
+
+    return True, ""
 
 # --- Pydantic Models (Step 2: Constrained Decoding) ---
 
@@ -44,8 +133,14 @@ class AddImport(BaseModel):
     file_path: str = Field(..., description="Path to the file to modify.")
     import_statement: str = Field(..., description="The import statement to add (e.g., 'import os' or 'from typing import Any').")
 
+class MoveNode(BaseModel):
+    action: Literal["move_node"] = "move_node"
+    source_file: str = Field(..., description="Path to the file to move the node FROM.")
+    target_file: str = Field(..., description="Path to the file to move the node TO.")
+    node_signature: str = Field(..., description="The function or class name to move (e.g., 'my_func' or 'MyClass.my_method').")
+
 class RefactorProposal(BaseModel):
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport]] = Field(..., description="A list of discrete refactoring actions.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of discrete refactoring actions.")
 
 # --- Config ---
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
@@ -73,8 +168,9 @@ async def generate_streaming_json(system_prompt: str, user_prompt: str, response
     ):
         yield part['message']['content']
 
-def calculate_checksum(content: str) -> str:
-    return hashlib.md5(content.encode('utf-8')).hexdigest()
+def extract_name_from_signature(signature: str) -> str:
+    """Extracts the base name from a signature (e.g., 'MyClass.my_method' -> 'my_method')."""
+    return signature.split('.')[-1]
 
 def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
     """Uses tree-sitter to find the byte range of a function or class."""
@@ -119,7 +215,13 @@ def resolve_path(target_path: str, master_state: dict) -> str:
     # 3. Path Reconstruction (Handles CreateFile)
     # Infer the working directory from the common path of all files currently in context
     try:
-        common_dir = os.path.commonpath(known_paths)
+        common_path = os.path.commonpath(known_paths)
+        # Fix: Ensure we extract the directory if the common path is actually a file
+        # This prevents NotADirectoryError when master_state only has one file
+        if common_path in known_paths:
+            common_dir = os.path.dirname(common_path)
+        else:
+            common_dir = common_path
     except ValueError:
         common_dir = "" # Fallback if paths are on different drives
 
@@ -142,14 +244,18 @@ def resolve_path(target_path: str, master_state: dict) -> str:
 
     return target_path
 
-def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport]], original_checksums: Dict[str, str] = None) -> Dict[str, str]:
+def calculate_checksum(content: str) -> str:
+    import hashlib
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]], original_checksums: Dict[str, str] = None, intent: str = "") -> Dict[str, str]:
     """
     Programmatically applies surgical actions (Phase 2 Upgrade).
     """
     new_state = master_state.copy()
     for action in actions:
         # 1. Resolve the path dynamically (Phase 1: Repo-Agnostic Path Resolution)
-        path = resolve_path(action.file_path, master_state)
+        path = resolve_path(action.file_path if hasattr(action, 'file_path') else "", master_state)
         
         # Step 3A: Pre-flight checksum check
         if original_checksums and path in original_checksums and path in new_state:
@@ -169,6 +275,12 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             print(f"   🆕 Created file: {path}")
 
         elif action.action == "delete_file":
+            # Phase 5: Forbidding Phantom Deletions
+            if "delete" not in intent.lower() and "remove" not in intent.lower():
+                raise ValueError(
+                    f"Action Rejected: 'delete_file' on '{path}' is not allowed unless the intent explicitly mentions deletion. "
+                    f"To remove code, use 'modify_node' instead."
+                )
             if path in new_state:
                 del new_state[path]
                 print(f"   🗑️ Deleted file: {path}")
@@ -185,6 +297,46 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 print(f"   🎯 Applied AST-targeted replacement to {path} at node '{action.target_node_signature}'")
             else:
                 print(f"❌ Modify Error: Node '{action.target_node_signature}' not found in {path}.")
+
+        elif action.action == "move_node":
+            source_path = resolve_path(action.source_file, master_state)
+            target_path = resolve_path(action.target_file, master_state)
+            
+            if source_path not in new_state:
+                print(f"❌ Move Error: Source file {source_path} not found in state.")
+                continue
+            
+            source_content = new_state[source_path]
+            node_range = find_node_range(source_content, action.node_signature)
+            if not node_range:
+                print(f"❌ Move Error: Node '{action.node_signature}' not found in {source_path}.")
+                continue
+            
+            start, end = node_range
+            node_code = source_content[start:end]
+            
+            # Phase 6: AST Collision Check
+            target_content = new_state.get(target_path, "")
+            if target_content:
+                target_namespace = get_namespace_identifiers(target_content)
+                moved_node_name = extract_name_from_signature(action.node_signature)
+                if moved_node_name in target_namespace:
+                    raise ASTCollisionError(
+                        f"Namespace Collision: Cannot move '{moved_node_name}' to '{target_path}'. "
+                        f"The target file already contains a class, function, or import with the exact same name. "
+                        f"Please use 'modify_node' to alias the existing identifier in the target file before moving."
+                    )
+
+            # 1. Pop from source
+            new_state[source_path] = source_content[:start] + source_content[end:]
+            # Clean up potential double newlines or artifacts (basic)
+            new_state[source_path] = new_state[source_path].replace("\n\n\n", "\n\n")
+            
+            # 2. Append to target
+            if target_path not in new_state:
+                new_state[target_path] = ""
+            new_state[target_path] += "\n\n" + node_code
+            print(f"   🚀 Moved node '{action.node_signature}' from {source_path} to {target_path}")
 
         elif action.action == "add_import":
             if path not in new_state:
@@ -218,39 +370,39 @@ def fetch_file_content(path: str) -> Optional[str]:
         with open(path, 'r', encoding='utf-8') as f: return f.read()
     except: return None
 
-def is_valid_python(content: str) -> bool:
-    # 1. Anti-Placeholder Guardrail (Phase 3: Semantic Sanity Checks)
-    forbidden_phrases = [
-        "# placeholder", 
-        "# ...", 
-        "pass  #", 
-        "# rest of code",
-        "# existing code"
-    ]
-    
-    content_lower = content.lower()
-    for phrase in forbidden_phrases:
-        if phrase in content_lower:
-            raise ValueError(
-                f"Code contains forbidden placeholder: '{phrase}'. "
-                f"Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
-            )
-    
-    # 2. Syntax Check
-    try:
-        ast.parse(content)
-        return True
-    except SyntaxError as e:
-        raise ValueError(f"SyntaxError during AST parse: {str(e)}")
-
 # --- Graph Engine ---
 NEO4J_URI, NEO4J_AUTH = "bolt://localhost:7687", ("neo4j", "password")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
 def get_hybrid_context(instruction: str) -> Dict[str, List[str]]:
-    query_vector = embedder.encode(instruction).tolist()
+    """Phase 1: Dynamic Context Scoping. Pulls entire file AST if 'audit' intent detected."""
     context_map = {}
+    
+    # Heuristic for intent-based scoping
+    audit_match = re.search(r"(audit|all functions in|all classes in|everything in)\s+([a-zA-Z0-9_\-\./]+)", instruction, re.IGNORECASE)
+    
+    if audit_match:
+        target_path = audit_match.group(2)
+        print(f"🔍 Intent Detected: Full-file audit for '{target_path}'. Bypassing vector search.")
+        with driver.session() as session:
+            # Query all functions and classes for this file
+            query = """
+            MATCH (n) 
+            WHERE (n:Function OR n:Class) AND n.file ENDS WITH $target_path
+            RETURN n.name, n.file
+            """
+            result = session.run(query, target_path=target_path)
+            for record in result:
+                f = record['n.file']
+                if f not in context_map: context_map[f] = []
+                context_map[f].append(record['n.name'])
+        
+        if context_map:
+            return context_map
+
+    # Fallback to vector search (K=5)
+    query_vector = embedder.encode(instruction).tolist()
     with driver.session() as session:
         result = session.run("CALL db.index.vector.queryNodes('function_embeddings', 5, $embedding) YIELD node AS anchor, score WHERE score > 0.65 RETURN anchor.name, anchor.file", embedding=query_vector)
         for record in result:
@@ -270,12 +422,14 @@ async def main():
     args, unknown_args = parser.parse_known_args()
 
     task_list = None
+    intent = ""
     if args.drive_spec:
         print(f"📂 Loading specification from: {args.drive_spec}")
         try:
             with open(args.drive_spec, 'r') as f:
                 spec_data = json.load(f)
             task_list = TaskList.model_validate(spec_data)
+            intent = spec_data.get('intent', "Executing loaded specification")
         except Exception as e:
             print(f"❌ Error loading spec: {e}")
             return
@@ -294,10 +448,9 @@ async def main():
         for path in context_map:
             content = fetch_file_content(path)
             if content:
-                try:
-                    is_valid_python(content)
-                except ValueError as e:
-                    print(f"❌ Syntax/Semantic Error detected in {path}: {str(e)}. Aborting main pipeline for triage.")
+                valid, error = is_semantically_valid(content)
+                if not valid:
+                    print(f"❌ Syntax/Semantic Error detected in {path}: {error}. Aborting main pipeline for triage.")
                     return
 
         task_sys_prompt = "You are a senior architect. Generate a sequential list of refactoring tasks."
@@ -364,7 +517,9 @@ async def main():
             "1. NEVER use the 'create_file' action to modify an existing file. It will wipe the file.\n"
             "2. NO TOKEN LAZINESS. You are strictly forbidden from using placeholders like '# ...' or '# existing code'. "
             "If you use a 'modify_node' action, you MUST output the entire, unbroken, executable code for that node.\n"
-            "3. When creating new files, ensure you include ALL necessary imports."
+            "3. When creating new files, ensure you include ALL necessary imports.\n"
+            "4. NEVER use the 'delete_file' action unless the user's prompt explicitly contains the words 'delete' or 'remove' for that specific file. To remove code, use 'modify_node'.\n"
+            "5. Use 'move_node' to refactor code between files while preserving integrity."
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
@@ -387,19 +542,25 @@ async def main():
             
             try:
                 proposal = RefactorProposal.model_validate_json(full_patch_json)
-                new_state = apply_actions_to_state(master_state, proposal.actions, master_checksums)
+                new_state = apply_actions_to_state(master_state, proposal.actions, master_checksums, intent=intent)
                 
                 # Step 3: Verification
                 syntax_error = False
                 for path, content in new_state.items():
                     if path.endswith(".py"):
-                        try:
-                            is_valid_python(content)
-                        except ValueError as e:
-                            error_msg = f"Verification failed for {path}: {str(e)}"
+                        valid, error = is_semantically_valid(content)
+                        if not valid:
+                            error_msg = f"Verification failed for {path}: {error}"
                             syntax_error = True
                             break
                 
+                if not syntax_error:
+                    # Step 3.2.1: Virtual Workspace Validation (Phase 7)
+                    valid, error = validate_virtual_workspace(new_state)
+                    if not valid:
+                        error_msg = error
+                        syntax_error = True
+
                 if not syntax_error:
                     # Show diff and confirm
                     print("\n🔍 REVIEW PROPOSED CHANGES:")

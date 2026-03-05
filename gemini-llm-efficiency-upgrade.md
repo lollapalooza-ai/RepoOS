@@ -339,3 +339,195 @@ sys_prompt = (
 )
 
 ```
+
+# Milestone 3.2 : Reliability and Safety 3.2
+
+### 1. The Cross-File Dependency Conundrum
+
+Tools like `pyflakes` (and even modern single-file linters like `ruff`) analyze Abstract Syntax Trees one file at a time. If the LLM renames `UnicodeCSVWriter` to `CSVUtil` in `compat.py`, and updates `reports.py` to say `from oscar.core.compat import CSVUtil`, `pyflakes` looking at `reports.py` will pass it as 100% perfectly valid! It only checks if the local namespace is satisfied; it does not trace the import edge to see if `CSVUtil` actually exists in the target file.
+
+**The Solution: The "Virtual Workspace" Type-Check**
+To catch cross-file dependency breaks before the user ever sees them, we cannot just lint strings in memory. We must implement a "Virtual Workspace Validation" step at the very end of the execution loop:
+
+1. The LLM finishes its Plan-Execute-Validate loop (using `pyflakes` or `ruff` for fast, single-file syntax/NameError checks).
+2. Before declaring success, `refactor2.py` dumps the proposed `new_state` dictionary into a temporary directory (`tempfile.TemporaryDirectory`).
+3. The engine runs a fast multi-file type checker like `mypy` or `pyright` across that isolated temp directory.
+4. If `mypy` flags `error: Module "oscar.core.compat" has no attribute "CSVUtil"`, we catch it, abort the transaction, and feed that exact cross-file error back to the LLM for a final self-correction.
+
+---
+
+### 2. Engineering Brief: Implementing Macro-Actions & Semantic Validation
+
+Here is the exact, step-by-step system prompt to hand to your Senior Engineer to resolve the Suite 3.1 failures.
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Upgrading Repo OS with Macro-Actions, Dynamic Scoping, and Semantic Validation
+**Context:** Our 14B model has proven its baseline loop works (Test 8), but it is failing on multi-step orchestration (moving nodes) and context starvation (hardcoded K=5 vector limits). We must upgrade the engine to use Macro-Actions and Semantic Validation to abstract complexity away from the LLM.
+
+Please implement the following five phases directly into `refactor2.py` and `ingest2.py`.
+
+---
+
+#### Phase 1: Dynamic Context Scoping (Fixing the K=5 Blindspot)
+
+**The Problem:** In Test 9, the LLM only audited a fraction of a 1700-line file because `ingest2.py` hardcodes the vector search to `LIMIT 5`.
+**Task:** Update `get_hybrid_context()` to support Intent-Based Scoping.
+
+* **Implementation:** Before querying the vector DB, check the user's prompt for file-level intents (e.g., "audit the file", "all functions in"). If detected, bypass the vector similarity search. Instead, execute a Neo4j Cypher query to pull the *entire* AST skeleton for that specific file:
+```cypher
+MATCH (f:File {path: $target_path})-[:CONTAINS]->(node)
+RETURN node.name, node.signature, node.docstring
+
+```
+
+
+
+#### Phase 2: Safe Directory Resolution (Corrected Code)
+
+The previous snippet relied on `os.path.isdir()`, which will fail if the virtual paths do not exist on the local disk at the time of execution. The safer, purely path-based heuristic is to check if the calculated `common_path` exactly matches one of our known file paths. If it does, we know it's a file, and we must extract its directory.
+
+Please replace the `try...except` block in `resolve_path` with this robust string-based implementation:
+
+```python
+    # 3. Path Reconstruction (Handles CreateFile)
+    # Infer the working directory from the common path of all files currently in context
+    try:
+        common_path = os.path.commonpath(known_paths)
+        # Fix: Ensure we extract the directory if the common path is actually a file
+        # This prevents NotADirectoryError when master_state only has one file
+        if common_path in known_paths:
+            common_dir = os.path.dirname(common_path)
+        else:
+            common_dir = common_path
+    except ValueError:
+        common_dir = "" # Fallback if paths are on different drives
+
+```
+
+
+#### Phase 3: Agentic Macro-Actions (`MoveNode`)
+
+**The Problem:** 14B models fail to coordinate `ModifyNode` (delete) + `CreateFile` + `AddImport` in a single pass.
+**Task:** Add a `MoveNode` primitive to the Pydantic Union.
+
+* **Implementation:** ```python
+class MoveNode(BaseModel):
+action: Literal["move_node"] = "move_node"
+source_file: str
+target_file: str
+node_signature: str
+```
+In `apply_actions_to_state`, write the Python logic to handle the orchestration: find the node in `source_file`, pop it out, append it to `target_file`, and inject the necessary imports. The LLM only has to output the `MoveNode` JSON, and Python does the heavy lifting.
+
+
+```
+
+
+
+#### Phase 4: Linter-in-the-Loop (Semantic Validation)
+
+**The Problem:** Tests 2, 4, and 7 failed due to `NameError` (missing imports like `Any` or `settings`). `ast.parse` does not catch undefined names.
+**Task:** Upgrade the `is_valid_python` function to run a fast `pyflakes` or `ruff` pass in memory.
+
+* **Implementation:**
+```python
+import pyflakes.api
+import pyflakes.reporter
+import io
+
+def is_semantically_valid(content: str) -> tuple[bool, str]:
+    # 1. Syntax Check
+    try:
+        ast.parse(content)
+    except SyntaxError as e:
+        return False, f"SyntaxError: {str(e)}"
+
+    # 2. Semantic Check (Catches missing imports / undefined names)
+    output = io.StringIO()
+    reporter = pyflakes.reporter.Reporter(output, output)
+    pyflakes.api.check(content, '', reporter)
+
+    errors = output.getvalue()
+    if "undefined name" in errors:
+        return False, f"Missing Import detected: {errors.strip()}. You MUST use 'add_import'."
+
+    return True, ""
+
+```
+
+
+Wire the output of this function into the LLM's retry loop.
+
+#### Phase 5: Forbidding Phantom Deletions
+
+**The Problem:** The LLM is using `DeleteFile` to wipe files it doesn't understand.
+**Task:** Enforce strict semantic constraints on the `DeleteFile` action.
+
+* **Implementation:** In the system prompt, add: *"CRITICAL RULE: NEVER use the `delete_file` action unless the user's prompt explicitly contains the words 'delete' or 'remove' for that specific file. To remove code from a file, use `modify_node`."*
+
+
+#### Phase6. Resolving AST Namespace Collisions in Macro-Actions
+
+This is a phenomenal edge case to consider. When building macro-actions like `MoveNode`, you cannot blindly append code to a new file, or you risk silent namespace shadowing (where the newly moved `UnicodeCSVWriter` overwrites the third-party import, breaking existing functions in `csv_utils.py` that relied on the external library).
+
+To handle this deterministically, we do not let the LLM guess. We implement a **Pre-flight Namespace Check** in the Python execution engine.
+
+Here is how we architect the collision resolution:
+
+#### The Strategy: Deterministic Rejection via `ASTCollisionError`
+
+Instead of writing complex logic to automatically alias imports (which requires rewriting all subsequent function calls in the file), we treat a namespace collision as a fatal validation error. We use the `ast` module to scan the target file's namespace *before* applying the move, and feed the collision back to the LLM to solve.
+
+**Step 1: The Pre-flight Checker**
+Inside your `MoveNode` execution logic, before you append the node to the `target_file`, parse the target file to collect all defined names and imported names.
+
+```python
+import ast
+
+def get_namespace_identifiers(file_content: str) -> set:
+    """Extracts all function names, class names, and imported aliases from a file's AST."""
+    identifiers = set()
+    try:
+        tree = ast.parse(file_content)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                identifiers.add(node.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    identifiers.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    identifiers.add(alias.asname or alias.name)
+    except SyntaxError:
+        pass # Handle syntax errors separately in the main loop
+    return identifiers
+
+```
+
+**Step 2: Enforce the Collision Guardrail**
+When the `MoveNode` action is evaluated, extract the name of the node being moved (e.g., `UnicodeCSVWriter` from the `node_signature`) and check it against the target file's namespace.
+
+```python
+class ASTCollisionError(Exception):
+    pass
+
+# Inside apply_actions_to_state for MoveNode:
+target_content = master_state.get(action.target_file, "")
+if target_content:
+    target_namespace = get_namespace_identifiers(target_content)
+    moved_node_name = extract_name_from_signature(action.node_signature) # e.g., 'UnicodeCSVWriter'
+    
+    if moved_node_name in target_namespace:
+        raise ASTCollisionError(
+            f"Namespace Collision: Cannot move '{moved_node_name}' to '{action.target_file}'. "
+            f"The target file already contains a class, function, or import with the exact same name. "
+            f"Please use 'modify_node' to alias the existing import in the target file before moving."
+        )
+
+```
+
+**Step 3: The Self-Healing Loop**
+When `ASTCollisionError` is raised, your retry loop catches it and pipes it back to the LLM.
+
+Because we feed the exact collision reason back to the agent, the LLM will naturally self-correct by first issuing a `ModifyNode` to change the target file's import to `from third_party import UnicodeCSVWriter as ExternalCSVWriter`, and *then* issuing the `MoveNode` command. This delegates the semantic reasoning back to the LLM while Python enforces the strict structural safety of the AST.
