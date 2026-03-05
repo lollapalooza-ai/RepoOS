@@ -24,8 +24,8 @@ import subprocess
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
 VENV_PYTHON = "./venv/bin/python3"
 
-def validate_virtual_workspace(state: Dict[str, str]) -> tuple[bool, str]:
-    """Step 3.2.1: Validates cross-file dependencies using mypy in a virtual workspace."""
+def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str]) -> tuple[bool, str]:
+    """Phase 2: Differential Static Analysis. Runs mypy ONLY on the files that were modified."""
     with tempfile.TemporaryDirectory() as tmpdir:
         for path, content in state.items():
             tmp_path = os.path.join(tmpdir, path)
@@ -34,19 +34,24 @@ def validate_virtual_workspace(state: Dict[str, str]) -> tuple[bool, str]:
                 f.write(content)
         
         try:
-            # We use --ignore-missing-imports and --follow-imports=silent to focus on the files we have
-            # and --no-error-summary to keep output clean.
+            # Construct absolute paths for only the modified files
+            target_files = [os.path.join(tmpdir, p) for p in modified_paths if p in state]
+            
+            if not target_files:
+                return True, "" # Nothing to lint
+                
+            # Run mypy only on target_files
             result = subprocess.run(
-                [VENV_PYTHON, "-m", "mypy", tmpdir, "--ignore-missing-imports", "--follow-imports=silent", "--no-error-summary"],
+                [VENV_PYTHON, "-m", "mypy", *target_files, "--ignore-missing-imports", "--follow-imports=silent", "--no-error-summary"],
                 capture_output=True, text=True, check=False
             )
+            
             if result.returncode != 0:
                 # Clean up output to hide temp paths
                 errors = result.stdout.replace(tmpdir + "/", "")
                 # Only return errors if they are relevant to cross-file attribute/module lookup
-                # This is a bit heuristic, but it's what the directive asks for.
                 if "has no attribute" in errors or "Module" in errors:
-                    return False, f"Cross-file dependency error: {errors.strip()}"
+                    return False, f"Type Error introduced in modified files:\n{errors.strip()}"
             return True, ""
         except Exception as e:
             return True, f"Type check skipped due to error: {str(e)}"
@@ -138,9 +143,23 @@ class MoveNode(BaseModel):
     source_file: str = Field(..., description="Path to the file to move the node FROM.")
     target_file: str = Field(..., description="Path to the file to move the node TO.")
     node_signature: str = Field(..., description="The function or class name to move (e.g., 'my_func' or 'MyClass.my_method').")
+    required_imports: List[str] = Field(
+        default=[], 
+        description="List of import statements required for this node to run in the target file (e.g., ['import csv', 'from typing import Any'])."
+    )
+
+# --- Define the dynamic Unions (Phase 1: Dynamic Schema Pruning) ---
+class RefactorProposalSafe(BaseModel):
+    """Schema used for standard refactoring. DeleteFile is mathematically impossible."""
+    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of safe refactoring actions.")
+
+class RefactorProposalUnsafe(BaseModel):
+    """Schema used ONLY when the user explicitly requests a deletion."""
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of refactoring actions, including deletion.")
 
 class RefactorProposal(BaseModel):
     actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of discrete refactoring actions.")
+
 
 # --- Config ---
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
@@ -332,10 +351,22 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             # Clean up potential double newlines or artifacts (basic)
             new_state[source_path] = new_state[source_path].replace("\n\n\n", "\n\n")
             
-            # 2. Append to target
+            # 2. Append to target (Phase 3: Explicit MoveNode Dependency Injection)
             if target_path not in new_state:
                 new_state[target_path] = ""
-            new_state[target_path] += "\n\n" + node_code
+            
+            # Construct the import block
+            import_block = ""
+            if hasattr(action, 'required_imports') and action.required_imports:
+                import_block = "\n".join(action.required_imports) + "\n\n"
+
+            existing_content = new_state.get(target_path, "")
+            # Avoid duplicating imports if they already exist
+            if import_block.strip() and import_block.strip() not in existing_content:
+                new_state[target_path] = import_block + existing_content + "\n\n" + node_code
+            else:
+                new_state[target_path] = existing_content + ("\n\n" if existing_content else "") + node_code
+            
             print(f"   🚀 Moved node '{action.node_signature}' from {source_path} to {target_path}")
 
         elif action.action == "add_import":
@@ -488,6 +519,12 @@ async def main():
             master_state[path] = content
             master_checksums[path] = calculate_checksum(content)
     
+    # Phase 1: Dynamic Schema Pruning
+    user_intent_lower = intent.lower()
+    requires_deletion = "delete" in user_intent_lower or "remove" in user_intent_lower
+    ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
+    print(f"🛡️  Using active schema: {ActiveSchema.__name__}")
+
     for i, task in enumerate(task_list.tasks):
         print(f"\n--- Executing Task {i+1}/{len(task_list.tasks)}: {task.task} ---")
         
@@ -536,27 +573,33 @@ async def main():
                 print("🧠 Generating Actions...", end="")
 
             full_patch_json = ""
-            async for token in generate_streaming_json(sys_prompt, current_user_prompt, RefactorProposal):
+            async for token in generate_streaming_json(sys_prompt, current_user_prompt, ActiveSchema):
                 full_patch_json += token
             print(" Done.\n")
             
             try:
-                proposal = RefactorProposal.model_validate_json(full_patch_json)
+                proposal = ActiveSchema.model_validate_json(full_patch_json)
                 new_state = apply_actions_to_state(master_state, proposal.actions, master_checksums, intent=intent)
                 
+                # Track modified paths for Phase 2: Differential Static Analysis
+                modified_paths = []
+                for path, new_content in new_state.items():
+                    if master_state.get(path) != new_content:
+                        modified_paths.append(path)
+
                 # Step 3: Verification
                 syntax_error = False
-                for path, content in new_state.items():
-                    if path.endswith(".py"):
-                        valid, error = is_semantically_valid(content)
+                for path in modified_paths:
+                    if path.endswith(".py") and path in new_state:
+                        valid, error = is_semantically_valid(new_state[path])
                         if not valid:
                             error_msg = f"Verification failed for {path}: {error}"
                             syntax_error = True
                             break
                 
                 if not syntax_error:
-                    # Step 3.2.1: Virtual Workspace Validation (Phase 7)
-                    valid, error = validate_virtual_workspace(new_state)
+                    # Phase 2: Differential Static Analysis
+                    valid, error = validate_virtual_workspace(new_state, modified_paths)
                     if not valid:
                         error_msg = error
                         syntax_error = True
@@ -565,9 +608,9 @@ async def main():
                     # Show diff and confirm
                     print("\n🔍 REVIEW PROPOSED CHANGES:")
                     has_changes = False
-                    for path, new_content in new_state.items():
+                    for path in modified_paths:
                         old_content = master_state.get(path, "")
-                        if old_content == new_content: continue
+                        new_content = new_state[path]
                         has_changes = True
                         print(f"\n--- File: {path} ---")
                         diff = difflib.unified_diff(old_content.splitlines(keepends=True), new_content.splitlines(keepends=True), fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="")
@@ -585,8 +628,8 @@ async def main():
                         print("✅ Changes accepted in-memory.")
                         break # Exit retry loop
                     else:
-                        print("🛑 Task rejected. Aborting.")
-                        return
+                        print("🛑 Task rejected. Skipping.")
+                        break # Skip this task and continue
                 else:
                     retry_count += 1
             except Exception as e:
@@ -594,12 +637,14 @@ async def main():
                 retry_count += 1
         
         if retry_count == max_retries:
-            print(f"❌ Failed to generate valid patches for task after {max_retries} attempts. Aborting.")
-            return
+            # Phase 4: Atomic "Best Effort" Execution
+            print(f"❌ Task {i+1} failed after {max_retries} attempts. Skipping to next task.")
+            continue
             
     print("\n💾 Writing all changes to disk...")
     apply_updates(master_state, master_checksums)
     print("✅ Complete.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

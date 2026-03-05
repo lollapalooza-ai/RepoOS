@@ -531,3 +531,173 @@ if target_content:
 When `ASTCollisionError` is raised, your retry loop catches it and pipes it back to the LLM.
 
 Because we feed the exact collision reason back to the agent, the LLM will naturally self-correct by first issuing a `ModifyNode` to change the target file's import to `from third_party import UnicodeCSVWriter as ExternalCSVWriter`, and *then* issuing the `MoveNode` command. This delegates the semantic reasoning back to the LLM while Python enforces the strict structural safety of the AST.
+
+# Milestone 3.3 : Conflicting Rules Removal
+# ENGINEERING BRIEF: Resolving Deadlocks, Differential Linting, and Best-Effort Execution
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Upgrading Repo OS Execution Engine (`refactor2.py`) - Suite 3.2 Fixes
+**Context:** Our 14B model is hitting a Negative Prompting Fallacy. By telling it "Do not use delete_file", we inadvertently trapped its attention mechanism, causing deadlocks. Furthermore, our global `mypy` validation is too strict, rejecting valid AST patches due to pre-existing legacy type errors. We are implementing Dynamic Schema Pruning, Differential Static Analysis, and Best-Effort Execution to finalize the stability of the execution loop.
+
+Please implement the following four phases sequentially into `refactor2.py`.
+
+---
+
+### Phase 1: Dynamic Schema Pruning (Solving the `delete_file` Deadlock)
+
+**The Problem:** The LLM gets trapped trying to use `delete_file` because it exists in the JSON schema grammar, even if the system prompt forbids it. When the Python engine rejects it, it retries the same forbidden action until it aborts.
+**The Fix:** Dynamically prune the JSON schema injected into the LLM context based on the user's intent.
+
+**Step 1:** Define two separate Pydantic Unions. Remove `DeleteFile` from the safe default.
+
+```python
+from pydantic import BaseModel, Field
+from typing import List, Union, Literal
+
+# --- Define Base Actions ---
+# (Assuming CreateFile, ModifyNode, AddImport, MoveNode are already defined)
+
+# --- Define the dynamic Unions ---
+class RefactorProposalSafe(BaseModel):
+    """Schema used for standard refactoring. DeleteFile is mathematically impossible."""
+    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode]]
+
+class RefactorProposalUnsafe(BaseModel):
+    """Schema used ONLY when the user explicitly requests a deletion."""
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]]
+
+```
+
+**Step 2:** Dynamically select the schema before calling the LLM generation function.
+
+```python
+# Inside your main orchestration loop, before generating the JSON:
+user_intent_lower = user_prompt.lower()
+requires_deletion = "delete" in user_intent_lower or "remove" in user_intent_lower
+
+# Select the active schema
+ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
+
+# Pass ActiveSchema to your generation function
+# e.g., response = generate_streaming_json(prompt, schema=ActiveSchema)
+
+```
+
+---
+
+### Phase 2: Differential Static Analysis (Solving Over-Strict Verification)
+
+**The Problem:** Test 9 (Docstrings) failed because our `validate_virtual_workspace` function ran `mypy` across the entire project scope. Legacy monoliths already have hundreds of type errors, causing RepoOS to reject perfectly valid LLM patches.
+**The Fix:** We must restrict `mypy` to only analyze the files that were touched in the current transaction.
+
+**Step 1:** Update `validate_virtual_workspace` to accept `modified_paths`.
+
+```python
+import subprocess
+import os
+from typing import Dict, List, Tuple
+
+def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str]) -> Tuple[bool, str]:
+    """Runs mypy ONLY on the files that were modified to prevent legacy errors from blocking."""
+    # ... (assume tmpdir setup is here and state is dumped to disk) ...
+    
+    try:
+        # Construct absolute paths for only the modified files
+        target_files = [os.path.join(tmpdir, p) for p in modified_paths if p in state]
+        
+        if not target_files:
+            return True, "" # Nothing to lint
+            
+        # Run mypy only on target_files
+        result = subprocess.run(
+            [VENV_PYTHON, "-m", "mypy", *target_files, "--ignore-missing-imports", "--follow-imports=silent"],
+            capture_output=True, text=True, check=False
+        )
+        
+        if result.returncode != 0:
+            return False, f"Type Error introduced in modified files:\n{result.stdout}"
+            
+        return True, ""
+    finally:
+        pass # Cleanup tmpdir
+
+```
+
+---
+
+### Phase 3: Explicit `MoveNode` Dependency Injection
+
+**The Problem:** In Test 1, `MoveNode` worked, but the LLM failed to emit a subsequent `AddImport` task, resulting in a `NameError` in the new file.
+**The Fix:** Force the LLM to provide required imports inside the `MoveNode` schema, and have Python automatically inject them.
+
+**Step 1:** Update the `MoveNode` Pydantic model.
+
+```python
+class MoveNode(BaseModel):
+    action: Literal["move_node"] = "move_node"
+    source_file: str
+    target_file: str
+    node_signature: str
+    required_imports: List[str] = Field(
+        default=[], 
+        description="List of import statements required for this node to run in the target file (e.g., ['import csv', 'from typing import Any'])."
+    )
+
+```
+
+**Step 2:** Update `apply_actions_to_state` to inject the imports.
+
+```python
+# Inside apply_actions_to_state, under the `if action.action == "move_node":` branch
+if target_path not in new_state:
+    new_state[target_path] = ""
+
+# Construct the import block
+import_block = ""
+if action.required_imports:
+    import_block = "\n".join(action.required_imports) + "\n\n"
+
+# Prepend imports and append the moved node code
+existing_content = new_state.get(target_path, "")
+# Avoid duplicating imports if they already exist
+if import_block.strip() not in existing_content:
+    new_state[target_path] = import_block + existing_content + "\n\n" + node_code
+else:
+    new_state[target_path] = existing_content + "\n\n" + node_code
+
+```
+
+---
+
+### Phase 4: Atomic "Best Effort" Execution
+
+**The Problem:** Currently, if the model fails to resolve a syntax error after `max_retries`, the script uses `return`, aborting the entire session and discarding all valid tasks completed prior.
+**The Fix:** Treat each task as an isolated atomic transaction. Skip failures, persist successes.
+
+**Step 1:** Change `return` to `continue` in your orchestration loop.
+
+```python
+# Inside your main task processing loop (e.g., iterating over parsed Plan steps)
+for i, task in enumerate(task_list):
+    retry_count = 0
+    success = False
+    
+    while retry_count < max_retries:
+        try:
+            # ... (generate patch, apply actions, validate) ...
+            success = True
+            break # Validation passed, break retry loop
+            
+        except (ValueError, SyntaxError) as e:
+            # ... (append error to message history) ...
+            retry_count += 1
+            
+    if not success:
+        print(f"❌ Task {i+1} failed after {max_retries} attempts. Skipping to next task.")
+        # CRITICAL FIX: Do not use `return` here. Use `continue` to move to the next task.
+        continue 
+        
+    print(f"✅ Task {i+1} applied successfully.")
+
+```
