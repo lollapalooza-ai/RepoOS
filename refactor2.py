@@ -6,6 +6,7 @@ import json
 import re
 import asyncio
 import ollama
+import textwrap
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
@@ -220,6 +221,7 @@ class InsertNode(BaseModel):
     action: Literal["insert_node"] = "insert_node"
     file_path: str = Field(..., description="Path to the existing file.")
     new_node_code: str = Field(..., description="The complete code for the new function or class.")
+    target_class_signature: Optional[str] = Field(None, description="If inserting a method into an existing class, provide the class name here (e.g., 'AbstractOrder'). Leave null for global functions.")
     
     @field_validator('file_path')
     @classmethod
@@ -274,32 +276,40 @@ async def generate_streaming_json(system_prompt: str, user_prompt: str, response
     ):
         yield part['message']['content']
 
+def get_base_indent(source_code: str, byte_offset: int) -> str:
+    """Finds the whitespace indentation level at a specific byte offset."""
+    lines = source_code[:byte_offset].split('\n')
+    last_line = lines[-1] if lines else ""
+    return last_line[:-len(last_line.lstrip())]
+
 def extract_name_from_signature(signature: str) -> str:
     """Extracts the base name from a signature (e.g., 'MyClass.my_method' -> 'my_method')."""
     return signature.split('.')[-1]
 
 def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
-    """Uses tree-sitter to find the byte range of a function, class, or nested method."""
+    """Uses tree-sitter to find the byte range, sanitizing LLM hallucinations."""
+    # Fix: Strip out anything after '(' so 'get_model(arg1, arg2)' becomes 'get_model'
+    clean_sig = signature.split('(')[0].strip()
+    
     tree = parser.parse(bytes(source_code, "utf8"))
 
-    # Handle Nested Class Methods (e.g., 'AbstractAddress.as_text')
-    if "." in signature:
-        class_name, method_name = signature.split(".", 1)
+    if "." in clean_sig:
+        class_name, method_name = clean_sig.split(".", 1)
         query = PY_LANGUAGE.query(f"""
-        (class_definition 
-            name: (identifier) @cls_name (#eq? @cls_name "{class_name}")
-            body: (block
-                (function_definition 
-                    name: (identifier) @meth_name (#eq? @meth_name "{method_name}")
-                ) @def
-            )
+        (class_definition name: (identifier) @cls (#eq? @cls "{class_name}")
+            body: (block [
+                (function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
+                (decorated_definition (function_definition name: (identifier) @meth (#eq? @meth "{method_name}")))
+                (async_function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
+            ] @def )
         )
         """)
-    # Handle Global Functions or Classes
     else:
         query = PY_LANGUAGE.query(f"""
-        (function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
-        (class_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        (function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
+        (class_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
+        (decorated_definition (function_definition name: (identifier) @n (#eq? @n "{clean_sig}"))) @def
+        (async_function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         """)
 
     captures = query.captures(tree.root_node)
@@ -367,19 +377,15 @@ def calculate_checksum(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 def path_to_python_module(filepath: str) -> str:
-    """Converts a file path to a python module path (e.g., src/oscar/core/compat.py -> oscar.core.compat)."""
-    # Remove .py extension
+    """Converts a file path to a python module path without destroying app namespaces."""
     path = filepath
     if path.endswith(".py"): path = path[:-3]
     
-    # Common project roots to strip (heuristic)
-    roots = ["src/", "oscar/"] # Add more as needed based on the repo structure
-    for root in roots:
-        if path.startswith(root):
-            path = path[len(root):]
-            break
-            
-    # Normalize separators
+    # ONLY strip src/ or other top-level project wrappers. 
+    # Do NOT strip 'oscar/' as that is the actual root package namespace.
+    if path.startswith("src/"):
+        path = path[4:]
+        
     return path.replace("/", ".").replace("\\", ".")
 
 def execute_graph_query(query: str, parameters: dict = None) -> list:
@@ -441,8 +447,9 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 
                 # If the new code is less than 50% the size of the old code, raise an alarm
                 if orig_len > 100 and new_len < (orig_len * 0.5):
-                    # Check if the user explicitly asked to delete/remove code
-                    if "remove" not in intent.lower() and "delete" not in intent.lower():
+                    # Whitelist intents that legitimately shrink code volume
+                    allowed_intents = ["remove", "delete", "extract", "move", "split", "break down"]
+                    if not any(word in intent.lower() for word in allowed_intents):
                         raise ValueError(
                             f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
                             f"You attempted to replace a large block of code ({orig_len} chars) with a significantly smaller one ({new_len} chars). "
@@ -549,8 +556,23 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         elif action.action == "insert_node":
             if path not in new_state: continue
             content = new_state[path]
-            # Safely append to EOF
-            new_state[path] = content.rstrip() + "\n\n" + action.new_node_code + "\n"
+            
+            # If inserting a method into a class (detected by dot notation in the prompt/context)
+            if getattr(action, 'target_class_signature', None):
+                class_range = find_node_range(content, action.target_class_signature)
+                if class_range:
+                    _, end = class_range
+                    # Calculate class indent + 4 spaces
+                    base_indent = get_base_indent(content, class_range[0]) + "    "
+                    normalized_code = textwrap.indent(textwrap.dedent(action.new_node_code), base_indent)
+                    
+                    # Insert right before the end of the class block
+                    new_state[path] = content[:end] + "\n" + normalized_code + "\n" + content[end:]
+                    print(f"   ➕ Inserted method into {action.target_class_signature}")
+                    continue
+            
+            # Fallback: Append to EOF with no indent
+            new_state[path] = content.rstrip() + "\n\n" + textwrap.dedent(action.new_node_code) + "\n"
             print(f"   ➕ Inserted new node into {path}")
 
         elif action.action == "update_docstring":
@@ -562,7 +584,8 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 start, end = node_range
                 node_code = content[start:end]
                 # Regex to safely replace or insert docstring just after the def/class signature
-                pattern = re.compile(r'(^(?:[ \t]*)(?:def|class)\s+[^\:]+\:\s*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
+                # Fix: [^\n]*\n handles trailing comments like 'def foo(): # comment \n'
+                pattern = re.compile(r'(^(?:[ \t]*)(?:def|async def|class)\s+[^:]+:[^\n]*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
                 
                 def replacement(match):
                     signature_line = match.group(1)
@@ -740,18 +763,39 @@ async def main():
                     file_block += f'\n<node signature="{node_name}">\n{node_code}\n</node>'
             file_block += "\n</file_context>"
             context_blocks.append(file_block)
+            
+        # NEW: Fetch Parent Class Context
+        parent_context_xml = ""
+        for path, node_names in task.context.items():
+            for node_name in node_names:
+                # In python, extract just the class name if it is a method, but for simplicity we can try the raw node_name
+                # since the cypher query requires `Class` label it will gracefully return empty for methods.
+                base_node_name = node_name.split('.')[0] if '.' in node_name else node_name
+                cypher_query = """
+                MATCH (c:Class {name: $class_name})-[:INHERITS_FROM*1..2]->(parent:Class)-[:HAS_METHOD]->(method:Function)
+                RETURN parent.name AS parent, method.name AS sig, method.docstring AS doc
+                """
+                results = execute_graph_query(cypher_query, {'class_name': base_node_name})
+                if results:
+                    # To avoid duplicates if we query the same class multiple times
+                    if f"<parent_class_context name='{base_node_name}'>" not in parent_context_xml:
+                        parent_context_xml += f"\n<parent_class_context name='{base_node_name}'>\n"
+                        for row in results:
+                            parent_context_xml += f"  <inherited_method parent='{row['parent']}' signature='{row['sig']}'>\n"
+                            parent_context_xml += f"    {row['doc']}\n  </inherited_method>\n"
+                        parent_context_xml += "</parent_class_context>\n"
         
-        context_str = "\n\n".join(context_blocks)
+        context_str = "\n\n".join(context_blocks) + parent_context_xml
         
         sys_prompt = (
             "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
             "You will be provided with a strict sub-tree of the codebase. "
             "CRITICAL RULES: \n"
-            "1. NO TOKEN LAZINESS: If you use 'modify_node', you MUST output the entire, unbroken, executable code for that node. Never use '# existing code' or dummy implementations like `pass`.\n"
-            "2. CREATION vs MODIFICATION: If you need to add a NEW function or class to an existing file, you MUST use 'insert_node'. Do NOT use 'modify_node' for nodes that do not exist yet.\n"
-            "3. DOCSTRINGS: To update a docstring on a large class, use 'update_docstring'. Do not rewrite the whole class just to change documentation.\n"
-            "4. LOGIC PRESERVATION: When extracting logic or adding type hints, DO NOT alter the underlying functional business logic. (e.g. do not change a `min()` check to `>=`).\n"
-            "5. IMPORTS: Always use 'add_import' if your new code requires dependencies like 'typing', 'Decimal', or 'settings'.\n"
+            "1. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass` or `f'{amount}'`.\n"
+            "2. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
+            "3. DOCSTRINGS: To update documentation on a large class, use 'update_docstring'. Do not rewrite the whole class.\n"
+            "4. INHERITANCE: Review the <parent_class_context> provided. Do not duplicate parent logic unnecessarily.\n"
+            "5. IMPORTS: Always use 'add_import' for new dependencies. Use exact project absolute paths.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         

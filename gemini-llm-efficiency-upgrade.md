@@ -1030,3 +1030,337 @@ sys_prompt = (
 )
 
 ```
+
+# Milestone 3.6 : Finalizing AST Robustness & Indentation
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching AST Parsing, Indentation Math, and Cross-Task Consistency (Suite 3.5)
+
+Please implement these four precise upgrades into `refactor2.py`.
+
+#### Phase 1: Expanding Tree-Sitter Node Resolution (Fixes Tests 12, 14, 17)
+
+**Task:** Upgrade `find_node_range` to detect decorated methods, async methods, and properties.
+
+```python
+def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
+    """Uses tree-sitter to find the byte range of a function, class, nested method, or decorated property."""
+    tree = parser.parse(bytes(source_code, "utf8"))
+
+    if "." in signature:
+        class_name, method_name = signature.split(".", 1)
+        # Capture standard, decorated, and async methods inside classes
+        query = PY_LANGUAGE.query(f"""
+        (class_definition 
+            name: (identifier) @cls_name (#eq? @cls_name "{class_name}")
+            body: (block
+                [
+                    (function_definition name: (identifier) @meth_name (#eq? @meth_name "{method_name}"))
+                    (decorated_definition (function_definition name: (identifier) @meth_name (#eq? @meth_name "{method_name}")))
+                    (async_function_definition name: (identifier) @meth_name (#eq? @meth_name "{method_name}"))
+                ] @def
+            )
+        )
+        """)
+    else:
+        # Capture global level definitions
+        query = PY_LANGUAGE.query(f"""
+        (function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        (class_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        (decorated_definition (function_definition name: (identifier) @name (#eq? @name "{signature}"))) @def
+        (async_function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        """)
+
+    captures = query.captures(tree.root_node)
+    if isinstance(captures, dict):
+        nodes = captures.get('def', [])
+        if nodes: return nodes[0].start_byte, nodes[0].end_byte
+    elif captures:
+        for node, name in captures:
+            if name == 'def': return node.start_byte, node.end_byte
+    return None
+
+```
+
+#### Phase 2: Dynamic Indentation Normalization (Fixes Tests 5, 9, 20)
+
+**Task:** `UpdateDocstring` and `InsertNode` must mathematically calculate the target indentation rather than relying on the LLM's whitespace.
+**1. Inject this helper function:**
+
+```python
+import textwrap
+
+def get_base_indent(source_code: str, byte_offset: int) -> str:
+    """Finds the whitespace indentation level at a specific byte offset."""
+    lines = source_code[:byte_offset].split('\n')
+    last_line = lines[-1] if lines else ""
+    return last_line[:-len(last_line.lstrip())]
+
+```
+
+**2. Update `apply_actions_to_state` for `insert_node`:**
+
+```python
+        elif action.action == "insert_node":
+            if path not in new_state: continue
+            content = new_state[path]
+            
+            # If inserting a method into a class (detected by dot notation in the prompt/context)
+            if "." in getattr(action, 'target_class_signature', ""):
+                class_range = find_node_range(content, action.target_class_signature)
+                if class_range:
+                    _, end = class_range
+                    # Calculate class indent + 4 spaces
+                    base_indent = get_base_indent(content, class_range[0]) + "    "
+                    normalized_code = textwrap.indent(textwrap.dedent(action.new_node_code), base_indent)
+                    
+                    # Insert right before the end of the class block
+                    new_state[path] = content[:end] + "\n" + normalized_code + "\n" + content[end:]
+                    print(f"   ➕ Inserted method into {action.target_class_signature}")
+                    continue
+            
+            # Fallback: Append to EOF with no indent
+            new_state[path] = content.rstrip() + "\n\n" + textwrap.dedent(action.new_node_code) + "\n"
+            print(f"   ➕ Inserted new node into {path}")
+
+```
+
+#### Phase 3: Pydantic Schema Upgrades (Fixes Tests 11, 13, 15)
+
+**Task:** We must force the LLM to explicitly state if an `InsertNode` belongs inside a class.
+
+**Update the model in `refactor2.py**`:
+
+```python
+class InsertNode(BaseModel):
+    action: Literal["insert_node"] = "insert_node"
+    file_path: str = Field(..., description="Path to the existing file.")
+    new_node_code: str = Field(..., description="The complete code for the new function or class.")
+    target_class_signature: Optional[str] = Field(None, description="If inserting a method into an existing class, provide the class name here (e.g., 'AbstractOrder'). Leave null for global functions.")
+
+```
+
+#### Phase 4: System Prompt Reinforcement (Fixes Test 4, 6, 18, 19)
+
+**Task:** The LLM's system prompt needs a direct command to stop hallucinating dummy logic and to manage `MoveNode` volume blocks.
+
+**Update `sys_prompt` around line 1263:**
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "You will be provided with a strict sub-tree of the codebase. "
+    "CRITICAL RULES: \n"
+    "1. NO DUMMY LOGIC: When extracting or moving logic, you MUST preserve the exact original business logic. Do not simplify logic with placeholders like `f'{amount:.2f}'`.\n"
+    "2. STRICT TOOL CHOICE: To add a NEW method to an existing class, you MUST use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
+    "3. CONSISTENCY: Ensure variable names, setting keys, and custom exceptions match exactly across all files in your plan.\n"
+    "4. MOVE VS DELETE: If moving a class to a new file, ALWAYS use 'move_node'. Do not use 'modify_node' to delete it from the source file.\n"
+    "5. IMPORTS: Always use 'add_import' if your new code requires dependencies like 'typing', 'Decimal', or 'settings'. Ensure imports use exact project absolute paths (e.g., 'oscar.core.utils').\n"
+)
+
+```
+# Milestone 3.6.1 : The Repo OS "Last Mile" Architecture Patch
+
+# ENGINEERING BRIEF
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Master Patch - Suite 3.4 & 3.5 Fixes (AST Parsing, Graph Inheritance, and Final Primitives)
+**Context:** Our local 14B model has reached the limits of its zero-shot context window and toolset. To achieve 90%+ reliability on complex multi-file refactors, we must supply it with proper node insertion primitives, mathematically precise indentation handlers, and an upgraded RAG context pipeline that resolves class inheritance dynamically.
+
+Please implement the following architectural upgrades across `ingest2.py` and `refactor2.py`.
+
+---
+
+## PART A: Knowledge Graph & Context Routing
+
+### 1. Upgrade `ingest2.py`: AST Sync & Inheritance Mapping
+
+We must ensure the graph captures decorated methods (like `@property`) and class inheritance so the MCP tools can query them.
+
+**Update Tree-sitter Queries & Processing:**
+
+```python
+# 1. Expand function extraction to include decorators and async
+FUNCTION_QUERY = PY_LANGUAGE.query("""
+    [
+        (function_definition name: (identifier) @function.name)
+        (async_function_definition name: (identifier) @function.name)
+        (decorated_definition (function_definition name: (identifier) @function.name))
+    ] @function.def
+""")
+
+# 2. Add Class Inheritance Query
+CLASS_INHERITANCE_QUERY = PY_LANGUAGE.query("""
+    (class_definition
+        name: (identifier) @class.name
+        superclasses: (argument_list (identifier) @base.name)
+    )
+""")
+
+# 3. Inside process_file(), create the edges in Neo4j:
+def create_inheritance_dependency(child_class, base_class):
+    query = """
+    MERGE (child:Class {name: $child_class})
+    MERGE (base:Class {name: $base_class})
+    MERGE (child)-[:INHERITS_FROM]->(base)
+    """
+    execute_write_query(query, {'child_class': child_class, 'base_class': base_class})
+
+```
+
+### 2. Upgrade `get_hybrid_context` MCP Tool
+
+When gathering context for a target file, traverse the new `[:INHERITS_FROM]` edge to fetch parent class signatures and docstrings.
+
+**Update Context Builder:**
+
+```python
+def get_hybrid_context(target_file: str, class_names: List[str]) -> str:
+    # ... existing vector/file context gathering ...
+    
+    # NEW: Fetch Parent Class Context
+    parent_context_xml = ""
+    for class_name in class_names:
+        cypher_query = """
+        MATCH (c:Class {name: $class_name})-[:INHERITS_FROM*1..2]->(parent:Class)-[:CONTAINS]->(method:Function)
+        RETURN parent.name AS parent, method.name AS method, method.signature AS sig, method.docstring AS doc
+        """
+        results = execute_graph_query(cypher_query, {'class_name': class_name})
+        
+        if results:
+            parent_context_xml += f"\n<parent_class_context name='{class_name}'>\n"
+            for row in results:
+                parent_context_xml += f"  <inherited_method parent='{row['parent']}' signature='{row['sig']}'>\n"
+                parent_context_xml += f"    {row['doc']}\n  </inherited_method>\n"
+            parent_context_xml += "</parent_class_context>\n"
+            
+    return existing_context + parent_context_xml
+
+```
+
+---
+
+## PART B: Core Action Primitives (`refactor2.py`)
+
+### 1. Introduce `InsertNode` and `UpdateDocstring` Pydantic Schemas
+
+Give the LLM the ability to append code and update docs without rewriting 500-line classes.
+
+```python
+class InsertNode(BaseModel):
+    action: Literal["insert_node"] = "insert_node"
+    file_path: str = Field(..., description="Path to the existing file.")
+    new_node_code: str = Field(..., description="The complete code for the new function or class.")
+    target_class_signature: Optional[str] = Field(None, description="If inserting a method into an existing class, provide the class name here (e.g., 'AbstractOrder').")
+
+class UpdateDocstring(BaseModel):
+    action: Literal["update_docstring"] = "update_docstring"
+    file_path: str = Field(..., description="Path to the file.")
+    target_node_signature: str = Field(..., description="The function or class name.")
+    new_docstring: str = Field(..., description="The new docstring text, including quotes.")
+
+# IMPORTANT: Add these to RefactorProposalSafe and RefactorProposalUnsafe Unions!
+
+```
+
+### 2. Pydantic Path Hardening & Safe Schema Fallback
+
+```python
+# 1. Pydantic Validator for all file_path fields
+@field_validator('file_path')
+def validate_paths(cls, v):
+    forbidden = ["path/to", "your/file", "source/file", "target/file", "...", "<"]
+    if any(sub in v.lower() for sub in forbidden):
+        raise ValueError(f"Invalid path hallucination: '{v}'. Use exact repository paths.")
+    return v
+
+# 2. Hardened DeleteFile Intent Check (in the main orchestration loop)
+requires_deletion = bool(re.search(r'\b(delete|remove|drop)\s+(the\s+)?(file|module|script)\b', intent.lower()))
+ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
+
+```
+
+---
+
+## PART C: AST Execution & Indentation (`refactor2.py`)
+
+### 1. Upgrade `find_node_range` (Nested & Decorated Methods)
+
+Update the Tree-sitter query to catch dotted signatures (`Class.method`) and decorated properties.
+
+```python
+def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
+    tree = parser.parse(bytes(source_code, "utf8"))
+
+    if "." in signature:
+        class_name, method_name = signature.split(".", 1)
+        query = PY_LANGUAGE.query(f"""
+        (class_definition name: (identifier) @cls (#eq? @cls "{class_name}")
+            body: (block [
+                (function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
+                (decorated_definition (function_definition name: (identifier) @meth (#eq? @meth "{method_name}")))
+            ] @def )
+        )
+        """)
+    else:
+        query = PY_LANGUAGE.query(f"""
+        (function_definition name: (identifier) @n (#eq? @n "{signature}")) @def
+        (class_definition name: (identifier) @n (#eq? @n "{signature}")) @def
+        (decorated_definition (function_definition name: (identifier) @n (#eq? @n "{signature}"))) @def
+        """)
+    # ... (capture parsing remains the same) ...
+
+```
+
+### 2. Dynamic Indentation Normalization
+
+To prevent `SyntaxError: expected an indented block` when inserting nodes into classes.
+
+```python
+import textwrap
+
+def get_base_indent(source_code: str, byte_offset: int) -> str:
+    """Calculates the whitespace prefix of the line at the given offset."""
+    lines = source_code[:byte_offset].split('\n')
+    last_line = lines[-1] if lines else ""
+    return last_line[:-len(last_line.lstrip())]
+
+# Inside apply_actions_to_state for 'insert_node':
+        elif action.action == "insert_node":
+            content = new_state.get(path, "")
+            
+            if getattr(action, 'target_class_signature', None):
+                class_range = find_node_range(content, action.target_class_signature)
+                if class_range:
+                    _, end = class_range
+                    base_indent = get_base_indent(content, class_range[0]) + "    "
+                    normalized_code = textwrap.indent(textwrap.dedent(action.new_node_code), base_indent)
+                    
+                    new_state[path] = content[:end] + "\n" + normalized_code + "\n" + content[end:]
+                    continue
+            
+            new_state[path] = content.rstrip() + "\n\n" + textwrap.dedent(action.new_node_code) + "\n"
+
+```
+
+---
+
+## PART D: System Prompt Reinforcement
+
+Update `sys_prompt` to forbid dummy logic and enforce the new tools.
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "You will be provided with a strict sub-tree of the codebase. "
+    "CRITICAL RULES: \n"
+    "1. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass` or `f'{amount}'`.\n"
+    "2. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
+    "3. DOCSTRINGS: To update documentation on a large class, use 'update_docstring'. Do not rewrite the whole class.\n"
+    "4. INHERITANCE: Review the <parent_class_context> provided. Do not duplicate parent logic unnecessarily.\n"
+    "5. IMPORTS: Always use 'add_import' for new dependencies. Use exact project absolute paths.\n"
+)
+
+```

@@ -28,27 +28,32 @@ PYTHON_BUILTINS = set(dir(builtins))
 
 # --- TREE-SITTER QUERIES (v4) ---
 GLOBAL_FUNC_QUERY = PY_LANGUAGE.query("""
-(function_definition
-  name: (identifier) @func.name
-  (#not-has-parent? class_definition)
-) @func.def
+[
+    (function_definition name: (identifier) @func.name)
+    (decorated_definition (function_definition name: (identifier) @func.name))
+] @func.def
 """)
 
 CLASS_DEF_QUERY = PY_LANGUAGE.query("""
 (class_definition
   name: (identifier) @class.name
-  (argument_list
-    (identifier) @base.class
-  )?
 ) @class.def
+""")
+
+CLASS_INHERITANCE_QUERY = PY_LANGUAGE.query("""
+    (class_definition
+        name: (identifier) @class.name
+        superclasses: (argument_list (identifier) @base.name)
+    )
 """)
 
 METHOD_DEF_QUERY = PY_LANGUAGE.query("""
 (class_definition
   body: (block
-    (function_definition
-      name: (identifier) @method.name
-    ) @method.def
+    [
+        (function_definition name: (identifier) @method.name)
+        (decorated_definition (function_definition name: (identifier) @method.name))
+    ] @method.def
   )
 )
 """)
@@ -166,10 +171,14 @@ def write_class_node(class_name, file_path, docstring=""):
     with driver.session() as session:
         session.run(query, name=class_name, file=file_path, docstring=docstring, embedding=vector)
 
-def create_inheritance_relationship(sub_class_name, super_class_name):
-    query = "MATCH (sub:Class {name: $sub_class}) MERGE (super:Class {name: $super_class}) MERGE (sub)-[:IMPLEMENTS]->(super)"
+def create_inheritance_dependency(child_class, base_class):
+    query = """
+    MERGE (child:Class {name: $child_class})
+    MERGE (base:Class {name: $base_class})
+    MERGE (child)-[:INHERITS_FROM]->(base)
+    """
     with driver.session() as session:
-        session.run(query, sub_class=sub_class_name, super_class=super_class_name)
+        session.run(query, child_class=child_class, base_class=base_class)
 
 def create_has_method_relationship(class_name, method_name):
     query = "MATCH (c:Class {name: $class_name}) MERGE (m:Function {name: $method_name}) MERGE (c)-[:HAS_METHOD]->(m)"
@@ -410,13 +419,13 @@ def process_file(file_path):
             write_class_node(class_name, file_path, docstring=class_doc)
             # print(f"   ➕ Class: {class_name}")
 
-            base_captures = CLASS_DEF_QUERY.captures(class_def_node)
+            base_captures = CLASS_INHERITANCE_QUERY.captures(class_def_node)
             if isinstance(base_captures, dict):
                 base_captures = [(n, c) for c, nodes in base_captures.items() for n in nodes]
             for base_node, base_name in base_captures:
-                if base_name == 'base.class':
+                if base_name == 'base.name':
                     super_name = source_code[base_node.start_byte:base_node.end_byte]
-                    create_inheritance_relationship(class_name, super_name)
+                    create_inheritance_dependency(class_name, super_name)
 
             method_captures = METHOD_DEF_QUERY.captures(class_def_node)
             if isinstance(method_captures, dict):
