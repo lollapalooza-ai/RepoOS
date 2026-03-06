@@ -20,9 +20,57 @@ import pyflakes.reporter
 import io
 import tempfile
 import subprocess
+import libcst as cst
 
 # --- Config ---
 MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
+
+class InsertMethodTransformer(cst.CSTTransformer):
+    """Cleanly injects a new method into an existing class, handling indentation natively."""
+    def __init__(self, target_class_name: str, new_method_code: str):
+        self.target_class_name = target_class_name
+        self.new_method_node = cst.parse_statement(new_method_code)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
+        if original_node.name.value == self.target_class_name:
+            # Append the new method; LibCST automatically aligns the whitespace!
+            new_body = list(updated_node.body.body) + [self.new_method_node]
+            return updated_node.with_changes(
+                body=updated_node.body.with_changes(body=new_body)
+            )
+        return updated_node
+
+class ModifyNodeTransformer(cst.CSTTransformer):
+    """Replaces a function/method while mathematically guaranteeing decorator preservation."""
+    def __init__(self, target_node_name: str, new_node_code: str):
+        self.target_node_name = target_node_name.split('.')[-1] # Strip class prefix if present
+        
+        # Parse the LLM's proposed replacement logic
+        parsed_module = cst.parse_module(new_node_code)
+        self.new_node_ast = parsed_module.body[0]
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        if original_node.name.value == self.target_node_name:
+            
+            # THE DECORATOR SHIELD:
+            # Forcibly graft the original node's decorators onto the new node.
+            # This prevents the LLM from accidentally deleting @property, @atomic, etc.
+            safe_new_node = self.new_node_ast.with_changes(
+                decorators=original_node.decorators
+            )
+            return safe_new_node
+            
+        return updated_node
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        if original_node.name.value == self.target_node_name:
+            # Same shield applies to Class decorators (e.g., @dataclass)
+            safe_new_node = self.new_node_ast.with_changes(
+                decorators=original_node.decorators
+            )
+            return safe_new_node
+            
+        return updated_node
 VENV_PYTHON = "./venv/bin/python3"
 
 def get_mypy_errors(filepath: str) -> set:
@@ -111,6 +159,38 @@ def get_namespace_identifiers(file_content: str) -> set:
         pass # Handle syntax errors separately in the main loop
     return identifiers
 
+def format_and_validate_python(content: str, filepath: str = "temp.py") -> tuple[bool, str, str]:
+    """Runs ruff to auto-format, then pyflakes to validate semantics."""
+    # 1. Linter-in-the-Loop: Auto-format with Ruff
+    try:
+        ruff_result = subprocess.run(
+            ["ruff", "format", "-", "--stdin-filename", filepath],
+            input=content,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        formatted_content = ruff_result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, f"Ruff Formatting Error: {e.stderr}", content
+
+    # 2. Syntax Check (Sanity)
+    try:
+        ast.parse(formatted_content)
+    except SyntaxError as e:
+        return False, f"SyntaxError: {str(e)}", formatted_content
+    
+    # 3. Semantic Check (NameErrors / missing imports)
+    output = io.StringIO()
+    reporter = pyflakes.reporter.Reporter(output, output)
+    pyflakes.api.check(formatted_content, filepath, reporter)
+    
+    errors = output.getvalue()
+    if "undefined name" in errors:
+        return False, f"Missing Import detected: {errors.strip()}. You MUST use 'add_import'.", formatted_content
+    
+    return True, "", formatted_content
+
 def is_semantically_valid(content: str) -> tuple[bool, str]:
     # 1. Anti-Placeholder Guardrail
     forbidden_phrases = [
@@ -126,22 +206,8 @@ def is_semantically_valid(content: str) -> tuple[bool, str]:
         if phrase in content_lower:
             return False, f"Code contains forbidden placeholder: '{phrase}'. Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
     
-    # 2. Syntax Check
-    try:
-        ast.parse(content)
-    except SyntaxError as e:
-        return False, f"SyntaxError during AST parse: {str(e)}"
-
-    # 3. Semantic Check (Catches missing imports / undefined names)
-    output = io.StringIO()
-    reporter = pyflakes.reporter.Reporter(output, output)
-    pyflakes.api.check(content, '', reporter)
-
-    errors = output.getvalue()
-    if "undefined name" in errors:
-        return False, f"Missing Import detected: {errors.strip()}. You MUST use 'add_import'."
-
     return True, ""
+
 
 # --- Pydantic Validators (Phase 4: Anti-Hallucination) ---
 def validate_no_placeholder_paths(v: str) -> str:
@@ -237,17 +303,26 @@ class UpdateDocstring(BaseModel):
     @classmethod
     def check_path(cls, v): return validate_no_placeholder_paths(v)
 
+class DeleteLines(BaseModel):
+    action: Literal["delete_lines"] = "delete_lines"
+    file_path: str = Field(..., description="Path to the file.")
+    exact_string_match: str = Field(..., description="The exact line(s) of code to delete (e.g., 'Field.register_lookup(ReverseStartsWith)').")
+
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
+
 # --- Define the dynamic Unions (Phase 1: Dynamic Schema Pruning) ---
 class RefactorProposalSafe(BaseModel):
     """Schema used for standard refactoring. DeleteFile is mathematically impossible."""
-    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of safe refactoring actions.")
+    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of safe refactoring actions.")
 
 class RefactorProposalUnsafe(BaseModel):
     """Schema used ONLY when the user explicitly requests a deletion."""
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of refactoring actions, including deletion.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of refactoring actions, including deletion.")
 
 class RefactorProposal(BaseModel):
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of discrete refactoring actions.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of discrete refactoring actions.")
 
 
 # --- Config ---
@@ -275,6 +350,14 @@ async def generate_streaming_json(system_prompt: str, user_prompt: str, response
         options={'temperature': 0.1}
     ):
         yield part['message']['content']
+
+def get_node_indent(source_code: str, start_byte: int) -> str:
+    """Calculates the exact indentation of the line where a node starts."""
+    # Find the start of the line containing the start_byte
+    line_start = source_code.rfind('\n', 0, start_byte) + 1
+    line_text = source_code[line_start:start_byte]
+    # Return just the whitespace
+    return line_text[:-len(line_text.lstrip())]
 
 def get_base_indent(source_code: str, byte_offset: int) -> str:
     """Finds the whitespace indentation level at a specific byte offset."""
@@ -434,11 +517,11 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 print(f"❌ Modify Error: File {path} not found in state.")
                 continue
             content = new_state[path]
+            
+            # Phase 3: AST Volume Conservation Guardrail (String based for safety)
             node_range = find_node_range(content, action.target_node_signature)
             if node_range:
                 start, end = node_range
-                
-                # Phase 3: AST Volume Conservation Guardrail
                 original_node_text = content[start:end]
                 orig_len = len(original_node_text.strip())
                 new_len = len(action.proposed_replace_string.strip())
@@ -446,18 +529,29 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 # If the new code is less than 50% the size of the old code, raise an alarm
                 if orig_len > 100 and new_len < (orig_len * 0.5):
                     # Whitelist intents that legitimately shrink code volume
-                    allowed_intents = ["remove", "delete", "extract", "move", "split", "break down"]
-                    if not any(word in intent.lower() for word in allowed_intents):
+                    allowed_intents = ["remove", "delete", "extract", "move", "split", "break down", "delegate"]
+                    # Also check if the LLM is explicitly calling a new helper method
+                    is_calling_helper = "def " not in action.proposed_replace_string and "(" in action.proposed_replace_string
+                    
+                    if not any(word in intent.lower() for word in allowed_intents) and not is_calling_helper:
                         raise ValueError(
                             f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
-                            f"You attempted to replace a large block of code ({orig_len} chars) with a significantly smaller one ({new_len} chars). "
-                            "Do not use dummy implementations or placeholders. Write the COMPLETE executable code."
+                            f"You attempted to replace a large block of code with a significantly smaller one. "
+                            "Do not use dummy implementations (like 'pass'). Write the COMPLETE executable code."
                         )
 
-                new_state[path] = content[:start] + action.proposed_replace_string + content[end:]
-                print(f"   🎯 Applied AST-targeted replacement to {path} at node '{action.target_node_signature}'")
-            else:
-                print(f"❌ Modify Error: Node '{action.target_node_signature}' not found in {path}.")
+            # Phase 3: LibCST Modification Engine
+            try:
+                source_tree = cst.parse_module(content)
+                transformer = ModifyNodeTransformer(
+                    target_node_name=action.target_node_signature,
+                    new_node_code=action.proposed_replace_string
+                )
+                modified_tree = source_tree.visit(transformer)
+                new_state[path] = modified_tree.code
+                print(f"   🔄 [LibCST] Modified {action.target_node_signature} (Decorators Preserved)")
+            except Exception as e:
+                raise ValueError(f"LibCST modification failed for '{action.target_node_signature}': {e}")
 
         elif action.action == "move_node":
             source_path = resolve_path(action.source_file, master_state)
@@ -557,17 +651,18 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             
             # If inserting a method into a class (detected by dot notation in the prompt/context)
             if getattr(action, 'target_class_signature', None):
-                class_range = find_node_range(content, action.target_class_signature)
-                if class_range:
-                    _, end = class_range
-                    # Calculate class indent + 4 spaces
-                    base_indent = get_base_indent(content, class_range[0]) + "    "
-                    normalized_code = textwrap.indent(textwrap.dedent(action.new_node_code), base_indent)
-                    
-                    # Insert right before the end of the class block
-                    new_state[path] = content[:end] + "\n" + normalized_code + "\n" + content[end:]
-                    print(f"   ➕ Inserted method into {action.target_class_signature}")
+                try:
+                    source_tree = cst.parse_module(content)
+                    transformer = InsertMethodTransformer(
+                        target_class_name=action.target_class_signature.split('.')[-1],
+                        new_method_code=action.new_node_code
+                    )
+                    modified_tree = source_tree.visit(transformer)
+                    new_state[path] = modified_tree.code
+                    print(f"   🔄 [LibCST] Inserted method into {action.target_class_signature}")
                     continue
+                except Exception as e:
+                    raise ValueError(f"LibCST insertion failed for '{action.target_class_signature}': {e}")
             
             # Fallback: Append to EOF with no indent
             new_state[path] = content.rstrip() + "\n\n" + textwrap.dedent(action.new_node_code) + "\n"
@@ -593,6 +688,15 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 updated_node = pattern.sub(replacement, node_code, count=1)
                 new_state[path] = content[:start] + updated_node + content[end:]
                 print(f"   📝 Updated docstring for {action.target_node_signature}")
+
+        elif action.action == "delete_lines":
+            if path in new_state:
+                content = new_state[path]
+                if action.exact_string_match in content:
+                    new_state[path] = content.replace(action.exact_string_match, "")
+                    # Clean up blank lines left behind
+                    new_state[path] = re.sub(r'\n\s*\n', '\n\n', new_state[path])
+                    print(f"   ✂️ Deleted specified lines from {path}")
         
     return new_state
 
@@ -787,13 +891,11 @@ async def main():
         
         sys_prompt = (
             "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
-            "You will be provided with a strict sub-tree of the codebase. "
             "CRITICAL RULES: \n"
-            "1. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass` or `f'{amount}'`.\n"
-            "2. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
-            "3. DOCSTRINGS: To update documentation on a large class, use 'update_docstring'. Do not rewrite the whole class.\n"
-            "4. INHERITANCE: Review the <parent_class_context> provided. Do not duplicate parent logic unnecessarily.\n"
-            "5. IMPORTS: Always use 'add_import' for new dependencies. Use exact project absolute paths.\n"
+            "1. FOCUS ON LOGIC: The execution engine automatically handles PEP-8 whitespace formatting and preserves existing decorators (like @property). Focus your tokens entirely on writing the correct, complete internal business logic.\n"
+            "2. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+            "3. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
+            "4. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
@@ -833,6 +935,15 @@ async def main():
                             error_msg = f"Verification failed for {path}: {error}"
                             syntax_error = True
                             break
+                            
+                        # Format and Validate
+                        valid, error, formatted_content = format_and_validate_python(new_state[path], filepath=path)
+                        if not valid:
+                            error_msg = f"Formatting/Validation failed for {path}: {error}"
+                            syntax_error = True
+                            break
+                        else:
+                            new_state[path] = formatted_content
                 
                 if not syntax_error:
                     # Phase 2: Differential Static Analysis

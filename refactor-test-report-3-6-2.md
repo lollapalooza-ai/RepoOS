@@ -2,6 +2,8 @@
 
 This report documents the results of rerunning the 20 refactoring tests after a seventh round of senior engineer fixes to RepoOS.
 
+| Test # | Prompt | Status | Correctness (1-5) | Summary |
+|---|---|---|---|---|
 | 1 | Move `UnicodeCSVWriter` to a Dedicated CSV Utility Module | Success | 4 | Correctly moved the class and resolved imports via self-healing. Correct path in reports.py. |
 | 2 | Add Type Hinting to `oscar/core/loading.py` | Partial | 4 | Added type hints to 3 of 4 functions and resolved imports. Failed on `get_classes` due to pre-existing type mismatch. |
 | 3 | Modernize `get_user_model` in `oscar/core/compat.py` | Success | 5 | Correctly removed obsolete comments and `_meta` annotations as requested. |

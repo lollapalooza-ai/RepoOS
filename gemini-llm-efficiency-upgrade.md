@@ -1462,3 +1462,266 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
             pattern = re.compile(r'(^(?:[ \t]*)(?:def|async def|class)\s+[^:]+:[^\n]*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
 
 ```
+
+# Milestone 3.6.3 Hardening Indentation & Extraction Logic
+
+# ENGINEERING BRIEF: Hardening Indentation & Extraction Logic (Suite 3.6.2 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching Indentation Math, Volume Bypass, and Free-Floating Nodes
+
+Please implement these four upgrades into `refactor2.py` to resolve the final friction points.
+
+### Phase 1: Robust Indentation Math
+
+**Task:** Stop calculating indentation based on the preceding line. Calculate it based on the AST definition line of the parent node.
+**Implementation:** Update `get_base_indent` and the `insert_node` / `update_docstring` logic.
+
+```python
+def get_node_indent(source_code: str, start_byte: int) -> str:
+    """Calculates the exact indentation of the line where a node starts."""
+    # Find the start of the line containing the start_byte
+    line_start = source_code.rfind('\n', 0, start_byte) + 1
+    line_text = source_code[line_start:start_byte]
+    # Return just the whitespace
+    return line_text[:-len(line_text.lstrip())]
+
+# Inside apply_actions_to_state for 'insert_node':
+        elif action.action == "insert_node":
+            content = new_state.get(path, "")
+            
+            if getattr(action, 'target_class_signature', None):
+                class_range = find_node_range(content, action.target_class_signature)
+                if class_range:
+                    class_start, class_end = class_range
+                    # The new method's indent is exactly the class's indent + 4 spaces
+                    base_indent = get_node_indent(content, class_start) + "    "
+                    normalized_code = textwrap.indent(textwrap.dedent(action.new_node_code), base_indent)
+                    
+                    new_state[path] = content[:class_end] + "\n" + normalized_code + "\n" + content[class_end:]
+                    continue
+
+```
+
+### Phase 2: Resolving the "Empty Extraction" Trap
+
+**Task:** The Volume Conservation check must whitelist operations that are explicitly moving or extracting logic, so the LLM doesn't feel forced to create empty methods to bypass the alarm.
+
+**Implementation:** Update the `modify_node` volume check bypass.
+
+```python
+        # Phase 3: AST Volume Conservation Guardrail
+        # ... (orig_len and new_len calculation) ...
+        
+        if orig_len > 100 and new_len < (orig_len * 0.5):
+            # Whitelist intents that legitimately shrink code volume
+            allowed_intents = ["remove", "delete", "extract", "move", "split", "break down", "delegate"]
+            # Also check if the LLM is explicitly calling a new helper method
+            is_calling_helper = "def " not in action.proposed_replace_string and "(" in action.proposed_replace_string
+            
+            if not any(word in intent.lower() for word in allowed_intents) and not is_calling_helper:
+                raise ValueError(
+                    f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
+                    f"You attempted to replace a large block of code with a significantly smaller one. "
+                    "Do not use dummy implementations (like 'pass'). Write the COMPLETE executable code."
+                )
+
+```
+
+### Phase 3: The `DeleteLines` Primitive (For Free-Floating Nodes)
+
+**Task:** Give the LLM a way to delete registration calls or module-level execution lines that aren't wrapped in a function, which `MoveNode` leaves behind.
+
+**Implementation:** Add a regex-based `DeleteLines` action to the Pydantic schema.
+
+```python
+class DeleteLines(BaseModel):
+    action: Literal["delete_lines"] = "delete_lines"
+    file_path: str = Field(..., description="Path to the file.")
+    exact_string_match: str = Field(..., description="The exact line(s) of code to delete (e.g., 'Field.register_lookup(ReverseStartsWith)').")
+
+# Add to the Action Unions, then in apply_actions_to_state:
+        elif action.action == "delete_lines":
+            if path in new_state:
+                content = new_state[path]
+                if action.exact_string_match in content:
+                    new_state[path] = content.replace(action.exact_string_match, "")
+                    # Clean up blank lines left behind
+                    new_state[path] = re.sub(r'\n\s*\n', '\n\n', new_state[path])
+                    print(f"   ✂️ Deleted specified lines from {path}")
+
+```
+
+### Phase 4: System Prompt - Forcing Extraction Completion
+
+**Task:** Stop the LLM from hallucinating `self` in static contexts and force it to complete extractions.
+
+**Implementation:** Append these rules to the `sys_prompt`.
+
+```python
+    "6. EXTRACTION COMPLETENESS: If you are asked to extract logic, you MUST create the new utility function WITH the full logic, and you MUST update the original caller to use the new function. Do not leave either empty.\n"
+    "7. SCOPE AWARENESS: Do not use `self` inside global utility functions or static decorators unless explicitly passed as an argument.\n"
+
+```
+
+# Milestone 3.6.4 The CST Migration & Linter-in-the-Loop
+
+# ENGINEERING BRIEF: The CST Migration & Linter-in-the-Loop (Suite 3.6.3)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Migrating to LibCST for Immutable Decorators and Indentation Safety
+**Context:** Our string-based AST manipulation is causing unrecoverable indentation loops and allowing the LLM to accidentally destroy Django decorators (like `@transaction.atomic`) when modifying nodes. We are migrating `InsertNode` and `ModifyNode` to `LibCST` to mathematically guarantee whitespace formatting and decorator preservation, backed by a `ruff` pre-formatting loop.
+
+Please install the dependencies (`pip install libcst ruff`), and implement the following three phases into `refactor2.py`.
+
+---
+
+### Phase 1: The Linter-in-the-Loop (`ruff format`)
+
+**Task:** Intercept the LLM's raw output and run it through `ruff` in memory to fix any trailing commas or minor whitespace errors *before* Pyflakes validation.
+
+```python
+import subprocess
+import ast
+import io
+import pyflakes.api
+import pyflakes.reporter
+
+def format_and_validate_python(content: str, filepath: str = "temp.py") -> tuple[bool, str, str]:
+    """Runs ruff to auto-format, then pyflakes to validate semantics."""
+    # 1. Linter-in-the-Loop: Auto-format with Ruff
+    try:
+        ruff_result = subprocess.run(
+            ["ruff", "format", "-", "--stdin-filename", filepath],
+            input=content,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        formatted_content = ruff_result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, f"Ruff Formatting Error: {e.stderr}", content
+
+    # 2. Syntax Check (Sanity)
+    try:
+        ast.parse(formatted_content)
+    except SyntaxError as e:
+        return False, f"SyntaxError: {str(e)}", formatted_content
+    
+    # 3. Semantic Check (NameErrors / missing imports)
+    output = io.StringIO()
+    reporter = pyflakes.reporter.Reporter(output, output)
+    pyflakes.api.check(formatted_content, filepath, reporter)
+    
+    errors = output.getvalue()
+    if "undefined name" in errors:
+        return False, f"Missing Import detected: {errors.strip()}. You MUST use 'add_import'.", formatted_content
+    
+    return True, "", formatted_content
+
+```
+
+---
+
+### Phase 2: LibCST Insertion Engine
+
+**Task:** Migrate `InsertNode` to `LibCST` so it inherently calculates class-level indentation.
+
+```python
+import libcst as cst
+
+class InsertMethodTransformer(cst.CSTTransformer):
+    """Cleanly injects a new method into an existing class, handling indentation natively."""
+    def __init__(self, target_class_name: str, new_method_code: str):
+        self.target_class_name = target_class_name
+        self.new_method_node = cst.parse_statement(new_method_code)
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
+        if original_node.name.value == self.target_class_name:
+            # Append the new method; LibCST automatically aligns the whitespace!
+            new_body = list(updated_node.body.body) + [self.new_method_node]
+            return updated_node.with_changes(
+                body=updated_node.body.with_changes(body=new_body)
+            )
+        return updated_node
+
+# Integration inside apply_actions_to_state for 'insert_node'
+# (See previous brief for integration logic using cst.parse_module)
+
+```
+
+---
+
+### Phase 3: LibCST Modification Engine & The "Decorator Shield"
+
+**Task:** Migrate `ModifyNode` to LibCST. Intercept the node replacement and manually copy the `decorators` attribute from the old AST node to the new LLM-generated node.
+
+```python
+class ModifyNodeTransformer(cst.CSTTransformer):
+    """Replaces a function/method while mathematically guaranteeing decorator preservation."""
+    def __init__(self, target_node_name: str, new_node_code: str):
+        self.target_node_name = target_node_name.split('.')[-1] # Strip class prefix if present
+        
+        # Parse the LLM's proposed replacement logic
+        parsed_module = cst.parse_module(new_node_code)
+        self.new_node_ast = parsed_module.body[0]
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        if original_node.name.value == self.target_node_name:
+            
+            # THE DECORATOR SHIELD:
+            # Forcibly graft the original node's decorators onto the new node.
+            # This prevents the LLM from accidentally deleting @property, @atomic, etc.
+            safe_new_node = self.new_node_ast.with_changes(
+                decorators=original_node.decorators
+            )
+            return safe_new_node
+            
+        return updated_node
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
+        if original_node.name.value == self.target_node_name:
+            # Same shield applies to Class decorators (e.g., @dataclass)
+            safe_new_node = self.new_node_ast.with_changes(
+                decorators=original_node.decorators
+            )
+            return safe_new_node
+            
+        return updated_node
+
+# Integration inside apply_actions_to_state for 'modify_node':
+        elif action.action == "modify_node":
+            content = new_state.get(path, "")
+            try:
+                source_tree = cst.parse_module(content)
+                transformer = ModifyNodeTransformer(
+                    target_node_name=action.target_node_signature,
+                    new_node_code=action.proposed_replace_string
+                )
+                modified_tree = source_tree.visit(transformer)
+                new_state[path] = modified_tree.code
+                print(f"   🔄 [LibCST] Modified {action.target_node_signature} (Decorators Preserved)")
+            except Exception as e:
+                raise ValueError(f"LibCST modification failed: {e}")
+
+```
+
+---
+
+### Phase 4: System Prompt Reinforcement
+
+**Task:** Update the system prompt to inform the LLM that the execution engine handles formatting and decorators, freeing up its token budget for pure logic.
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "CRITICAL RULES: \n"
+    "1. FOCUS ON LOGIC: The execution engine automatically handles PEP-8 whitespace formatting and preserves existing decorators (like @property). Focus your tokens entirely on writing the correct, complete internal business logic.\n"
+    "2. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+    "3. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
+    "4. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+)
+
+```
