@@ -144,11 +144,17 @@ def is_semantically_valid(content: str) -> tuple[bool, str]:
 
 # --- Pydantic Validators (Phase 4: Anti-Hallucination) ---
 def validate_no_placeholder_paths(v: str) -> str:
-    forbidden_substrings = ["path/to", "your/file", "source/file", "target/file", "...", "<"]
+    forbidden_substrings = ["path/to", "your/file", "source/file", "target/file", "...", "<", "my_module"]
     v_lower = v.lower()
+    
     for sub in forbidden_substrings:
         if sub in v_lower:
             raise ValueError(f"Invalid path hallucination detected: '{v}'. You MUST output exact repository paths from the context.")
+            
+    # Traversal attack / bad structure protection
+    if '..' in v or v.startswith('/'):
+        raise ValueError("Path must be a relative repository path, no absolute paths or traversal.")
+        
     return v
 
 # --- Pydantic Models (Step 2: Constrained Decoding) ---
@@ -210,17 +216,36 @@ class MoveNode(BaseModel):
     @classmethod
     def check_path(cls, v): return validate_no_placeholder_paths(v)
 
+class InsertNode(BaseModel):
+    action: Literal["insert_node"] = "insert_node"
+    file_path: str = Field(..., description="Path to the existing file.")
+    new_node_code: str = Field(..., description="The complete code for the new function or class.")
+    
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
+
+class UpdateDocstring(BaseModel):
+    action: Literal["update_docstring"] = "update_docstring"
+    file_path: str = Field(..., description="Path to the file.")
+    target_node_signature: str = Field(..., description="The function or class name.")
+    new_docstring: str = Field(..., description="The new docstring text, including quotes.")
+
+    @field_validator('file_path')
+    @classmethod
+    def check_path(cls, v): return validate_no_placeholder_paths(v)
+
 # --- Define the dynamic Unions (Phase 1: Dynamic Schema Pruning) ---
 class RefactorProposalSafe(BaseModel):
     """Schema used for standard refactoring. DeleteFile is mathematically impossible."""
-    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of safe refactoring actions.")
+    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of safe refactoring actions.")
 
 class RefactorProposalUnsafe(BaseModel):
     """Schema used ONLY when the user explicitly requests a deletion."""
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of refactoring actions, including deletion.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of refactoring actions, including deletion.")
 
 class RefactorProposal(BaseModel):
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]] = Field(..., description="A list of discrete refactoring actions.")
+    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring]] = Field(..., description="A list of discrete refactoring actions.")
 
 
 # --- Config ---
@@ -254,24 +279,36 @@ def extract_name_from_signature(signature: str) -> str:
     return signature.split('.')[-1]
 
 def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
-    """Uses tree-sitter to find the byte range of a function or class."""
+    """Uses tree-sitter to find the byte range of a function, class, or nested method."""
     tree = parser.parse(bytes(source_code, "utf8"))
-    
-    # Query for functions or classes with the given name
-    query = PY_LANGUAGE.query(f"""
-    (function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
-    (class_definition name: (identifier) @name (#eq? @name "{signature}")) @def
-    """)
-    
+
+    # Handle Nested Class Methods (e.g., 'AbstractAddress.as_text')
+    if "." in signature:
+        class_name, method_name = signature.split(".", 1)
+        query = PY_LANGUAGE.query(f"""
+        (class_definition 
+            name: (identifier) @cls_name (#eq? @cls_name "{class_name}")
+            body: (block
+                (function_definition 
+                    name: (identifier) @meth_name (#eq? @meth_name "{method_name}")
+                ) @def
+            )
+        )
+        """)
+    # Handle Global Functions or Classes
+    else:
+        query = PY_LANGUAGE.query(f"""
+        (function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        (class_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        """)
+
     captures = query.captures(tree.root_node)
     if isinstance(captures, dict):
         nodes = captures.get('def', [])
-        if nodes:
-            return nodes[0].start_byte, nodes[0].end_byte
+        if nodes: return nodes[0].start_byte, nodes[0].end_byte
     elif captures:
         for node, name in captures:
-            if name == 'def':
-                return node.start_byte, node.end_byte
+            if name == 'def': return node.start_byte, node.end_byte
     return None
 
 def resolve_path(target_path: str, master_state: dict) -> str:
@@ -489,12 +526,15 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 content = new_state.get(file_path, master_state.get(file_path))
                 if content:
                     # Replace the old import with the new one
-                    # This is a simple string replacement; a more robust way would be AST or regex
                     old_import = f"from {old_module_path} import {node_name}"
                     new_import = f"from {new_module_path} import {node_name}"
                     
                     if old_import in content:
-                        new_state[file_path] = content.replace(old_import, new_import)
+                        # Replace the old import line entirely, leaving the new one
+                        new_state[file_path] = content.replace(old_import + "\n", "")
+                        new_state[file_path] = new_state[file_path].replace(old_import, "")
+                        # Add the new import to the top of the file
+                        new_state[file_path] = new_import + "\n" + new_state[file_path]
                         print(f"   ⚓ Automatically updated downstream import in {file_path}")
 
         elif action.action == "add_import":
@@ -505,6 +545,33 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 # Add at the top
                 new_state[path] = action.import_statement + "\n" + content
                 print(f"   ⚓ Added import to {path}: {action.import_statement}")
+
+        elif action.action == "insert_node":
+            if path not in new_state: continue
+            content = new_state[path]
+            # Safely append to EOF
+            new_state[path] = content.rstrip() + "\n\n" + action.new_node_code + "\n"
+            print(f"   ➕ Inserted new node into {path}")
+
+        elif action.action == "update_docstring":
+            if path not in new_state: continue
+            content = new_state[path]
+            node_range = find_node_range(content, action.target_node_signature)
+            
+            if node_range:
+                start, end = node_range
+                node_code = content[start:end]
+                # Regex to safely replace or insert docstring just after the def/class signature
+                pattern = re.compile(r'(^(?:[ \t]*)(?:def|class)\s+[^\:]+\:\s*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
+                
+                def replacement(match):
+                    signature_line = match.group(1)
+                    indent = match.group(1).split(match.group(1).lstrip())[0] + "    " 
+                    return f"{signature_line}{indent}{action.new_docstring}\n"
+                
+                updated_node = pattern.sub(replacement, node_code, count=1)
+                new_state[path] = content[:start] + updated_node + content[end:]
+                print(f"   📝 Updated docstring for {action.target_node_signature}")
         
     return new_state
 
@@ -649,7 +716,8 @@ async def main():
     
     # Phase 1: Dynamic Schema Pruning
     user_intent_lower = intent.lower()
-    requires_deletion = "delete" in user_intent_lower or "remove" in user_intent_lower
+    # Only allow DeleteFile if they explicitly ask to delete a FILE or MODULE.
+    requires_deletion = bool(re.search(r'\b(delete|remove|drop)\s+(the\s+)?(file|module|script)\b', user_intent_lower))
     ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
     print(f"🛡️  Using active schema: {ActiveSchema.__name__}")
 
@@ -679,12 +747,11 @@ async def main():
             "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
             "You will be provided with a strict sub-tree of the codebase. "
             "CRITICAL RULES: \n"
-            "1. NEVER use the 'create_file' action to modify an existing file. It will wipe the file.\n"
-            "2. NO TOKEN LAZINESS. You are strictly forbidden from using placeholders like '# ...' or '# existing code'. "
-            "If you use a 'modify_node' action, you MUST output the entire, unbroken, executable code for that node.\n"
-            "3. When creating new files, ensure you include ALL necessary imports.\n"
-            "4. NEVER use the 'delete_file' action unless the user's prompt explicitly contains the words 'delete' or 'remove' for that specific file. To remove code, use 'modify_node'.\n"
-            "5. Use 'move_node' to refactor code between files while preserving integrity."
+            "1. NO TOKEN LAZINESS: If you use 'modify_node', you MUST output the entire, unbroken, executable code for that node. Never use '# existing code' or dummy implementations like `pass`.\n"
+            "2. CREATION vs MODIFICATION: If you need to add a NEW function or class to an existing file, you MUST use 'insert_node'. Do NOT use 'modify_node' for nodes that do not exist yet.\n"
+            "3. DOCSTRINGS: To update a docstring on a large class, use 'update_docstring'. Do not rewrite the whole class just to change documentation.\n"
+            "4. LOGIC PRESERVATION: When extracting logic or adding type hints, DO NOT alter the underlying functional business logic. (e.g. do not change a `min()` check to `>=`).\n"
+            "5. IMPORTS: Always use 'add_import' if your new code requires dependencies like 'typing', 'Decimal', or 'settings'.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         

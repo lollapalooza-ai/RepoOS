@@ -835,53 +835,105 @@ class CreateFile(BaseModel):
 
 # Milestone 3.5 : The Final Primitives
 
-### Engineering Brief: The Final Primitives
+This is the final hurdle. Pushing 20 complex, multi-file refactoring prompts through a local 14B parameter model and achieving these results is a massive testament to your team's architecture.
+
+By analyzing Suite 3.4, we can see exactly why the tool failed in the back half (Prompts 11-20). The LLM isn't "stupid"—it is simply being constrained by an incomplete AST parser and missing tool primitives.
+
+Specifically:
+
+1. **The Node Identification Bug (Tests 12, 14, 15, 17, 20):** Your `find_node_range` function is broken for class methods. If the LLM asks to modify `AbstractAddress.as_text`, your Tree-sitter query searches for a function named exactly `AbstractAddress.as_text`, which doesn't exist (the AST identifier is just `as_text` nested inside `AbstractAddress`).
+2. **Creation vs Modification (Tests 11, 13, 15):** The LLM tries to `ModifyNode` on functions that don't exist yet because it has no `InsertNode` tool.
+3. **Hallucination Loops:** The model defaults to dummy logic (`f'{amount:.2f}'`) or placeholder paths (`path/to/file.py`) when it runs out of tokens or gets confused.
+
+Here is the exact, comprehensive Engineering Brief to hand to your Senior Engineer. It combines "The Final Primitives" with the fixes for the AST parsing and hallucination bugs identified in Tests 11-20.
+
+---
+
+# ENGINEERING BRIEF: The "Last Mile" Refactor Stability Patch
 
 **To:** Lead/Senior AI Engineer
 **From:** Principal AI Architect
-**Subject:** Finalizing Repo OS Action Primitives (Suite 3.4 Fixes)
+**Subject:** Finalizing Repo OS Action Primitives & AST Resolution (Suite 3.4 Fixes)
+**Context:** Our 14B model is hitting a structural ceiling. It fails to identify nested class methods, hallucinates paths when confused, and attempts to modify nodes that haven't been created yet. We are deploying the final Pydantic primitives (`InsertNode`, `UpdateDocstring`), fixing the Tree-sitter method resolution, and hardening the path validators.
 
-#### Phase 1: Introduce `InsertNode` and `UpdateDocstring` Primitives
+Please implement the following five phases into `refactor2.py`.
 
-We must give the LLM the ability to append code and modify documentation without rewriting entire class bodies.
+---
 
-**Step 1:** Add these to your Pydantic schemas in `refactor2.py`.
+### Phase 1: Fixing AST Method Resolution (Fixes Tests 12, 14, 15, 17, 20)
+
+**The Problem:** `find_node_range` fails when given a dot-notation signature (e.g., `AbstractAddress.as_text`) because the raw Tree-sitter identifier is just `as_text`.
+**Task:** Upgrade `find_node_range` to dynamically build a nested Tree-sitter query if a `.` is detected in the signature.
+
+```python
+def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
+    """Uses tree-sitter to find the byte range of a function, class, or nested method."""
+    tree = parser.parse(bytes(source_code, "utf8"))
+
+    # Handle Nested Class Methods (e.g., 'AbstractAddress.as_text')
+    if "." in signature:
+        class_name, method_name = signature.split(".", 1)
+        query = PY_LANGUAGE.query(f"""
+        (class_definition 
+            name: (identifier) @cls_name (#eq? @cls_name "{class_name}")
+            body: (block
+                (function_definition 
+                    name: (identifier) @meth_name (#eq? @meth_name "{method_name}")
+                ) @def
+            )
+        )
+        """)
+    # Handle Global Functions or Classes
+    else:
+        query = PY_LANGUAGE.query(f"""
+        (function_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        (class_definition name: (identifier) @name (#eq? @name "{signature}")) @def
+        """)
+
+    captures = query.captures(tree.root_node)
+    if isinstance(captures, dict):
+        nodes = captures.get('def', [])
+        if nodes: return nodes[0].start_byte, nodes[0].end_byte
+    elif captures:
+        for node, name in captures:
+            if name == 'def': return node.start_byte, node.end_byte
+    return None
+
+```
+
+---
+
+### Phase 2: The Final Primitives (Fixes Tests 4, 9, 11, 13)
+
+**The Problem:** The LLM lacks tools to append code to existing files or cleanly update docstrings without tripping the Volume Conservation check.
+**Task:** Add `InsertNode` and `UpdateDocstring` to the Pydantic schemas, and implement their logic.
+
+**1. Add to Pydantic Models:**
 
 ```python
 class InsertNode(BaseModel):
     action: Literal["insert_node"] = "insert_node"
     file_path: str = Field(..., description="Path to the existing file.")
     new_node_code: str = Field(..., description="The complete code for the new function or class.")
-    insert_after_node: Optional[str] = Field(None, description="The signature of the node to insert after. If null, appends to EOF.")
 
 class UpdateDocstring(BaseModel):
     action: Literal["update_docstring"] = "update_docstring"
-    file_path: str
-    target_node_signature: str
+    file_path: str = Field(..., description="Path to the file.")
+    target_node_signature: str = Field(..., description="The function or class name.")
     new_docstring: str = Field(..., description="The new docstring text, including quotes.")
 
-# IMPORTANT: Add these to RefactorProposalSafe and RefactorProposalUnsafe unions!
+# IMPORTANT: Ensure these are added to both RefactorProposalSafe and RefactorProposalUnsafe Unions!
 
 ```
 
-**Step 2:** Implement the execution logic in `apply_actions_to_state`.
+**2. Execution Logic in `apply_actions_to_state`:**
 
 ```python
-        # Inside apply_actions_to_state loop:
-        
         elif action.action == "insert_node":
             if path not in new_state: continue
             content = new_state[path]
-            
-            if hasattr(action, 'insert_after_node') and action.insert_after_node:
-                node_range = find_node_range(content, action.insert_after_node)
-                if node_range:
-                    _, end = node_range
-                    new_state[path] = content[:end] + "\n\n" + action.new_node_code + content[end:]
-                    continue
-            
-            # Fallback: Append to End of File
-            new_state[path] = content.rstrip() + "\n\n" + action.new_node_code
+            # Safely append to EOF
+            new_state[path] = content.rstrip() + "\n\n" + action.new_node_code + "\n"
             print(f"   ➕ Inserted new node into {path}")
 
         elif action.action == "update_docstring":
@@ -893,12 +945,11 @@ class UpdateDocstring(BaseModel):
                 start, end = node_range
                 node_code = content[start:end]
                 # Regex to safely replace or insert docstring just after the def/class signature
-                # Matches `def foo(...):` or `class Foo(...):` and inserts docstring
                 pattern = re.compile(r'(^(?:[ \t]*)(?:def|class)\s+[^\:]+\:\s*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
                 
                 def replacement(match):
                     signature_line = match.group(1)
-                    indent = match.group(1).split(match.group(1).lstrip())[0] + "    " # Infer indent
+                    indent = match.group(1).split(match.group(1).lstrip())[0] + "    " 
                     return f"{signature_line}{indent}{action.new_docstring}\n"
                 
                 updated_node = pattern.sub(replacement, node_code, count=1)
@@ -907,57 +958,75 @@ class UpdateDocstring(BaseModel):
 
 ```
 
-#### Phase 2: Fix the `DeleteFile` False Positive Regex
+---
 
-We must only allow `DeleteFile` if the user explicitly mentions deleting a *file*, not just "removing comments."
+### Phase 3: Pydantic Path Hardening (Fixes Tests 13, 16, 19)
 
-**Step 1:** Update the schema selection logic (around line 1185).
+**The Problem:** The LLM hallucinates paths (e.g., `oscar/apps/checkout/src/exceptions.py`).
+**Task:** Upgrade `validate_no_placeholder_paths` using Pydantic V2 `@field_validator` string matching to trap hallucinations mathematically.
 
 ```python
-# Phase 1: Dynamic Schema Pruning (Hardened Regex)
-user_intent_lower = intent.lower()
-# Only trigger unsafe schema if they explicitly mention deleting a file/module
-requires_deletion = bool(re.search(r'\b(delete|remove|drop)\s+(the\s+)?(file|module|script)\b', user_intent_lower))
-ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
-print(f"🛡️  Using active schema: {ActiveSchema.__name__}")
+def validate_no_placeholder_paths(v: str) -> str:
+    forbidden_substrings = ["path/to", "your/file", "source/file", "target/file", "...", "<", "my_module"]
+    v_lower = v.lower()
+    
+    for sub in forbidden_substrings:
+        if sub in v_lower:
+            raise ValueError(f"Invalid path hallucination detected: '{v}'. You MUST output exact repository paths from the context.")
+            
+    # Traversal attack / bad structure protection
+    if '..' in v or v.startswith('/'):
+        raise ValueError("Path must be a relative repository path, no absolute paths or traversal.")
+        
+    return v
 
 ```
 
-#### Phase 3: Robust Downstream Import Replacement
+---
 
-We must handle comma-separated imports when executing a `MoveNode` downstream update.
+### Phase 4: Dynamic Schema Pruning & Import Cleanup (Fixes Tests 1 & 10)
 
-**Step 1:** Upgrade the Python string replacement logic in `apply_actions_to_state` (around line 1050).
+**Task 1: Fix `DeleteFile` Bias**
+Update the intent parser (around line 2931) to use strict regex so it doesn't arm the `delete_file` tool just because the user said "remove comments".
 
 ```python
-        # 2. Deterministic Regex String Replacement for Imports
-        old_module_path = path_to_python_module(source_path)
-        new_module_path = path_to_python_module(target_path)
+user_intent_lower = intent.lower()
+# Only allow DeleteFile if they explicitly ask to delete a FILE or MODULE.
+requires_deletion = bool(re.search(r'\b(delete|remove|drop)\s+(the\s+)?(file|module|script)\b', user_intent_lower))
+ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
 
-        for file_path in affected_files:
-            content = new_state.get(file_path, master_state.get(file_path))
-            if content:
-                # Regex to match: from oscar.core.compat import A, UnicodeCSVWriter, B
-                # And safely extract UnicodeCSVWriter while leaving the rest
-                import_pattern = re.compile(rf"^(from\s+{re.escape(old_module_path)}\s+import\s+)(.*)$", re.MULTILINE)
-                
-                def import_replacer(match):
-                    prefix = match.group(1)
-                    imported_items = [item.strip() for item in match.group(2).split(',')]
-                    
-                    if node_name in imported_items:
-                        imported_items.remove(node_name)
-                        new_import_line = f"from {new_module_path} import {node_name}"
-                        
-                        if not imported_items:
-                            return new_import_line # Replaced entirely
-                        else:
-                            # Keep the old line (minus the moved node) and append the new line
-                            remaining_import = f"{prefix}{', '.join(imported_items)}"
-                            return f"{remaining_import}\n{new_import_line}"
-                    return match.group(0)
+```
 
-                new_state[file_path] = import_pattern.sub(import_replacer, content)
-                print(f"   ⚓ Safely re-routed downstream import in {file_path}")
+**Task 2: Robust Downstream Imports**
+In `apply_actions_to_state` for `move_node`, update the string replacement (around line 2795) to remove the old import entirely.
+
+```python
+        if old_import in content:
+            # Replace the old import line entirely, leaving the new one
+            new_state[file_path] = content.replace(old_import + "\n", "")
+            new_state[file_path] = new_state[file_path].replace(old_import, "")
+            # Add the new import to the top of the file
+            new_state[file_path] = new_import + "\n" + new_state[file_path]
+
+```
+
+---
+
+### Phase 5: The Ultimate System Prompt Upgrade
+
+**The Problem:** The LLM uses `ModifyNode` to change `min()` logic to `>=` (Test 17) or uses it on non-existent functions.
+**Task:** Replace your current `sys_prompt` with this strict, behavior-modifying instruction set.
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "You will be provided with a strict sub-tree of the codebase. "
+    "CRITICAL RULES: \n"
+    "1. NO TOKEN LAZINESS: If you use 'modify_node', you MUST output the entire, unbroken, executable code for that node. Never use '# existing code' or dummy implementations like `pass`.\n"
+    "2. CREATION vs MODIFICATION: If you need to add a NEW function or class to an existing file, you MUST use 'insert_node'. Do NOT use 'modify_node' for nodes that do not exist yet.\n"
+    "3. DOCSTRINGS: To update a docstring on a large class, use 'update_docstring'. Do not rewrite the whole class just to change documentation.\n"
+    "4. LOGIC PRESERVATION: When extracting logic or adding type hints, DO NOT alter the underlying functional business logic. (e.g. do not change a `min()` check to `>=`).\n"
+    "5. IMPORTS: Always use 'add_import' if your new code requires dependencies like 'typing', 'Decimal', or 'settings'.\n"
+)
 
 ```
