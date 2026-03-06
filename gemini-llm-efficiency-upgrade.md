@@ -1364,3 +1364,101 @@ sys_prompt = (
 )
 
 ```
+
+# Milestone 3.6.2: Hardening the AST Edge Cases (Suite 3.6 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching AST Strictness, Volume Traps, and Import Routing
+
+Please implement these four precise, copy-pasteable upgrades into `refactor2.py`.
+
+### Phase 1: Fixing the Import Routing Bug
+
+**Task:** Stop `path_to_python_module`  from destroying the Django app namespace.
+
+* **Implementation:**
+
+```python
+def path_to_python_module(filepath: str) -> str:
+    """Converts a file path to a python module path without destroying app namespaces."""
+    path = filepath
+    if path.endswith(".py"): path = path[:-3]
+    
+    # ONLY strip src/ or other top-level project wrappers. 
+    # Do NOT strip 'oscar/' as that is the actual root package namespace.
+    if path.startswith("src/"):
+        path = path[4:]
+        
+    return path.replace("/", ".").replace("\\", ".")
+
+```
+
+### Phase 2: Node Signature Sanitization
+
+**Task:** Upgrade `find_node_range`  to ignore parameters if the LLM hallucinates the full function signature instead of just the name.
+
+* **Implementation:**
+
+```python
+def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int]]:
+    """Uses tree-sitter to find the byte range, sanitizing LLM hallucinations."""
+    # Fix: Strip out anything after '(' so 'get_model(arg1, arg2)' becomes 'get_model'
+    clean_sig = signature.split('(')[0].strip()
+    
+    tree = parser.parse(bytes(source_code, "utf8"))
+
+    if "." in clean_sig:
+        class_name, method_name = clean_sig.split(".", 1)
+        query = PY_LANGUAGE.query(f"""
+        (class_definition name: (identifier) @cls (#eq? @cls "{class_name}")
+            body: (block [
+                (function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
+                (decorated_definition (function_definition name: (identifier) @meth (#eq? @meth "{method_name}")))
+                (async_function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
+            ] @def )
+        )
+        """)
+    else:
+        query = PY_LANGUAGE.query(f"""
+        (function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
+        (class_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
+        (decorated_definition (function_definition name: (identifier) @n (#eq? @n "{clean_sig}"))) @def
+        (async_function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
+        """)
+    # [cite_start]... (capture parsing remains the same [cite: 893]) ...
+
+```
+
+### Phase 3: The "Extract" Volume Bypass
+
+**Task:** Update the Volume Conservation Guardrail  to allow massive size reductions when the user's intent is to extract or split logic.
+
+* **Implementation:** (Replace lines 1010-1018)
+
+```python
+        # If the new code is less than 50% the size of the old code, raise an alarm
+        if orig_len > 100 and new_len < (orig_len * 0.5):
+            # Whitelist intents that legitimately shrink code volume
+            allowed_intents = ["remove", "delete", "extract", "move", "split", "break down"]
+            if not any(word in intent.lower() for word in allowed_intents):
+                raise ValueError(
+                    f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
+                    f"You attempted to replace a large block of code ({orig_len} chars) with a significantly smaller one ({new_len} chars). "
+                    "Do not use dummy implementations or placeholders. Write the COMPLETE executable code."
+                )
+
+```
+
+### Phase 4: Robust Docstring Regex
+
+**Task:** Make `UpdateDocstring`  impervious to trailing inline comments on class/function definitions.
+
+* **Implementation:** (Replace the regex on line 1126)
+
+```python
+            # Regex to safely replace or insert docstring just after the def/class signature
+            # Fix: [^\n]*\n handles trailing comments like 'def foo(): # comment \n'
+            pattern = re.compile(r'(^(?:[ \t]*)(?:def|async def|class)\s+[^:]+:[^\n]*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
+
+```

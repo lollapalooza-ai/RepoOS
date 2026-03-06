@@ -300,7 +300,6 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
             body: (block [
                 (function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
                 (decorated_definition (function_definition name: (identifier) @meth (#eq? @meth "{method_name}")))
-                (async_function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
             ] @def )
         )
         """)
@@ -309,7 +308,6 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
         (function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         (class_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         (decorated_definition (function_definition name: (identifier) @n (#eq? @n "{clean_sig}"))) @def
-        (async_function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         """)
 
     captures = query.captures(tree.root_node)
