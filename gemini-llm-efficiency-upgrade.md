@@ -2094,3 +2094,200 @@ In your main orchestration loop, add a dependency check:
             continue 
 
 ```
+
+
+# Milestone 3.6.8 : The "Definitive Stability" Master Patch (Suite 3.6.7 Fixes)
+
+# ENGINEERING BRIEF: The "Definitive Stability" Master Patch (Suite 3.6.7 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Curing LibCST Crashes, Dangling Callers, Context Wandering, and Context Overload
+
+Please implement these five precise upgrades across `refactor2.py` and your MCP Context tool.
+
+### Phase 1: The LibCST "Dummy Wrapper" Hack (Fixes Tests 12, 14, 18, 19)
+
+**The Problem:** `LibCST` throws a fatal `Syntax Error: expected INDENT` if the LLM's proposed method has slightly misaligned whitespace relative to a global module.
+**The Fix:** Wrap the LLM's raw string inside a dummy class before parsing it. This guarantees Python's strict block indentation rules are satisfied, allowing us to safely extract the AST node and graft it.
+
+**Update `InsertNode` logic in `apply_actions_to_state`:**
+
+```python
+        elif action.action == "insert_node":
+            content = new_state.get(path, "")
+            try:
+                # 1. Force the LLM's code into a valid, dedented string
+                raw_llm_code = textwrap.dedent(action.new_node_code.strip('\n'))
+                
+                # 2. Wrap it in a dummy class to guarantee valid CST parsing for methods
+                dummy_wrapper = f"class __DummyWrapper__:\n{textwrap.indent(raw_llm_code, '    ')}"
+                dummy_tree = cst.parse_module(dummy_wrapper)
+                
+                # 3. Extract the clean node from the dummy class
+                new_method_node = dummy_tree.body[0].body.body[0]
+                
+                if getattr(action, 'target_class_signature', None):
+                    class InsertGraftTransformer(cst.CSTTransformer):
+                        def leave_ClassDef(self, original_node, updated_node):
+                            if original_node.name.value == action.target_class_signature:
+                                new_body = list(updated_node.body.body) + [new_method_node]
+                                return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                            return updated_node
+
+                    source_tree = cst.parse_module(content)
+                    modified_tree = source_tree.visit(InsertGraftTransformer())
+                    new_state[path] = modified_tree.code
+                    print(f"   ➕ [LibCST] Safely inserted method into {action.target_class_signature}")
+                    continue
+                    
+                # Fallback for global functions
+                new_state[path] = content.rstrip() + "\n\n" + raw_llm_code + "\n"
+                
+            except Exception as e:
+                raise ValueError(f"LibCST parsing failed for new node: {e}")
+
+```
+
+### Phase 2: Two-Phase Commit for Caller Safety (Fixes Tests 11, 13, 16)
+
+**The Problem:** The engine fails to insert a new utility method, but still updates the caller to use that non-existent method, breaking the application.
+**The Fix:** Implement a strict Dependency Registry. If an `InsertNode` task fails, globally block any subsequent `ModifyNode` task that might depend on it.
+
+**Update the Orchestration Loop in `refactor2.py`:**
+
+```python
+    # Before the task loop starts, initialize the failure shield
+    failed_critical_tasks = False
+
+    for i, task in enumerate(task_list):
+        # Prevent Dangling Callers:
+        if failed_critical_tasks and task.action_type in ["modify_node", "update_docstring"]:
+            print(f"⚠️ Skipping Task {i+1} to prevent breaking callers (a previous insertion/creation failed).")
+            continue
+            
+        # ... execute retry loop ...
+        
+        if not success:
+            print(f"❌ Task {i+1} failed.")
+            if task.action_type in ["insert_node", "create_file"]:
+                # Trigger the global shield to protect downstream callers
+                failed_critical_tasks = True
+
+```
+
+### Phase 3: Curing Context Wandering (Pydantic & Sys Prompt)
+
+**The Problem:** When asked to audit a specific file, the model wanders off and updates docstrings in unrelated RAG context files.
+**The Fix:** Force the LLM to declare its primary targets and restrict modifications to them.
+
+**1. Update the Pydantic Schema:**
+
+```python
+class RefactoringPlan(BaseModel):
+    primary_target_files: List[str] = Field(
+        ..., 
+        description="The exact file path(s) you are explicitly asked to audit or refactor. Do NOT include RAG context files here."
+    )
+    tasks: List[Union[CreateFile, ModifyNode, InsertNode, UpdateDocstring, AddImport]]
+
+```
+
+**2. Update the System Prompt:**
+
+```python
+    "5. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file."
+
+```
+
+### Phase 4: Explicit Import Scrubbing (Fixes Tests 1, 6)
+
+**The Problem:** `MoveNode` leaves duplicate/broken imports behind.
+**The Fix:** Use aggressive regex in the downstream resolver.
+
+**Update the `MoveNode` downstream resolver logic:**
+
+```python
+        # Inside apply_actions_to_state for move_node:
+        old_module_path = path_to_python_module(source_path)
+        new_module_path = path_to_python_module(target_path)
+        node_name = extract_name_from_signature(action.node_signature)
+
+        for file_path in affected_files:
+            content = new_state.get(file_path, master_state.get(file_path, ""))
+            if content:
+                # 1. Strip the exact old import line
+                exact_old_import = f"from {old_module_path} import {node_name}"
+                content = content.replace(exact_old_import, "")
+                
+                # 2. Handle comma-separated imports (e.g., from X import A, Node, B)
+                comma_pattern = re.compile(rf"^(from\s+{re.escape(old_module_path)}\s+import\s+.*?\b){node_name}\b,?\s*(.*)$", re.MULTILINE)
+                content = comma_pattern.sub(r"\1\2", content)
+                
+                # 3. Prepend the new import
+                new_import = f"from {new_module_path} import {node_name}\n"
+                new_state[file_path] = new_import + content.lstrip()
+
+```
+
+### Phase 5: Dynamic Context Truncation (The MCP Layer)
+
+**The Problem:** The 14B model is overwhelmed by the sheer token volume of related RAG files, triggering context amnesia.
+**The Fix:** If the user prompt contains "audit", "standardize", or "comprehensive", we strip the business logic out of all secondary context files, providing the LLM with only the structural "skeleton" (class names, method signatures, and imports) so it knows *how* to call the files without getting distracted by *what* they do.
+
+**Update `get_hybrid_context` (and add the `ast` helper function):**
+
+```python
+import ast
+
+def get_file_skeleton(source_code: str) -> str:
+    """Strips out implementation logic, returning only imports, classes, and method signatures."""
+    try:
+        tree = ast.parse(source_code)
+        skeleton = []
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                skeleton.append(ast.unparse(node))
+            elif isinstance(node, ast.ClassDef):
+                skeleton.append(f"class {node.name}:")
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        skeleton.append(f"    def {item.name}(...): pass")
+                    elif isinstance(item, ast.AsyncFunctionDef):
+                        skeleton.append(f"    async def {item.name}(...): pass")
+            elif isinstance(node, ast.FunctionDef):
+                skeleton.append(f"def {node.name}(...): pass")
+        return "\n".join(skeleton)
+    except SyntaxError:
+        return source_code[:500] + "\n... [Content Truncated due to SyntaxError] ..."
+
+def get_hybrid_context(target_files: List[str], context_files: List[str], user_prompt: str) -> str:
+    """Builds the XML context for the LLM prompt, truncating secondary files during audits."""
+    
+    # Check if we should activate strict focus mode
+    audit_keywords = ["audit", "standardize", "comprehensive", "clean up"]
+    is_audit_mode = any(word in user_prompt.lower() for word in audit_keywords)
+    
+    context_xml = ""
+    
+    # 1. Provide FULL content for the explicitly targeted files
+    for target in target_files:
+        content = fetch_file_content(target) # Assume this is your existing fetch function
+        context_xml += f"<target_file path='{target}'>\n{content}\n</target_file>\n"
+        
+    # 2. Truncate secondary context files if in audit mode
+    for ctx_file in context_files:
+        if ctx_file in target_files:
+            continue
+            
+        content = fetch_file_content(ctx_file)
+        
+        if is_audit_mode:
+            skeleton = get_file_skeleton(content)
+            context_xml += f"<context_file path='{ctx_file}' note='TRUNCATED SKELETON FOR REFERENCE'>\n{skeleton}\n</context_file>\n"
+        else:
+            context_xml += f"<context_file path='{ctx_file}'>\n{content}\n</context_file>\n"
+            
+    return context_xml
+
+```

@@ -278,6 +278,10 @@ class TaskItem(BaseModel):
     context: Dict[str, List[str]] = Field(..., description="A mapping of file paths to the specific functions or classes relevant to this task.")
 
 class TaskList(BaseModel):
+    primary_target_files: List[str] = Field(
+        ..., 
+        description="The exact file path(s) you are explicitly asked to audit or refactor. Do NOT include RAG context files here."
+    )
     tasks: List[TaskItem] = Field(..., description="A sequential list of tasks to complete the refactor.")
 
 class CreateFile(BaseModel):
@@ -670,26 +674,25 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             affected_records = execute_graph_query(cypher_query, {"node_name": node_name})
             affected_files = [r["affected_path"] for r in affected_records]
 
-            # 2. Deterministic Python string replacement
+            # 2. Deterministic Python string replacement (Milestone 3.6.8 Phase 4)
             old_module_path = path_to_python_module(source_path)
             new_module_path = path_to_python_module(target_path)
 
             for file_path in affected_files:
-                # We update the file in new_state if it's there, or master_state otherwise
-                # But we should really look at what we've already modified
-                content = new_state.get(file_path, master_state.get(file_path))
+                content = new_state.get(file_path, master_state.get(file_path, ""))
                 if content:
-                    # Replace the old import with the new one
-                    old_import = f"from {old_module_path} import {node_name}"
-                    new_import = f"from {new_module_path} import {node_name}"
+                    # 1. Strip the exact old import line
+                    exact_old_import = f"from {old_module_path} import {node_name}"
+                    content = content.replace(exact_old_import, "")
                     
-                    if old_import in content:
-                        # Replace the old import line entirely, leaving the new one
-                        new_state[file_path] = content.replace(old_import + "\n", "")
-                        new_state[file_path] = new_state[file_path].replace(old_import, "")
-                        # Add the new import to the top of the file
-                        new_state[file_path] = new_import + "\n" + new_state[file_path]
-                        print(f"   ⚓ Automatically updated downstream import in {file_path}")
+                    # 2. Handle comma-separated imports (e.g., from X import A, Node, B)
+                    comma_pattern = re.compile(rf"^(from\s+{re.escape(old_module_path)}\s+import\s+.*?\b){node_name}\b,?\s*(.*)$", re.MULTILINE)
+                    content = comma_pattern.sub(r"\1\2", content)
+                    
+                    # 3. Prepend the new import
+                    new_import = f"from {new_module_path} import {node_name}\n"
+                    new_state[file_path] = new_import + content.lstrip()
+                    print(f"   ⚓ Automatically updated downstream import in {file_path}")
 
         elif action.action == "add_import":
             if path not in new_state:
@@ -703,25 +706,37 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         elif action.action == "insert_node":
             if path not in new_state: continue
             content = new_state[path]
-            
-            # If inserting a method into a class (detected by dot notation in the prompt/context)
-            if getattr(action, 'target_class_signature', None):
-                try:
+            try:
+                # 1. Force the LLM's code into a valid, dedented string
+                raw_llm_code = textwrap.dedent(action.new_node_code.strip('\n'))
+                
+                # 2. Wrap it in a dummy class to guarantee valid CST parsing for methods
+                dummy_wrapper = f"class __DummyWrapper__:\n{textwrap.indent(raw_llm_code, '    ')}"
+                dummy_tree = cst.parse_module(dummy_wrapper)
+                
+                # 3. Extract the clean node from the dummy class
+                new_method_node = dummy_tree.body[0].body.body[0]
+                
+                if getattr(action, 'target_class_signature', None):
+                    class InsertGraftTransformer(cst.CSTTransformer):
+                        def leave_ClassDef(self, original_node, updated_node):
+                            if original_node.name.value == action.target_class_signature.split('.')[-1]:
+                                new_body = list(updated_node.body.body) + [new_method_node]
+                                return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                            return updated_node
+
                     source_tree = cst.parse_module(content)
-                    transformer = InsertMethodTransformer(
-                        target_class_name=action.target_class_signature.split('.')[-1],
-                        new_method_code=action.new_node_code
-                    )
-                    modified_tree = source_tree.visit(transformer)
+                    modified_tree = source_tree.visit(InsertGraftTransformer())
                     new_state[path] = modified_tree.code
-                    print(f"   🔄 [LibCST] Inserted method into {action.target_class_signature}")
+                    print(f"   ➕ [LibCST] Safely inserted method into {action.target_class_signature}")
                     continue
-                except Exception as e:
-                    raise ValueError(f"LibCST insertion failed for '{action.target_class_signature}': {e}")
-            
-            # Fallback: Append to EOF with no indent
-            new_state[path] = content.rstrip() + "\n\n" + textwrap.dedent(action.new_node_code) + "\n"
-            print(f"   ➕ Inserted new node into {path}")
+                    
+                # Fallback for global functions
+                new_state[path] = content.rstrip() + "\n\n" + raw_llm_code + "\n"
+                print(f"   ➕ Inserted new node into {path}")
+                
+            except Exception as e:
+                raise ValueError(f"LibCST parsing failed for new node: {e}")
 
         elif action.action == "update_docstring":
             if path not in new_state: continue
@@ -787,6 +802,27 @@ def fetch_file_content(path: str) -> Optional[str]:
 NEO4J_URI, NEO4J_AUTH = "bolt://localhost:7687", ("neo4j", "password")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+
+def get_file_skeleton(source_code: str) -> str:
+    """Strips out implementation logic, returning only imports, classes, and method signatures."""
+    try:
+        tree = ast.parse(source_code)
+        skeleton = []
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                skeleton.append(ast.unparse(node))
+            elif isinstance(node, ast.ClassDef):
+                skeleton.append(f"class {node.name}:")
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        skeleton.append(f"    def {item.name}(...): pass")
+                    elif isinstance(item, ast.AsyncFunctionDef):
+                        skeleton.append(f"    async def {item.name}(...): pass")
+            elif isinstance(node, ast.FunctionDef):
+                skeleton.append(f"def {node.name}(...): pass")
+        return "\n".join(skeleton)
+    except SyntaxError:
+        return source_code[:500] + "\n... [Content Truncated due to SyntaxError] ..."
 
 def get_hybrid_context(instruction: str) -> Dict[str, List[str]]:
     """Phase 1: Dynamic Context Scoping. Pulls entire file AST if 'audit' intent detected."""
@@ -866,7 +902,11 @@ async def main():
                     print(f"❌ Syntax/Semantic Error detected in {path}: {error}. Aborting main pipeline for triage.")
                     return
 
-        task_sys_prompt = "You are a senior architect. Generate a sequential list of refactoring tasks."
+        task_sys_prompt = (
+            "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
+            "CRITICAL: You MUST identify the 'primary_target_files'. These are the files you are explicitly asked to refactor or audit. "
+            "Do NOT include files that are only provided for context or that might need minor caller updates."
+        )
         task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}"
         
         print("\n🧠 Generating Refactoring Plan...")
@@ -911,34 +951,50 @@ async def main():
     # Phase 3: The "Do No Harm" Task Abort tracking (Milestone 3.6.7)
     failed_critical_tasks = False
 
+    # Determine if we should activate strict focus mode (Milestone 3.6.8 Phase 5)
+    audit_keywords = ["audit", "standardize", "comprehensive", "clean up"]
+    is_audit_mode = any(word in intent.lower() for word in audit_keywords)
+
     for i, task in enumerate(task_list.tasks):
         print(f"\n--- Executing Task {i+1}/{len(task_list.tasks)}: {task.task} ---")
         
         # Abort downstream modifications if a critical node creation failed earlier
         if failed_critical_tasks:
-            # We check the instruction text or context to guess if it's a modification
-            # In a real implementation we'd check the action_type in the proposal, 
-            # but we are in the outer loop before the proposal is generated.
-            # However, we can just skip ALL remaining tasks for safety if a critical one failed.
             print(f"⚠️ Skipping Task {i+1} to prevent downstream breakage from earlier failures.")
             continue
         
-        # Phase 3: Precision Routing via Sub-Tree GraphRAG
+        # Phase 3: Precision Routing via Sub-Tree GraphRAG (Upgraded for Milestone 3.6.8 Phase 5)
         context_blocks = []
+        
+        # 1. Provide FULL content for explicitly targeted files
+        for target_path in task_list.primary_target_files:
+            content = master_state.get(target_path, "")
+            if content:
+                context_blocks.append(f'<target_file path="{target_path}">\n{content}\n</target_file>')
+
+        # 2. Provide nodes or skeletons for other files in task context
         for path, node_names in task.context.items():
+            if path in task_list.primary_target_files:
+                continue # Already provided full content
+                
             content = master_state.get(path, "")
             if not content: continue
             
-            file_block = f'<file_context path="{path}">'
-            for node_name in node_names:
-                node_range = find_node_range(content, node_name)
-                if node_range:
-                    start, end = node_range
-                    node_code = content[start:end]
-                    # In a real implementation, we'd also fetch adjacent docstrings from Neo4j
-                    file_block += f'\n<node signature="{node_name}">\n{node_code}\n</node>'
-            file_block += "\n</file_context>"
-            context_blocks.append(file_block)
+            if is_audit_mode:
+                # Provide only the structural skeleton to avoid context overload
+                skeleton = get_file_skeleton(content)
+                context_blocks.append(f'<context_file path="{path}" note="TRUNCATED SKELETON FOR REFERENCE">\n{skeleton}\n</context_file>')
+            else:
+                # Provide the specific nodes requested
+                file_block = f'<file_context path="{path}">'
+                for node_name in node_names:
+                    node_range = find_node_range(content, node_name)
+                    if node_range:
+                        start, end = node_range
+                        node_code = content[start:end]
+                        file_block += f'\n<node signature="{node_name}">\n{node_code}\n</node>'
+                file_block += "\n</file_context>"
+                context_blocks.append(file_block)
             
         # NEW: Fetch Parent Class Context
         parent_context_xml = ""
@@ -970,6 +1026,8 @@ async def main():
             "2. ABSOLUTE IMPORTS ONLY: Never use relative imports (like `from . import lookups`). ALL imports must be absolute paths from the project root (e.g., `from oscar.core.models import lookups`).\n"
             "3. SCOPE AWARENESS: Do not use `self` inside global utility functions, static decorators, or outside of a Class instance.\n"
             "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+            "5. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file.\n"
+            "6. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
