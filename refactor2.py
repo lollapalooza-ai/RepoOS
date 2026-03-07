@@ -12,7 +12,7 @@ from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict, Optional, Union, AsyncGenerator, Literal
+from typing import List, Dict, Optional, Union, AsyncGenerator, Literal, Set, Tuple
 import hashlib
 import ast
 import pyflakes.api
@@ -51,27 +51,57 @@ class ModifyNodeTransformer(cst.CSTTransformer):
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
         if original_node.name.value == self.target_node_name:
-            
-            # THE DECORATOR SHIELD:
-            # Forcibly graft the original node's decorators onto the new node.
-            # This prevents the LLM from accidentally deleting @property, @atomic, etc.
-            safe_new_node = self.new_node_ast.with_changes(
-                decorators=original_node.decorators
-            )
-            return safe_new_node
-            
+            # Type safety check: Ensure the LLM didn't hallucinate a non-function node
+            if isinstance(self.new_node_ast, (cst.FunctionDef, cst.ClassDef)):
+                return self.new_node_ast.with_changes(decorators=original_node.decorators)
+            return self.new_node_ast # Return as-is if the LLM changed the node type entirely
         return updated_node
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.CSTNode:
         if original_node.name.value == self.target_node_name:
             # Same shield applies to Class decorators (e.g., @dataclass)
-            safe_new_node = self.new_node_ast.with_changes(
-                decorators=original_node.decorators
-            )
-            return safe_new_node
+            if isinstance(self.new_node_ast, (cst.FunctionDef, cst.ClassDef)):
+                return self.new_node_ast.with_changes(decorators=original_node.decorators)
+            return self.new_node_ast
             
         return updated_node
-VENV_PYTHON = "./venv/bin/python3"
+VENV_PYTHON = sys.executable
+
+def get_modified_line_numbers(old_content: str, new_content: str) -> Set[int]:
+    """Returns a set of line numbers (1-indexed) modified or added in the new content."""
+    lines_old = old_content.splitlines()
+    lines_new = new_content.splitlines()
+    matcher = difflib.SequenceMatcher(None, lines_old, lines_new)
+    modified_lines = set()
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ('replace', 'insert'):
+            # j1 to j2 are 0-indexed indices in lines_new. Add 1 for standard 1-indexed line numbers.
+            for line_num in range(j1 + 1, j2 + 1):
+                modified_lines.add(line_num)
+    return modified_lines
+
+def parse_mypy_output(stdout: str, base_dir: str) -> Dict[str, List[Tuple[int, str]]]:
+    """Parses Mypy output into a dict mapping relative filepath -> list of (line_num, exact_error_message)."""
+    errors = {}
+    # Matches Mypy format: "filepath.py:line_num: error/note: Message [error-code]"
+    pattern = re.compile(r"^(.*?):(\d+): (?:error|note): (.*)$")
+    
+    for line in stdout.splitlines():
+        match = pattern.match(line)
+        if match:
+            filepath, line_num, msg = match.groups()
+            # Normalize filepath relative to the temporary workspace root
+            try:
+                # Use os.path.join and then relpath to get a consistent relative path
+                abs_path = os.path.abspath(os.path.join(base_dir, filepath))
+                rel_path = os.path.relpath(abs_path, base_dir)
+                if rel_path not in errors:
+                    errors[rel_path] = []
+                errors[rel_path].append((int(line_num), msg.strip()))
+            except ValueError:
+                continue
+    return errors
 
 def get_mypy_errors(filepath: str) -> set:
     """Runs mypy and returns a set of error strings, ignoring line numbers for baseline comparison."""
@@ -90,53 +120,70 @@ def get_mypy_errors(filepath: str) -> set:
                 errors.add(parts[1].strip())
     return errors
 
-def validate_virtual_workspace(state: Dict[str, str], modified_paths: List[str], pre_state_cache: Dict[str, str] = None) -> tuple[bool, str]:
-    """Phase 1: Baseline Differential Linting. Runs mypy and only reports errors introduced by the patch."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. Get Baseline Errors if pre_state_cache is provided
-        baseline_errors_map = {}
-        if pre_state_cache:
-            for path in modified_paths:
-                if path in pre_state_cache:
-                    # Create a temporary file for the baseline
-                    with tempfile.NamedTemporaryFile(suffix=".py", mode='w', delete=False) as f:
-                        f.write(pre_state_cache[path])
-                        f_path = f.name
-                    try:
-                        baseline_errors_map[path] = get_mypy_errors(f_path)
-                    finally:
-                        if os.path.exists(f_path): os.remove(f_path)
-
-        # 2. Setup the virtual workspace for the new state
-        for path, content in state.items():
-            tmp_path = os.path.join(tmpdir, path)
-            os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+def validate_virtual_workspace(pre_state: dict, post_state: dict, modified_paths: list) -> tuple[bool, str]:
+    """
+    True Differential Linting:
+    1. Creates identical pre/post workspace directories.
+    2. Runs Mypy globally to establish a contextual baseline.
+    3. Uses line-mapping and frequency tracking to isolate LLM-introduced errors.
+    """
+    with tempfile.TemporaryDirectory() as base_dir, tempfile.TemporaryDirectory() as post_dir:
         
-        try:
-            target_files = [os.path.join(tmpdir, p) for p in modified_paths if p in state]
-            if not target_files:
-                return True, ""
-                
-            introduced_errors = []
-            for path in modified_paths:
-                if path not in state: continue
-                tmp_target_path = os.path.join(tmpdir, path)
-                new_errors = get_mypy_errors(tmp_target_path)
-                
-                baseline = baseline_errors_map.get(path, set())
-                diff = new_errors - baseline
-                
-                if diff:
-                    introduced_errors.append(f"File {path} introduced:\n" + "\n".join(f"  - {e}" for e in diff))
-            
-            if introduced_errors:
-                return False, "Type Error(s) introduced in modified files:\n" + "\n".join(introduced_errors)
-                
-            return True, ""
-        except Exception as e:
-            return True, f"Type check skipped due to error: {str(e)}"
+        # 1. Populate identical workspaces to guarantee identical Mypy import resolution
+        for path, content in pre_state.items():
+            full_path = os.path.join(base_dir, path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f: f.write(content)
+
+        for path, content in post_state.items():
+            full_path = os.path.join(post_dir, path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f: f.write(content)
+
+        # 2. Run Mypy globally on BOTH workspaces
+        # --show-error-codes and --hide-error-context ensures predictable parsing
+        # We use VENV_PYTHON to ensure we use the same environment
+        mypy_cmd = [VENV_PYTHON, "-m", "mypy", ".", "--show-error-codes", "--no-error-summary", "--hide-error-context", "--ignore-missing-imports", "--follow-imports=silent"]
+        
+        base_result = subprocess.run(mypy_cmd, cwd=base_dir, capture_output=True, text=True)
+        post_result = subprocess.run(mypy_cmd, cwd=post_dir, capture_output=True, text=True)
+
+        base_errors = parse_mypy_output(base_result.stdout, base_dir)
+        post_errors = parse_mypy_output(post_result.stdout, post_dir)
+
+        introduced_errors = []
+
+        # 3. Analyze differences using Line-Mapping and Message Exhaustion
+        for filepath, current_errors in post_errors.items():
+            # Extract just the string messages from the baseline for this specific file
+            baseline_msgs = [msg for line_num, msg in base_errors.get(filepath, [])]
+
+            mod_lines = set()
+            if filepath in modified_paths:
+                mod_lines = get_modified_line_numbers(pre_state.get(filepath, ""), post_state.get(filepath, ""))
+
+            for line_num, msg in current_errors:
+                # CONDITION A: The error falls directly on a line the LLM modified/inserted
+                if filepath in modified_paths and line_num in mod_lines:
+                    # Double check it wasn't a pre-existing error on that exact line (e.g. appended text)
+                    if (line_num, msg) not in base_errors.get(filepath, []):
+                        introduced_errors.append(f"Line {line_num} in {filepath}: {msg}")
+                    continue
+
+                # CONDITION B: The error is on an unmodified line, OR in a downstream file
+                # We check if this exact error message existed in the baseline for this file.
+                if msg in baseline_msgs:
+                    # It's a legacy error. Remove it from the list to handle duplicates properly
+                    # This safely ignores line-shifts caused by the LLM inserting code above it!
+                    baseline_msgs.remove(msg) 
+                else:
+                    # It was NOT in the baseline. The LLM broke a downstream dependency!
+                    introduced_errors.append(f"Downstream break in {filepath}:{line_num}: {msg}")
+
+        if introduced_errors:
+            return False, "Validation Failed. Introduced Errors:\n" + "\n".join(introduced_errors)
+
+        return True, ""
 
 class ASTCollisionError(Exception):
     pass
@@ -518,34 +565,42 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 continue
             content = new_state[path]
             
-            # Phase 3: AST Volume Conservation Guardrail (String based for safety)
+            # Find original node text for volume check
             node_range = find_node_range(content, action.target_node_signature)
             if node_range:
                 start, end = node_range
                 original_node_text = content[start:end]
+                
+                # PHASE 2: The Ruthless No-Wipe Shield (Milestone 3.6.7)
                 orig_len = len(original_node_text.strip())
                 new_len = len(action.proposed_replace_string.strip())
                 
-                # If the new code is less than 50% the size of the old code, raise an alarm
-                if orig_len > 100 and new_len < (orig_len * 0.5):
-                    # Whitelist intents that legitimately shrink code volume
-                    allowed_intents = ["remove", "delete", "extract", "move", "split", "break down", "delegate"]
-                    # Also check if the LLM is explicitly calling a new helper method
-                    is_calling_helper = "def " not in action.proposed_replace_string and "(" in action.proposed_replace_string
+                # If the node is substantial (over 100 chars), prohibit shrinking it by more than 40%
+                if orig_len > 100 and new_len < (orig_len * 0.6):
+                    allowed_intents = ["remove", "delete", "drop", "clean up"]
+                    is_intent_deletion = any(word in intent.lower() for word in allowed_intents)
                     
-                    if not any(word in intent.lower() for word in allowed_intents) and not is_calling_helper:
+                    # Explicitly block placeholders that the LLM uses to wipe logic
+                    has_dummy_logic = "pass" in action.proposed_replace_string or "NotImplementedError" in action.proposed_replace_string
+                    
+                    if not is_intent_deletion or has_dummy_logic:
                         raise ValueError(
-                            f"Action Rejected: AST Volume Conservation Check failed for '{action.target_node_signature}'. "
-                            f"You attempted to replace a large block of code with a significantly smaller one. "
-                            "Do not use dummy implementations (like 'pass'). Write the COMPLETE executable code."
+                            f"Safety Block: You attempted to replace '{action.target_node_signature}' ({orig_len} chars) "
+                            f"with a significantly smaller implementation ({new_len} chars). "
+                            f"This indicates a catastrophic wipe of business logic. You MUST preserve the existing functional logic."
                         )
 
-            # Phase 3: LibCST Modification Engine
+            # Phase 1: LibCST Whitespace Normalization (Milestone 3.6.7)
             try:
+                # FIX: Strip leading/trailing blank lines and force dedent to 0-level indentation
+                # This prevents LibCST from choking on LLM-generated indented blocks
+                raw_llm_code = action.proposed_replace_string.strip('\n')
+                normalized_new_code = textwrap.dedent(raw_llm_code)
+                
                 source_tree = cst.parse_module(content)
                 transformer = ModifyNodeTransformer(
                     target_node_name=action.target_node_signature,
-                    new_node_code=action.proposed_replace_string
+                    new_node_code=normalized_new_code
                 )
                 modified_tree = source_tree.visit(transformer)
                 new_state[path] = modified_tree.code
@@ -671,23 +726,30 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         elif action.action == "update_docstring":
             if path not in new_state: continue
             content = new_state[path]
-            node_range = find_node_range(content, action.target_node_signature)
-            
-            if node_range:
-                start, end = node_range
-                node_code = content[start:end]
-                # Regex to safely replace or insert docstring just after the def/class signature
-                # Fix: [^\n]*\n handles trailing comments like 'def foo(): # comment \n'
-                pattern = re.compile(r'(^(?:[ \t]*)(?:def|async def|class)\s+[^:]+:[^\n]*\n)(?:[ \t]*[\'"]{3}.*?[\'"]{3}\s*\n)?', re.DOTALL | re.MULTILINE)
+            try:
+                source_tree = cst.parse_module(content)
+                # Parse the new docstring string into a SimpleStatementLine
+                clean_doc = action.new_docstring.strip('"').strip("'")
+                new_doc_node = cst.parse_module(f'"""{clean_doc}"""').body[0]
                 
-                def replacement(match):
-                    signature_line = match.group(1)
-                    indent = match.group(1).split(match.group(1).lstrip())[0] + "    " 
-                    return f"{signature_line}{indent}{action.new_docstring}\n"
-                
-                updated_node = pattern.sub(replacement, node_code, count=1)
-                new_state[path] = content[:start] + updated_node + content[end:]
-                print(f"   📝 Updated docstring for {action.target_node_signature}")
+                class DocstringTransformer(cst.CSTTransformer):
+                    def leave_FunctionDef(self, original_node, updated_node):
+                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                        return updated_node
+                        
+                    def leave_ClassDef(self, original_node, updated_node):
+                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                        return updated_node
+
+                modified_tree = source_tree.visit(DocstringTransformer())
+                new_state[path] = modified_tree.code
+                print(f"   📝 [LibCST] Updated docstring for {action.target_node_signature}")
+            except Exception as e:
+                raise ValueError(f"LibCST docstring update failed: {e}")
 
         elif action.action == "delete_lines":
             if path in new_state:
@@ -846,8 +908,20 @@ async def main():
     ActiveSchema = RefactorProposalUnsafe if requires_deletion else RefactorProposalSafe
     print(f"🛡️  Using active schema: {ActiveSchema.__name__}")
 
+    # Phase 3: The "Do No Harm" Task Abort tracking (Milestone 3.6.7)
+    failed_critical_tasks = False
+
     for i, task in enumerate(task_list.tasks):
         print(f"\n--- Executing Task {i+1}/{len(task_list.tasks)}: {task.task} ---")
+        
+        # Abort downstream modifications if a critical node creation failed earlier
+        if failed_critical_tasks:
+            # We check the instruction text or context to guess if it's a modification
+            # In a real implementation we'd check the action_type in the proposal, 
+            # but we are in the outer loop before the proposal is generated.
+            # However, we can just skip ALL remaining tasks for safety if a critical one failed.
+            print(f"⚠️ Skipping Task {i+1} to prevent downstream breakage from earlier failures.")
+            continue
         
         # Phase 3: Precision Routing via Sub-Tree GraphRAG
         context_blocks = []
@@ -892,10 +966,10 @@ async def main():
         sys_prompt = (
             "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
             "CRITICAL RULES: \n"
-            "1. FOCUS ON LOGIC: The execution engine automatically handles PEP-8 whitespace formatting and preserves existing decorators (like @property). Focus your tokens entirely on writing the correct, complete internal business logic.\n"
-            "2. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
-            "3. INSERT VS MODIFY: To add a NEW method to an existing class, use 'insert_node' and set 'target_class_signature'. DO NOT use 'modify_node' for nodes that don't exist yet.\n"
-            "4. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+            "1. NO HALLUCINATIONS: You MUST strictly use the variables, kwargs, and attributes exactly as they appear in the provided file context. Do not invent `self.order_number` if the code uses `self.number`. Do not invent exception names.\n"
+            "2. ABSOLUTE IMPORTS ONLY: Never use relative imports (like `from . import lookups`). ALL imports must be absolute paths from the project root (e.g., `from oscar.core.models import lookups`).\n"
+            "3. SCOPE AWARENESS: Do not use `self` inside global utility functions, static decorators, or outside of a Class instance.\n"
+            "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
@@ -946,8 +1020,8 @@ async def main():
                             new_state[path] = formatted_content
                 
                 if not syntax_error:
-                    # Phase 2: Differential Static Analysis
-                    valid, error = validate_virtual_workspace(new_state, modified_paths, pre_state_cache=master_state)
+                    # Phase 2: Dual-Workspace Differential Static Analysis (Milestone 3.6.6)
+                    valid, error = validate_virtual_workspace(master_state, new_state, modified_paths)
                     if not valid:
                         error_msg = error
                         syntax_error = True
@@ -987,6 +1061,18 @@ async def main():
         if retry_count == max_retries:
             # Phase 4: Atomic "Best Effort" Execution
             print(f"❌ Task {i+1} failed after {max_retries} attempts. Skipping to next task.")
+            
+            # Phase 3 Part 2 (Milestone 3.6.7): Detect if this was a critical node creation
+            # We look at the proposed actions if we have them from the last attempt
+            try:
+                # We check the task list description or the last failed proposal
+                is_critical = "create" in task.task.lower() or "insert" in task.task.lower() or "add" in task.task.lower()
+                if is_critical:
+                    print(f"🛑 CRITICAL FAILURE: Node creation/insertion failed. Arming 'Do No Harm' shield for downstream tasks.")
+                    failed_critical_tasks = True
+            except:
+                pass
+                
             continue
             
     print("\n💾 Writing all changes to disk...")

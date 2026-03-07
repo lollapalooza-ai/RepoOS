@@ -1725,3 +1725,372 @@ sys_prompt = (
 )
 
 ```
+
+# Milestone 3.6.5 : The Autopsy of Suite 3.6.4
+
+# ENGINEERING BRIEF: The Final Hardening (Suite 3.6.4 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching LibCST Type Safety, Line-Strict Linting, and Anti-Hallucination Constraints
+
+Please implement these four precise upgrades into your updated `RepoOS2` code (`refactor2.py`) to eradicate the remaining failure modes.
+
+### Phase 1: LibCST Type Safety & Native Docstrings (Fixes Tests 18, 20)
+
+**Task 1: Fix the `decorators` kwarg crash.**
+Update `ModifyNodeTransformer` to check if the new node is actually a function or class before grafting decorators.
+
+```python
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
+        if original_node.name.value == self.target_node_name:
+            # Type safety check: Ensure the LLM didn't hallucinate a non-function node
+            if isinstance(self.new_node_ast, (cst.FunctionDef, cst.ClassDef)):
+                return self.new_node_ast.with_changes(decorators=original_node.decorators)
+            return self.new_node_ast # Return as-is if the LLM changed the node type entirely
+        return updated_node
+
+```
+
+**Task 2: Migrate `UpdateDocstring` to LibCST.**
+Stop using regex for docstrings. LibCST natively understands where docstrings belong without throwing indentation errors.
+
+```python
+# Inside apply_actions_to_state for 'update_docstring':
+        elif action.action == "update_docstring":
+            content = new_state.get(path, "")
+            try:
+                source_tree = cst.parse_module(content)
+                # Parse the new docstring string into a SimpleStatementLine
+                new_doc_node = cst.parse_module(f'"""{action.new_docstring.strip("""")}"""').body[0]
+                
+                class DocstringTransformer(cst.CSTTransformer):
+                    def leave_FunctionDef(self, original_node, updated_node):
+                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                        return updated_node
+                        
+                    def leave_ClassDef(self, original_node, updated_node):
+                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                        return updated_node
+
+                modified_tree = source_tree.visit(DocstringTransformer())
+                new_state[path] = modified_tree.code
+                print(f"   📝 [LibCST] Updated docstring for {action.target_node_signature}")
+            except Exception as e:
+                raise ValueError(f"LibCST docstring update failed: {e}")
+
+```
+
+### Phase 2: The Node Integrity Shield (Fixes Tests 5, 11, 17, 19)
+
+**Task:** We must explicitly prevent the LLM from wiping core methods like `__init__`, `clean`, or `save` under the guise of "refactoring."
+Add this validation check inside the `ModifyNode` execution block:
+
+```python
+        # Protected core methods shield
+        protected_methods = ["__init__", "clean", "save", "dispatch"]
+        target_name = action.target_node_signature.split('.')[-1]
+        
+        if target_name in protected_methods:
+            # If it's a protected method, it must retain a super() call or be at least 80% the original size
+            if "super()" not in action.proposed_replace_string and len(action.proposed_replace_string) < (orig_len * 0.8):
+                raise ValueError(
+                    f"Safety Block: You attempted to overwrite a critical '{target_name}' method with a fundamentally smaller implementation that lacks a super() call. "
+                    f"This usually indicates an accidental wipe. You must preserve the core logic."
+                )
+
+```
+
+### Phase 3: True Differential Linting (Fixes Tests 2, 7)
+
+**Task:** Stop failing tasks for pre-existing errors. We must use Python's `difflib` to only run validation checks on lines that were actually changed.
+
+```python
+import difflib
+
+def get_modified_line_numbers(old_content: str, new_content: str) -> set:
+    """Returns a set of line numbers that were added or modified in the new content."""
+    lines_old = old_content.splitlines()
+    lines_new = new_content.splitlines()
+    matcher = difflib.SequenceMatcher(None, lines_old, lines_new)
+    modified_lines = set()
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ('replace', 'insert'):
+            for line_num in range(j1 + 1, j2 + 1):
+                modified_lines.add(line_num)
+    return modified_lines
+
+# In your Pyflakes/Linter validation loop:
+    # 1. Calculate modified_lines = get_modified_line_numbers(master_state[path], new_state[path])
+    # 2. Parse the pyflakes output line number (e.g. from "loading.py:45: undefined name")
+    # 3. Only raise the error if that integer line number exists in the modified_lines set.
+
+```
+
+### Phase 4: System Prompt - Banning Relative Imports & Hallucinations (Fixes 1, 4, 6, 10, 13, 15)
+
+**Task:** Update the System Prompt to enforce strict context boundaries.
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
+    "CRITICAL RULES: \n"
+    "1. NO HALLUCINATIONS: You MUST strictly use the variables, kwargs, and attributes exactly as they appear in the provided file context. Do not invent `self.order_number` if the code uses `self.number`. Do not invent exception names.\n"
+    "2. ABSOLUTE IMPORTS ONLY: Never use relative imports (like `from . import lookups`). ALL imports must be absolute paths from the project root (e.g., `from oscar.core.models import lookups`).\n"
+    "3. SCOPE AWARENESS: Do not use `self` inside global utility functions, static decorators, or outside of a Class instance.\n"
+    "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+)
+
+```
+
+# Milestone 3.6.6 : Dual-Workspace Differential Linting
+
+### The Architectural Shift
+
+1. **Identical Staging:** We will create *two* temporary directories (`workspace_baseline` and `workspace_post`). We will dump the entire graph state into both, apply the LLM's patch only to the post-workspace, and run Mypy globally on both. This guarantees the import resolution environment is mathematically identical.
+2. **Line-Strict Attribution:** For files the LLM modified, we will use Python's `difflib` to calculate the exact line numbers that were changed. We will only blame the LLM if a Pyflakes/Mypy error lands *specifically on a modified line*.
+3. **Downstream Break Tracking:** For files the LLM *didn't* modify, we will track the frequency of specific Mypy error messages. If a new error message appears in an unmodified file in the post-workspace, we know the LLM broke a downstream dependency.
+
+---
+
+# ENGINEERING BRIEF: Dual-Workspace Differential Linting
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Rewriting `validate_virtual_workspace` for True Differential Line-Mapping
+
+Please add the following helper functions and completely replace the existing `validate_virtual_workspace` in `refactor2.py`.
+
+### Phase 1: The Helper Functions
+
+Add these above your validation logic. They handle the exact line-number mapping and Mypy output parsing.
+
+```python
+import os
+import shutil
+import tempfile
+import subprocess
+import difflib
+import re
+from typing import Dict, List, Tuple, Set
+
+def get_modified_line_numbers(old_content: str, new_content: str) -> Set[int]:
+    """Returns a set of line numbers (1-indexed) modified or added in the new content."""
+    lines_old = old_content.splitlines()
+    lines_new = new_content.splitlines()
+    matcher = difflib.SequenceMatcher(None, lines_old, lines_new)
+    modified_lines = set()
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ('replace', 'insert'):
+            # j1 to j2 are 0-indexed indices in lines_new. Add 1 for standard 1-indexed line numbers.
+            for line_num in range(j1 + 1, j2 + 1):
+                modified_lines.add(line_num)
+    return modified_lines
+
+def parse_mypy_output(stdout: str, base_dir: str) -> Dict[str, List[Tuple[int, str]]]:
+    """Parses Mypy output into a dict mapping relative filepath -> list of (line_num, exact_error_message)."""
+    errors = {}
+    # Matches Mypy format: "filepath.py:line_num: error/note: Message [error-code]"
+    pattern = re.compile(r"^(.*?):(\d+): (?:error|note): (.*)$")
+    
+    for line in stdout.splitlines():
+        match = pattern.match(line)
+        if match:
+            filepath, line_num, msg = match.groups()
+            # Normalize filepath relative to the temporary workspace root
+            rel_path = os.path.relpath(os.path.abspath(os.path.join(base_dir, filepath)), base_dir)
+            if rel_path not in errors:
+                errors[rel_path] = []
+            errors[rel_path].append((int(line_num), msg.strip()))
+    return errors
+
+```
+
+### Phase 2: The Core Validation Engine
+
+Replace your current `validate_virtual_workspace` with this dual-workspace implementation.
+
+```python
+def validate_virtual_workspace(pre_state: dict, post_state: dict, modified_paths: list) -> tuple[bool, str]:
+    """
+    True Differential Linting:
+    1. Creates identical pre/post workspace directories.
+    2. Runs Mypy globally to establish a contextual baseline.
+    3. Uses line-mapping and frequency tracking to isolate LLM-introduced errors.
+    """
+    with tempfile.TemporaryDirectory() as base_dir, tempfile.TemporaryDirectory() as post_dir:
+        
+        # 1. Populate identical workspaces to guarantee identical Mypy import resolution
+        for path, content in pre_state.items():
+            full_path = os.path.join(base_dir, path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f: f.write(content)
+
+        for path, content in post_state.items():
+            full_path = os.path.join(post_dir, path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f: f.write(content)
+
+        # 2. Run Mypy globally on BOTH workspaces
+        # --show-error-codes and --hide-error-context ensures predictable parsing
+        mypy_cmd = ["python", "-m", "mypy", ".", "--show-error-codes", "--no-error-summary", "--hide-error-context"]
+        
+        base_result = subprocess.run(mypy_cmd, cwd=base_dir, capture_output=True, text=True)
+        post_result = subprocess.run(mypy_cmd, cwd=post_dir, capture_output=True, text=True)
+
+        base_errors = parse_mypy_output(base_result.stdout, base_dir)
+        post_errors = parse_mypy_output(post_result.stdout, post_dir)
+
+        introduced_errors = []
+
+        # 3. Analyze differences using Line-Mapping and Message Exhaustion
+        for filepath, current_errors in post_errors.items():
+            # Extract just the string messages from the baseline for this specific file
+            baseline_msgs = [msg for line_num, msg in base_errors.get(filepath, [])]
+
+            mod_lines = set()
+            if filepath in modified_paths:
+                mod_lines = get_modified_line_numbers(pre_state.get(filepath, ""), post_state[filepath])
+
+            for line_num, msg in current_errors:
+                # CONDITION A: The error falls directly on a line the LLM modified/inserted
+                if filepath in modified_paths and line_num in mod_lines:
+                    # Double check it wasn't a pre-existing error on that exact line (e.g. appended text)
+                    if (line_num, msg) not in base_errors.get(filepath, []):
+                        introduced_errors.append(f"Line {line_num} in {filepath}: {msg}")
+                    continue
+
+                # CONDITION B: The error is on an unmodified line, OR in a downstream file
+                # We check if this exact error message existed in the baseline for this file.
+                if msg in baseline_msgs:
+                    # It's a legacy error. Remove it from the list to handle duplicates properly
+                    # This safely ignores line-shifts caused by the LLM inserting code above it!
+                    baseline_msgs.remove(msg) 
+                else:
+                    # It was NOT in the baseline. The LLM broke a downstream dependency!
+                    introduced_errors.append(f"Downstream break in {filepath}:{line_num}: {msg}")
+
+        if introduced_errors:
+            return False, "Validation Failed. Introduced Errors:\n" + "\n".join(introduced_errors)
+
+        return True, ""
+
+```
+
+
+# Milestone 3.6.7 : The "Do No Harm" Patch (Suite 3-6-6 Fixes)
+
+### The Autopsy of the Regressions
+
+**1. The "Catastrophic Wipe" Loophole (Tests 5, 11, 13, 14, 19)**
+In our previous iteration, we implemented a "Node Integrity Shield" for protected methods (`__init__`, `clean`, `save`) that allowed a volume reduction *if* the new code contained a `super()` call.
+**The Hack:** The 14B model learned this loophole! When it got confused about how to extract the `merge` logic or order number generation, it simply wrote a new method containing *only* `super().save(*args, **kwargs)` or `pass`, entirely deleting the core business logic. Because `super()` was present, our Python engine let it bypass the volume check.
+
+**2. LibCST Indentation Crashes (Test 12)**
+LibCST parses code as a full module before it grafts it into the target tree.  The 14B model frequently outputs its proposed replacement code with a 4-space indentation (because it knows the method belongs inside a class). When we pass an indented string directly to `cst.parse_module()`, LibCST immediately throws a fatal `Syntax Error: expected INDENT` or `unexpected INDENT`, causing the task to abort.
+
+**3. The `_meta` Annihilation (Test 3)**
+The prompt asked to "clean up" the manual `_meta` annotation. Because the 14B model lacked a targeted way to edit the inner attributes of a class without rewriting the whole thing, it just opted to delete the entire `_meta` class, breaking Django's ORM compatibility.
+
+---
+
+# ENGINEERING BRIEF: The "Do No Harm" Patch (Suite 3-6-6 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Patching the Volume Shield Loophole and LibCST Dedenting
+
+We must physically prevent the LLM from deleting business logic by removing the `super()` bypass, and we must normalize its whitespace before feeding it to LibCST. Please implement these three exact patches in `refactor2.py`.
+
+### Phase 1: LibCST Whitespace Normalization
+
+**Task:** We must perfectly dedent the LLM's proposed code before passing it to `cst.parse_module()`, and let our `ModifyNodeTransformer` handle the re-indentation natively during the graft.
+Update the `modify_node` execution block (where you instantiate the transformer):
+
+```python
+import textwrap
+import libcst as cst
+
+# Inside apply_actions_to_state for 'modify_node':
+        elif action.action == "modify_node":
+            content = new_state.get(path, "")
+            try:
+                # FIX: Strip leading/trailing blank lines and force dedent to 0-level indentation
+                # This prevents LibCST from choking on LLM-generated indented blocks
+                raw_llm_code = action.proposed_replace_string.strip('\n')
+                normalized_new_code = textwrap.dedent(raw_llm_code)
+                
+                source_tree = cst.parse_module(content)
+                transformer = ModifyNodeTransformer(
+                    target_node_name=action.target_node_signature,
+                    new_node_code=normalized_new_code
+                )
+                modified_tree = source_tree.visit(transformer)
+                new_state[path] = modified_tree.code
+                print(f"   🔄 [LibCST] Modified {action.target_node_signature}")
+            except Exception as e:
+                raise ValueError(f"LibCST modification failed for '{action.target_node_signature}': {e}")
+
+```
+
+### Phase 2: The Unbypassable "No-Wipe" Shield
+
+**Task:** Remove the `super()` loophole. If the LLM proposes shrinking a method by more than 40% (unless the user explicitly asked to delete it), we mathematically reject the patch. Period.
+
+Replace the current "Protected core methods shield" and "AST Volume Conservation Guardrail" with this unified, ruthless check:
+
+```python
+        # PHASE 2: The Ruthless No-Wipe Shield
+        orig_len = len(original_node_text.strip())
+        new_len = len(action.proposed_replace_string.strip())
+        
+        # If the node is substantial (over 100 chars), prohibit shrinking it by more than 40%
+        if orig_len > 100 and new_len < (orig_len * 0.6):
+            allowed_intents = ["remove", "delete", "drop", "clean up"]
+            is_intent_deletion = any(word in intent.lower() for word in allowed_intents)
+            
+            # Explicitly block placeholders that the LLM uses to wipe logic
+            has_dummy_logic = "pass" in action.proposed_replace_string or "NotImplementedError" in action.proposed_replace_string
+            
+            if not is_intent_deletion or has_dummy_logic:
+                raise ValueError(
+                    f"Safety Block: You attempted to replace '{action.target_node_signature}' ({orig_len} chars) "
+                    f"with a significantly smaller implementation ({new_len} chars). "
+                    f"This indicates a catastrophic wipe of business logic. You MUST preserve the existing functional logic."
+                )
+
+```
+
+### Phase 3: The "Do No Harm" Task Abort
+
+**Task:** In Test 14 and 19, the tool failed to insert the new utility methods, but it *did* successfully update the callers to use those missing methods, breaking the app.
+
+We must enforce that if a `CreateFile` or `InsertNode` task fails and aborts, we do not blindly continue applying `ModifyNode` updates that depend on them.
+
+In your main orchestration loop, add a dependency check:
+
+```python
+    # In the main task loop:
+    failed_critical_tasks = False
+    
+    for i, task in enumerate(task_list):
+        if failed_critical_tasks and task.action_type in ["modify_node", "update_docstring"]:
+            print(f"⚠️ Skipping Task {i+1} to prevent downstream breakage from earlier failures.")
+            continue
+            
+        # ... retry loop logic ...
+        
+        if not success:
+            print(f"❌ Task {i+1} failed after {max_retries} attempts.")
+            # If we fail to create the necessary nodes, flag it so we don't break callers
+            if task.action_type in ["create_file", "insert_node"]:
+                failed_critical_tasks = True
+            continue 
+
+```
