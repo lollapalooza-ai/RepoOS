@@ -2291,3 +2291,107 @@ def get_hybrid_context(target_files: List[str], context_files: List[str], user_p
     return context_xml
 
 ```
+
+# Milestone 3.6.9 :  The DeepSeek Transition & State Machine Hardening
+
+# ENGINEERING BRIEF: The DeepSeek Transition & State Machine Hardening
+
+**To:** Lead/Senior AI Engineer
+
+**From:** Principal AI Architect
+
+**Subject:** MoE Context Expansion, False Success Shield, and CreateFile Hard Gate
+
+**Context:** We are migrating our local backend to `deepseek-coder-v2` (MoE) to resolve severe logic hallucinations and path errors. To fully support this model and patch the remaining execution loopholes in `refactor2.py`, please implement the following three critical updates.
+
+---
+
+### PART 1.2: Expanding the DeepSeek Context Window
+
+**The Problem:** By default, Ollama heavily restricts the context window (usually to 2048 or 4096 tokens) to conserve RAM. If we pipe our massive GraphRAG XML context into this default window, it will silently truncate, blinding the model to the target files.
+**The Fix:** We must explicitly allocate a 32k context window in the API call. DeepSeek V2 Lite is highly optimized and can handle this on a 24GB Unified Memory architecture.
+
+**Implementation:** Locate your LLM completion call in `refactor2.py` (whether you are using LiteLLM or the standard `openai` Python client targeting `localhost:11434`) and inject the `num_ctx` option.
+
+```python
+# Update your LLM completion function (e.g., inside the planner or self-healing loop):
+response = client.chat.completions.create(
+    model="deepseek-coder-v2", # Make sure this matches your Ollama tag
+    messages=messages,
+    temperature=0.1, # Keep it deterministic
+    # If using OpenAI client format for Ollama, pass extra_body:
+    extra_body={
+        "options": {
+            "num_ctx": 32768  # 32k context window for heavy GraphRAG
+        }
+    }
+)
+
+```
+
+*(Note: If you are using LiteLLM, you can pass this via `custom_llm_provider="ollama"` and `num_ctx=32768` as a direct kwargs parameter).*
+
+---
+
+### PART 2: Eradicating the "False Success" Bug
+
+**The Problem:** In recent tests, LibCST successfully parsed the code without crashing, but because the LLM hallucinated a target node signature, the transformer didn't actually match any nodes. It returned the AST entirely unchanged. Because no exceptions were thrown, `refactor2.py` blindly marked the task as "Success", completely lying to the planner and breaking downstream dependencies.
+
+**The Fix:** We must mathematically verify that a mutation occurred. We will snapshot the pre-execution string and compare it to the post-execution string.
+
+**Implementation:** Update `apply_actions_to_state` in `refactor2.py`. Apply this check to `modify_node`, `update_docstring`, and `delete_lines`.
+
+```python
+        elif action.action == "modify_node":
+            content = new_state.get(path, "")
+            original_content = content  # SNAPSHOT THE STATE
+            
+            try:
+                raw_llm_code = action.proposed_replace_string.strip('\n')
+                normalized_new_code = textwrap.dedent(raw_llm_code)
+                
+                source_tree = cst.parse_module(content)
+                transformer = ModifyNodeTransformer(
+                    target_node_name=action.target_node_signature,
+                    new_node_code=normalized_new_code
+                )
+                modified_tree = source_tree.visit(transformer)
+                new_state[path] = modified_tree.code
+                
+                # THE FALSE SUCCESS SHIELD
+                if new_state[path] == original_content:
+                    raise ValueError(
+                        f"False Success: No changes were made to the file. "
+                        f"The target node '{action.target_node_signature}' was not found in the AST. "
+                        f"Ensure you are using the EXACT class or method name as it appears in the file."
+                    )
+                    
+                print(f"   🔄 [LibCST] Modified {action.target_node_signature}")
+            except Exception as e:
+                raise ValueError(f"LibCST modification failed: {e}")
+
+```
+
+---
+
+### PART 3: The `CreateFile` Abuse Shield
+
+**The Problem:** When the 14B model panicked or hit a wall during self-healing, it bypassed the strict AST rules of `modify_node` by simply calling `create_file` to completely overwrite an existing file (like `loading.py`). This caused catastrophic logic wipes.
+**The Fix:** A hard gate at the execution router. If the target path exists in the repository state, `create_file` must immediately abort.
+
+**Implementation:** Update the `create_file` block in `apply_actions_to_state`.
+
+```python
+        elif action.action == "create_file":
+            # THE ABUSE SHIELD
+            if path in master_state or path in new_state:
+                raise ValueError(
+                    f"Action Rejected: You attempted to use 'create_file' on '{path}', "
+                    f"but this file ALREADY EXISTS in the repository. "
+                    f"You MUST use 'modify_node', 'insert_node', or 'update_docstring' to edit existing files."
+                )
+                
+            new_state[path] = action.content
+            print(f"   📄 Created new file {path}")
+
+```

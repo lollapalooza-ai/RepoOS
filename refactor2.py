@@ -23,7 +23,7 @@ import subprocess
 import libcst as cst
 
 # --- Config ---
-MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
+MODEL_NAME = "deepseek-coder-v2"
 
 class InsertMethodTransformer(cst.CSTTransformer):
     """Cleanly injects a new method into an existing class, handling indentation natively."""
@@ -240,18 +240,21 @@ def format_and_validate_python(content: str, filepath: str = "temp.py") -> tuple
 
 def is_semantically_valid(content: str) -> tuple[bool, str]:
     # 1. Anti-Placeholder Guardrail
-    forbidden_phrases = [
-        "# placeholder", 
-        "# ...", 
-        "pass  #", 
-        "# rest of code",
-        "# existing code"
+    # We use regex to catch lines that consist ONLY of a placeholder comment (ignoring whitespace)
+    # This avoids false positives on descriptive comments like "# placeholder urls"
+    forbidden_patterns = [
+        (r"^\s*#\s*placeholder\s*$", "# placeholder"),
+        (r"\.\.\.", "..."), # Catch ANY triple dot, very common in lazy code
+        (r"pass\s*#", "pass #"),
+        (r"^\s*#\s*rest of code\s*$", "# rest of code"),
+        (r"^\s*#\s*existing code\s*$", "# existing code")
     ]
     
-    content_lower = content.lower()
-    for phrase in forbidden_phrases:
-        if phrase in content_lower:
-            return False, f"Code contains forbidden placeholder: '{phrase}'. Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
+    lines = content.splitlines()
+    for line in lines:
+        for pattern, label in forbidden_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                return False, f"Code contains forbidden placeholder: '{label}'. Token laziness is strictly prohibited. You MUST write the COMPLETE and executable node."
     
     return True, ""
 
@@ -376,9 +379,6 @@ class RefactorProposal(BaseModel):
     actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of discrete refactoring actions.")
 
 
-# --- Config ---
-MODEL_NAME = "qwen2.5-coder:14b-instruct-q4_K_M"
-
 # Global Parser setup
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
@@ -393,12 +393,12 @@ async def generate_streaming_json(system_prompt: str, user_prompt: str, response
     async for part in await client.chat(
         model=MODEL_NAME,
         messages=[
-            {'role': 'system', 'content': f"{system_prompt}\nReturn ONLY valid JSON matching this schema: {json.dumps(schema)}"},
+            {'role': 'system', 'content': f"{system_prompt}\nReturn ONLY JSON matching this schema: {json.dumps(schema)}"},
             {'role': 'user', 'content': user_prompt}
         ],
         format=schema,
         stream=True,
-        options={'temperature': 0.1}
+        options={'temperature': 0.1, 'num_ctx': 32768}
     ):
         yield part['message']['content']
 
@@ -427,30 +427,38 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
     
     tree = parser.parse(bytes(source_code, "utf8"))
 
+    # Support "Class.method" or just "method" (suffix match)
     if "." in clean_sig:
-        class_name, method_name = clean_sig.split(".", 1)
-        query = PY_LANGUAGE.query(f"""
+        class_name, method_name = clean_sig.rsplit(".", 1)
+        query_str = f"""
         (class_definition name: (identifier) @cls (#eq? @cls "{class_name}")
             body: (block [
                 (function_definition name: (identifier) @meth (#eq? @meth "{method_name}"))
                 (decorated_definition (function_definition name: (identifier) @meth (#eq? @meth "{method_name}")))
             ] @def )
         )
-        """)
+        """
     else:
-        query = PY_LANGUAGE.query(f"""
+        query_str = f"""
         (function_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         (class_definition name: (identifier) @n (#eq? @n "{clean_sig}")) @def
         (decorated_definition (function_definition name: (identifier) @n (#eq? @n "{clean_sig}"))) @def
-        """)
+        """
 
+    query = PY_LANGUAGE.query(query_str)
     captures = query.captures(tree.root_node)
+    
     if isinstance(captures, dict):
         nodes = captures.get('def', [])
         if nodes: return nodes[0].start_byte, nodes[0].end_byte
     elif captures:
         for node, name in captures:
             if name == 'def': return node.start_byte, node.end_byte
+            
+    # FALLBACK: If "Class.method" failed, try just "method" if it's unique
+    if "." in clean_sig:
+        return find_node_range(source_code, clean_sig.split(".")[-1])
+        
     return None
 
 def resolve_path(target_path: str, master_state: dict) -> str:
@@ -465,6 +473,10 @@ def resolve_path(target_path: str, master_state: dict) -> str:
     # 1. Exact Match (The LLM provided the perfect path)
     if target_path in known_paths:
         return target_path
+    
+    # 1b. Check if target_path exists on disk as is
+    if os.path.exists(target_path):
+        return target_path
 
     # 2. Suffix Match (Handles Modification of existing files)
     # If LLM outputs "core/csv_utils.py", we match it to "src/app/core/csv_utils.py"
@@ -473,17 +485,18 @@ def resolve_path(target_path: str, master_state: dict) -> str:
         return suffix_matches[0]
 
     # 3. Path Reconstruction (Handles CreateFile)
-    # Infer the working directory from the common path of all files currently in context
+    # If the path already looks like it starts with 'django-oscar' (repo root), don't join
+    if target_path.startswith("django-oscar/"):
+        return target_path
+
     try:
         common_path = os.path.commonpath(known_paths)
-        # Fix: Ensure we extract the directory if the common path is actually a file
-        # This prevents NotADirectoryError when master_state only has one file
         if common_path in known_paths:
             common_dir = os.path.dirname(common_path)
         else:
             common_dir = common_path
     except ValueError:
-        common_dir = "" # Fallback if paths are on different drives
+        common_dir = ""
 
     if common_dir and not target_path.startswith(common_dir):
         # Normalize separators for cross-platform compatibility
@@ -543,14 +556,15 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 continue
 
         if action.action == "create_file":
-            # 2. Block destructive overwrites (Phase 2: State Machine Guardrails)
-            if path in master_state:
+            # THE ABUSE SHIELD
+            if path in master_state or path in new_state:
                 raise ValueError(
-                    f"Action Rejected: Cannot use 'create_file' on existing file '{path}'. "
-                    f"You MUST use 'modify_node' or 'add_import'."
+                    f"Action Rejected: You attempted to use 'create_file' on '{path}', "
+                    f"but this file ALREADY EXISTS in the repository. "
+                    f"You MUST use 'modify_node', 'insert_node', or 'update_docstring' to edit existing files."
                 )
             new_state[path] = action.content
-            print(f"   🆕 Created file: {path}")
+            print(f"   📄 Created new file {path}")
 
         elif action.action == "delete_file":
             # Phase 5: Forbidding Phantom Deletions
@@ -568,6 +582,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 print(f"❌ Modify Error: File {path} not found in state.")
                 continue
             content = new_state[path]
+            original_content = content  # SNAPSHOT THE STATE
             
             # Find original node text for volume check
             node_range = find_node_range(content, action.target_node_signature)
@@ -608,6 +623,14 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 )
                 modified_tree = source_tree.visit(transformer)
                 new_state[path] = modified_tree.code
+                
+                # THE FALSE SUCCESS SHIELD
+                if new_state[path] == original_content:
+                    raise ValueError(
+                        f"False Success: No changes were made to the file. "
+                        f"The target node '{action.target_node_signature}' was not found in the AST. "
+                        f"Ensure you are using the EXACT class or method name as it appears in the file."
+                    )
                 print(f"   🔄 [LibCST] Modified {action.target_node_signature} (Decorators Preserved)")
             except Exception as e:
                 raise ValueError(f"LibCST modification failed for '{action.target_node_signature}': {e}")
@@ -741,6 +764,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         elif action.action == "update_docstring":
             if path not in new_state: continue
             content = new_state[path]
+            original_content = content  # SNAPSHOT THE STATE
             try:
                 source_tree = cst.parse_module(content)
                 # Parse the new docstring string into a SimpleStatementLine
@@ -762,6 +786,14 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
 
                 modified_tree = source_tree.visit(DocstringTransformer())
                 new_state[path] = modified_tree.code
+                
+                # THE FALSE SUCCESS SHIELD
+                if new_state[path] == original_content:
+                    raise ValueError(
+                        f"False Success: No changes were made to the file. "
+                        f"The target node '{action.target_node_signature}' was not found in the AST. "
+                        f"Ensure you are using the EXACT class or method name as it appears in the file."
+                    )
                 print(f"   📝 [LibCST] Updated docstring for {action.target_node_signature}")
             except Exception as e:
                 raise ValueError(f"LibCST docstring update failed: {e}")
@@ -769,11 +801,21 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         elif action.action == "delete_lines":
             if path in new_state:
                 content = new_state[path]
+                original_content = content  # SNAPSHOT THE STATE
                 if action.exact_string_match in content:
                     new_state[path] = content.replace(action.exact_string_match, "")
                     # Clean up blank lines left behind
                     new_state[path] = re.sub(r'\n\s*\n', '\n\n', new_state[path])
+                    
+                    # THE FALSE SUCCESS SHIELD
+                    if new_state[path] == original_content:
+                         raise ValueError(
+                            f"False Success: No changes were made to the file during 'delete_lines'. "
+                            f"The exact string match '{action.exact_string_match}' was not found or could not be replaced."
+                        )
                     print(f"   ✂️ Deleted specified lines from {path}")
+                else:
+                    raise ValueError(f"False Success: Exact string match '{action.exact_string_match}' not found in {path}")
         
     return new_state
 
@@ -905,7 +947,8 @@ async def main():
         task_sys_prompt = (
             "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
             "CRITICAL: You MUST identify the 'primary_target_files'. These are the files you are explicitly asked to refactor or audit. "
-            "Do NOT include files that are only provided for context or that might need minor caller updates."
+            "Do NOT include files that are only provided for context or that might need minor caller updates.\n"
+            "NEW FILES: If the instruction requires creating a new file (e.g., a new utils.py), your VERY FIRST task MUST be to create that file using a 'create_file' instruction description."
         )
         task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}"
         
@@ -1028,6 +1071,8 @@ async def main():
             "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
             "5. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file.\n"
             "6. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+            "7. CLASS METHOD AWARENESS: When modifying a method within a class (like `get_context_data`), you MUST use `self.request` instead of `request` to access the request object. Never assume `request` is available in the local scope unless it is a function argument.\n"
+            "8. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
@@ -1121,15 +1166,11 @@ async def main():
             print(f"❌ Task {i+1} failed after {max_retries} attempts. Skipping to next task.")
             
             # Phase 3 Part 2 (Milestone 3.6.7): Detect if this was a critical node creation
-            # We look at the proposed actions if we have them from the last attempt
-            try:
-                # We check the task list description or the last failed proposal
-                is_critical = "create" in task.task.lower() or "insert" in task.task.lower() or "add" in task.task.lower()
-                if is_critical:
-                    print(f"🛑 CRITICAL FAILURE: Node creation/insertion failed. Arming 'Do No Harm' shield for downstream tasks.")
-                    failed_critical_tasks = True
-            except:
-                pass
+            # We check if this was a creation task
+            is_critical = "create" in task.task.lower() or "insert" in task.task.lower() or "add" in task.task.lower()
+            if is_critical:
+                print(f"🛑 CRITICAL FAILURE: Node creation/insertion failed. Arming 'Do No Harm' shield for downstream tasks.")
+                failed_critical_tasks = True
                 
             continue
             
