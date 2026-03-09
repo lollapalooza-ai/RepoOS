@@ -2395,3 +2395,360 @@ response = client.chat.completions.create(
             print(f"   📄 Created new file {path}")
 
 ```
+
+# Milestone 3.6.10 : The MoE Constraint Patch (Suite 3-6-9 Fixes)
+
+Background on why tests in refactor-test-report-3-6-9.md failed.
+Here is the architectural teardown of the MoE friction points and the precise engineering brief to patch refactor2.py in RepoOS2.
+
+1. The DeepSeek Friction Points
+Friction A: The "Architectural Hallucination" Loop (Tests 2, 5, 7, 10, 19)
+DeepSeek is over-engineering. Asked to extract a simple BOM handler, it tries to create a whole new oscar/core/config directory. Asked to add type hints, it tries to create a new typing_utils.py file.
+The Fix: We must violently constrain the planner. The prompt must explicitly forbid the creation of new files unless the user's prompt explicitly commands it.
+
+Friction B: The CreateFile / ModifyNode Cognitive Dissonance (Tests 14, 20)
+DeepSeek frequently outputs a plan to CreateFile for utils.py, gets blocked by our new Abuse Shield (because utils.py already exists), and then panics during the self-heal.
+The Fix: Instead of throwing a fatal ValueError when create_file hits an existing path, we should dynamically intercept the action in the engine and convert it into a modify_node or insert_node warning, letting the self-heal loop know it picked the wrong tool without aborting the plan.
+
+Friction C: The Context Resolution Bug (Tests 1, 6)
+DeepSeek generated paths like oscar/core/models/oscar/apps/catalogue/.... Why? Because when we feed it the GraphRAG XML, we provide paths relative to the project root, but DeepSeek is confusing them with Django app labels.
+The Fix: We need to enforce strict path prefixing in the Pydantic schema validation.
+
+# ENGINEERING BRIEF: The MoE Generic Constraint Patch (Suite 3-6-9 Fixes)
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Taming DeepSeek: Generic Path Resolution and Architectural Constraints
+**Context:** The MoE model is over-engineering and hallucinating paths. We must constrain its behavior and auto-resolve path truncations generically so RepoOS works on *any* target codebase, without hardcoded folder names.
+
+Please implement these three exact upgrades into `refactor2.py`.
+
+### Phase 1: Dynamic Tool Redirection (Soft-Reject `create_file`)
+
+**Task:** Stop aborting the task when DeepSeek tries to `create_file` on an existing file. Let the engine softly reject it and instruct the LLM on which tool to use.
+
+**Implementation in `apply_actions_to_state`:**
+
+```python
+        if action.action == "create_file":
+            if path in master_state or path in new_state:
+                # SOFT REJECT: Tell the self-heal loop exactly how to fix its mistake generically
+                raise ValueError(
+                    f"Tool Selection Error: You attempted to use 'create_file' on '{path}', "
+                    f"but this file ALREADY EXISTS in the repository. "
+                    f"To add new functions to this file, you MUST use the 'insert_node' tool. "
+                    f"To change existing functions, use 'modify_node'."
+                )
+                
+            new_state[path] = action.content
+
+```
+
+### Phase 2: Generic Path Auto-Resolution & Validation
+
+**Task:** Prevent DeepSeek from using placeholders, and gracefully auto-correct paths if the LLM drops the project's root directory name.
+
+**1. Update Pydantic Schemas to block structural placeholders (Project-Agnostic):**
+
+```python
+from pydantic import BaseModel, Field, field_validator
+
+class RefactorActionBase(BaseModel):
+    file_path: str = Field(..., description="The exact repository path to the file.")
+
+    @field_validator('file_path')
+    def validate_strict_path(cls, v):
+        # Block generic placeholders and angle brackets
+        forbidden = ["<", ">", "path/to", "your_project", "...", "dummy"]
+        if any(f in v.lower() for f in forbidden):
+            raise ValueError(f"Invalid placeholder path detected: {v}. You MUST use the exact paths from the context.")
+            
+        # Block absolute paths and parent traversal
+        if v.startswith("/") or "../" in v:
+            raise ValueError(f"Paths must be strictly relative to the project root. Do not use '/' or '../'. Received: {v}")
+            
+        return v
+
+```
+
+**2. Add Generic Auto-Resolution in `apply_actions_to_state`:**
+Inject this right after you extract `path = action.file_path`, *before* executing the tool logic. This allows the engine to adapt to any project structure dynamically.
+
+```python
+        path = action.file_path
+        
+        # GENERIC PATH AUTO-RESOLUTION
+        # If the exact path is missing, check if the LLM truncated the project root directory
+        if path not in master_state and action.action != "create_file":
+            # Find any file in the graph that ends with the LLM's provided path
+            possible_matches = [p for p in master_state.keys() if p.endswith("/" + path) or p == path]
+            
+            if len(possible_matches) == 1:
+                print(f"   🔍 Auto-corrected truncated path: '{path}' -> '{possible_matches[0]}'")
+                path = possible_matches[0]
+            elif len(possible_matches) > 1:
+                raise ValueError(f"Ambiguous path '{path}'. It matches multiple files: {possible_matches}. Please provide the full path.")
+            else:
+                raise ValueError(f"File '{path}' does not exist in the repository context.")
+
+```
+
+### Phase 3: The "Anti-Overengineering" System Prompt
+
+**Task:** DeepSeek is highly responsive to system prompts. We must explicitly forbid it from creating architectural patterns (like new `utils.py` files) unless requested. Ensure the prompt applies to *any* language/framework.
+
+**Update the `sys_prompt` for the Planner and the Action Generator:**
+
+```python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex codebase. "
+    "CRITICAL ARCHITECTURAL RULES: \n"
+    "1. NO OVER-ENGINEERING: Do NOT create new utility files, configuration files, or helper modules unless the user's prompt explicitly commands you to do so. If asked to add type hints, docstrings, or extract logic, modify the existing files ONLY.\n"
+    "2. TOOL SELECTION: If you need to add a new function or class to an existing file, you MUST use 'insert_node'. Do NOT use 'create_file' on a file that already exists in the provided context.\n"
+    "3. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the `<target_file path='...'>` or `<context_file path='...'>` attributes provided to you.\n"
+    "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+)
+
+```
+
+# Milestone 3.6.11 : 
+
+Phase 1: Syncing the Planner's Brain
+Task: We must restrict the Planner so it mathematically cannot propose over-engineered files (like type_hints.py) before the execution loop even begins.
+
+Update task_sys_prompt (around line 431 in refactor2.py):
+
+Python
+        task_sys_prompt = (
+            "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. NO OVER-ENGINEERING: Do NOT create new utility files, configuration files, or helper modules unless explicitly commanded. If asked to add type hints, docstrings, or extract logic, you MUST modify the existing files ONLY.\n"
+            "2. PRIMARY TARGETS: You MUST identify the 'primary_target_files'. These are the files you are explicitly asked to refactor or audit.\n"
+            "3. NEW FILES: If the instruction requires creating a new file, your VERY FIRST task MUST be to create that file.\n"
+            "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context. Do not use placeholders like 'project_root/' or 'your_project/'."
+        )
+Phase 2: Aggressive Root Stripping
+Task: We must catch literal root hallucinations (project_root/) and violently strip them out before passing the path to our dynamic resolver.
+
+Update resolve_dynamic_path (around line 223 in refactor2.py):
+
+Python
+def resolve_dynamic_path(raw_path: str, master_state: dict, is_new_file: bool = False) -> str:
+    """Generically resolves truncated LLM paths for both existing and new files."""
+    if not raw_path:
+        return raw_path
+        
+    # STRIP HALLUCINATED ROOTS: DeepSeek often takes "project root" literally
+    raw_path = re.sub(r'^(project_root/|repo_root/|your_project/|dummy/)', '', raw_path, flags=re.IGNORECASE)
+    
+    if raw_path in master_state:
+        return raw_path
+        
+    # 1. Match existing files (modify, delete, insert)
+    # ... (Keep the rest of your existing logic here) ...
+Phase 3: Pydantic Path Hardening
+Task: Update both of your Pydantic path validators to instantly reject these literal root strings if they slip through the planner.
+
+Update validate_no_placeholder_paths (around line 144) and validate_strict_path (around line 161) to include the new forbidden strings:
+
+Python
+        # In both validator functions, update the forbidden list:
+        forbidden = ["<", ">", "path/to", "your_project", "...", "dummy", "project_root", "repo_root", "project-root"]
+
+
+# Milestone 3.6.12
+
+Tests are in refactor-test-report-3-6-10.md (Test run #3)
+**1. The Pydantic Union Confusion (Test 1)**
+*Error:* `15 validation errors... (actions.0.CreateFile.action: Input should be 'create_file' [type=literal_error, input_value='update_docstring'])`
+*Why:* Pydantic V2 gets deeply confused when an LLM hallucinates mixed fields inside a `Union`. DeepSeek tried to output a `CreateFile` action, but accidentally named the action `update_docstring`. Pydantic didn't know which schema to validate against, so it threw 15 parallel errors, completely overwhelming the self-healing loop.
+*The Fix:* We must use `Annotated` and a Pydantic `discriminator`. This forces Pydantic to look *only* at the `"action"` key to determine which schema to use, reducing 15 errors down to 1 clean error that the LLM can easily fix.
+
+**2. The Planner's Ignorance of Macro-Actions (Test 1)**
+*Error:* The Planner generated 4 tasks to manually create a file, move a class, and update imports.
+*Why:* We built a brilliant, automated `MoveNode` macro-action in Python that handles all of this automatically! But *we never told the Planner it exists*. Because the Planner broke the job into manual steps, DeepSeek panicked during execution and tried to manually wrap the class instead of using our tool.
+
+**3. The `ModifyNode` Indentation Crash (Test 2)**
+*Error:* `LibCST parsing failed for new node: Syntax Error @ 24:1... expected INDENT`.
+*Why:* We added the "Dummy Wrapper" hack to `InsertNode` to fix LibCST's indentation parsing, but we forgot to apply that exact same hack to `ModifyNodeTransformer`. When DeepSeek tried to modify `get_classes` with a decorator or specific whitespace, LibCST choked.
+
+---
+
+# ENGINEERING BRIEF: The DeepSeek Harmonization Patch
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Pydantic Discriminators, Planner Tool Awareness, and `ModifyNode` Wrapping
+
+Please implement these three precise upgrades into `refactor2.py`.
+
+### Phase 1: Pydantic Discriminators & XML Tag Stripping
+
+**Task 1:** We must force Pydantic to cleanly route the JSON validation, and we must explicitly ban the `<target_file>` XML string from the paths.
+
+**Update the imports and Unions in `refactor2.py` (around line 170):**
+
+```python
+from typing import List, Dict, Optional, Union, AsyncGenerator, Literal, Set, Tuple, Annotated
+
+# --- Define the dynamic Unions ---
+class RefactorProposalSafe(BaseModel):
+    actions: List[Annotated[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of safe refactoring actions.")
+
+class RefactorProposalUnsafe(BaseModel):
+    actions: List[Annotated[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of refactoring actions, including deletion.")
+
+class RefactorProposal(BaseModel):
+    actions: List[Annotated[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of discrete refactoring actions.")
+
+```
+
+**Task 2:** Update `validate_no_placeholder_paths` (around line 105) to trap the XML tags:
+
+```python
+def validate_no_placeholder_paths(v: str) -> str:
+    # Added XML tag patterns and more literal string bans
+    forbidden = ["<", ">", "path/to", "your_project", "...", "dummy", "project_root", "repo_root", "project-root", "target_file path", "context_file path"]
+    v_lower = v.lower()
+    
+    for sub in forbidden:
+        if sub in v_lower:
+            raise ValueError(f"Invalid path hallucination detected: '{v}'. You MUST output exact repository paths from the context.")
+
+```
+
+### Phase 2: Planner Macro-Action Awareness
+
+**Task:** We must sync the Planner's brain with the Execution Engine's capabilities so it stops trying to manually orchestrate complex moves and type hints.
+
+**Update `task_sys_prompt` (around line 450 in `refactor2.py`):**
+
+```python
+        task_sys_prompt = (
+            "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. NO OVER-ENGINEERING: Do NOT create new utility files or helper modules unless explicitly commanded.\n"
+            "2. TYPE HINTS & DOCSTRINGS: NEVER create a new file for type hints (e.g. `type_hints.py`). Type hints and docstrings MUST be added inline to the existing files.\n"
+            "3. MACRO-ACTIONS: The execution engine has a powerful 'move_node' tool that automatically creates the target file, moves the code, and updates all downstream imports. If asked to move a class/function, output a SINGLE task instructing the executor to 'Use move_node'.\n"
+            "4. PRIMARY TARGETS: You MUST identify the 'primary_target_files'.\n"
+            "5. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context."
+        )
+
+```
+
+### Phase 3: The `ModifyNode` Dummy Wrapper
+
+**Task:** Apply the exact same LibCST indentation hack from `InsertNode` to `ModifyNodeTransformer` so LibCST stops crashing on valid DeepSeek code.
+
+**Update `ModifyNodeTransformer.__init__` (around line 24 in `refactor2.py`):**
+
+```python
+class ModifyNodeTransformer(cst.CSTTransformer):
+    """Replaces a function/method while mathematically guaranteeing decorator preservation."""
+    def __init__(self, target_node_name: str, new_node_code: str):
+        self.target_node_name = target_node_name.split('.')[-1]
+        
+        # Ensure no leading whitespace on the very first line breaks the dummy wrapper
+        clean_code = new_node_code.lstrip()
+        
+        # APPLY THE DUMMY WRAPPER HACK
+        dummy_wrapper = f"class __DummyWrapper__:\n{textwrap.indent(clean_code, '    ')}"
+        parsed_module = cst.parse_module(dummy_wrapper)
+        
+        # Extract the actual node from inside the dummy class
+        self.new_node_ast = parsed_module.body[0].body.body[0]
+
+```
+
+# Milestone 3.6.13
+
+Phase 1: Making MoveNode Auto-Initialize Files (Fixes Test 1)
+The Bug: DeepSeek used move_node to move the class to oscar/core/csv_utils.py. The execution engine crashed with File ... not found in state because it tried to append the AST node to a file that didn't exist in the new_state dictionary.
+The Fix: We must manually initialize an empty string for the target file in the execution state before we try to graft the node into it.
+
+Update the move_node block inside apply_actions_to_state in refactor2.py:
+
+Python
+        elif action.action == "move_node":
+            source_path = action.source_file
+            target_path = action.target_file
+            
+            # --- THE AUTO-INITIALIZATION PATCH ---
+            # If the target file doesn't exist yet, create it in the state so LibCST has a canvas
+            if target_path not in new_state and target_path not in master_state:
+                new_state[target_path] = ""
+                print(f"   📄 Auto-created target file for MoveNode: {target_path}")
+            # -------------------------------------
+
+            content_source = new_state.get(source_path, "")
+            content_target = new_state.get(target_path, master_state.get(target_path, ""))
+            
+            try:
+                # ... (Keep your existing LibCST extraction and insertion logic here) ...
+Phase 2: Bulletproof Prefix Stripping (Fixes oscarmain/)
+The Bug: DeepSeek hallucinated the prefix oscarmain/. Our regex only looked for project_root/ or repo_root/.
+The Fix: Instead of playing whack-a-mole with hallucinated repo names, we will use a regex that violently strips any arbitrary directory that precedes the known src/ or oscar/ base directories.
+
+Update resolve_dynamic_path in refactor2.py:
+
+Python
+def resolve_dynamic_path(raw_path: str, master_state: dict, is_new_file: bool = False) -> str:
+    """Generically resolves hallucinated or truncated LLM paths for ANY project structure."""
+    if not raw_path:
+        return raw_path
+        
+    # 1. Strip explicit literal placeholders (these are universally bad LLM habits)
+    raw_path = re.sub(r'^(project_root/|repo_root/|your_project/|dummy/|<target_file path=)', '', raw_path, flags=re.IGNORECASE)
+    raw_path = raw_path.strip("'>\"") # Clean up trailing XML/quote artifacts
+    
+    if raw_path in master_state:
+        return raw_path
+        
+    # 2. PROGRESSIVE SUFFIX MATCHING (For existing files)
+    # If the LLM prepends garbage (e.g. 'oscarmain/src/api.py' instead of 'my_repo/src/api.py'),
+    # we iteratively drop the leftmost directory until we lock onto a unique real path.
+    parts = raw_path.split('/')
+    for i in range(len(parts)):
+        test_suffix = "/".join(parts[i:])
+        possible_matches = [p for p in master_state.keys() if p.endswith("/" + test_suffix) or p == test_suffix]
+        
+        if len(possible_matches) == 1:
+            print(f"   🔍 Auto-corrected existing path: '{raw_path}' -> '{possible_matches[0]}'")
+            return possible_matches[0]
+        # If len > 1, it's ambiguous (e.g., dropping until just 'utils.py' remains). We continue to fail safely.
+
+    # 3. DIRECTORY-AWARE MATCHING (For new files like MoveNode targets)
+    # If the file doesn't exist yet, we apply the progressive matching to its parent directory
+    if is_new_file or not possible_matches:
+        parent_dir = os.path.dirname(raw_path)
+        filename = os.path.basename(raw_path)
+        
+        if parent_dir:
+            parent_parts = parent_dir.split('/')
+            for i in range(len(parent_parts)):
+                test_parent_suffix = "/".join(parent_parts[i:])
+                for existing_path in master_state.keys():
+                    if f"/{test_parent_suffix}/" in existing_path or existing_path.startswith(f"{test_parent_suffix}/"):
+                        # Extract the true project root prefix from the existing sibling file
+                        prefix = existing_path.split(test_parent_suffix)[0]
+                        resolved = os.path.join(prefix, test_parent_suffix, filename).replace('\\', '/')
+                        print(f"   🔍 Auto-corrected new file path: '{raw_path}' -> '{resolved}'")
+                        return resolved
+                        
+    return raw_path # Fallback to original if no match found
+Phase 3: Forcing the Discriminator Key (Fixes Test 2)
+The Bug: DeepSeek output {"file_path": "...", "target_node_signature": "...", "proposed_replace_string": "..."}, but forgot "action": "modify_node". Pydantic panicked.
+The Fix: We must explicitly scream at the Execution LLM (the Action Generator) to include this mandatory literal key in every single JSON dictionary it generates.
+
+Update the sys_prompt for the Action Generator (around line 350 in refactor2.py):
+
+Python
+sys_prompt = (
+    "You are an elite Principal AI Engineer refactoring a complex codebase. "
+    "CRITICAL ARCHITECTURAL RULES: \n"
+    "1. MANDATORY ACTION KEY: You are generating a JSON list of actions. EVERY single action object MUST contain the exact 'action' key so the validator knows which schema to use. (e.g., `\"action\": \"modify_node\"` or `\"action\": \"insert_node\"`). If you omit this key, the system will crash.\n"
+    "2. NO OVER-ENGINEERING: Modify the existing files ONLY unless commanded to create a new one.\n"
+    "3. TOOL SELECTION: Use 'modify_node' to add type hints or change existing functions. Use 'insert_node' to add BRAND NEW functions.\n"
+    "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context.\n"
+    "5. NO DUMMY LOGIC: Preserve the EXACT original business logic. Never use placeholders like `pass`."
+)

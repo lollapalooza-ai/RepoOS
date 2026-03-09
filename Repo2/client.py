@@ -1,7 +1,9 @@
+from Repo1.app import call_search_api
 import requests
 import json
 
-REPO1_BASE_URL = "http://127.0.0.1:5000" # Assuming Repo1 runs locally on port 5000
+REPO1_BASE_URL = "http://127.0.0.1:5000"  # Assuming Repo1 runs locally on port 5000
+
 
 def call_search_api(query, token="valid-token"):
     """
@@ -9,9 +11,11 @@ def call_search_api(query, token="valid-token"):
     """
     headers = {"Authorization": token}
     params = {"q": query}
-    
+
     try:
-        response = requests.get(f"{REPO1_BASE_URL}/search", headers=headers, params=params)
+        response = requests.get(
+            f"{REPO1_BASE_URL}/search", headers=headers, params=params
+        )
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
         return response.json()
     except requests.exceptions.HTTPError as err:
@@ -23,6 +27,7 @@ def call_search_api(query, token="valid-token"):
     except requests.exceptions.RequestException as err:
         print(f"Something went wrong: {err}")
     return None
+
 
 if __name__ == "__main__":
     print("Calling Repo1 search API with query 'normal'...")

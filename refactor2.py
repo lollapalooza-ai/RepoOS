@@ -12,7 +12,7 @@ from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict, Optional, Union, AsyncGenerator, Literal, Set, Tuple
+from typing import List, Dict, Optional, Union, AsyncGenerator, Literal, Set, Tuple, Annotated
 import hashlib
 import ast
 import pyflakes.api
@@ -45,9 +45,15 @@ class ModifyNodeTransformer(cst.CSTTransformer):
     def __init__(self, target_node_name: str, new_node_code: str):
         self.target_node_name = target_node_name.split('.')[-1] # Strip class prefix if present
         
-        # Parse the LLM's proposed replacement logic
-        parsed_module = cst.parse_module(new_node_code)
-        self.new_node_ast = parsed_module.body[0]
+        # Ensure no leading whitespace on the very first line breaks the dummy wrapper
+        clean_code = new_node_code.lstrip()
+        
+        # APPLY THE DUMMY WRAPPER HACK
+        dummy_wrapper = f"class __DummyWrapper__:\n{textwrap.indent(clean_code, '    ')}"
+        parsed_module = cst.parse_module(dummy_wrapper)
+        
+        # Extract the actual node from inside the dummy class
+        self.new_node_ast = parsed_module.body[0].body.body[0]
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.CSTNode:
         if original_node.name.value == self.target_node_name:
@@ -83,7 +89,7 @@ def get_modified_line_numbers(old_content: str, new_content: str) -> Set[int]:
 
 def parse_mypy_output(stdout: str, base_dir: str) -> Dict[str, List[Tuple[int, str]]]:
     """Parses Mypy output into a dict mapping relative filepath -> list of (line_num, exact_error_message)."""
-    errors = {}
+    errors: Dict[str, List[Tuple[int, str]]] = {}
     # Matches Mypy format: "filepath.py:line_num: error/note: Message [error-code]"
     pattern = re.compile(r"^(.*?):(\d+): (?:error|note): (.*)$")
     
@@ -101,23 +107,6 @@ def parse_mypy_output(stdout: str, base_dir: str) -> Dict[str, List[Tuple[int, s
                 errors[rel_path].append((int(line_num), msg.strip()))
             except ValueError:
                 continue
-    return errors
-
-def get_mypy_errors(filepath: str) -> set:
-    """Runs mypy and returns a set of error strings, ignoring line numbers for baseline comparison."""
-    result = subprocess.run(
-        [VENV_PYTHON, "-m", "mypy", filepath, "--ignore-missing-imports", "--follow-imports=silent"],
-        capture_output=True, text=True, check=False
-    )
-    # Strip line numbers so we can compare the exact error signatures
-    errors = set()
-    for line in result.stdout.splitlines():
-        if "error:" in line:
-            # Extract everything after "error:" to ignore line shifts
-            # Format is usually: path/to/file.py:line: error: message
-            parts = line.split("error:")
-            if len(parts) > 1:
-                errors.add(parts[1].strip())
     return errors
 
 def validate_virtual_workspace(pre_state: dict, post_state: dict, modified_paths: list) -> tuple[bool, str]:
@@ -261,10 +250,11 @@ def is_semantically_valid(content: str) -> tuple[bool, str]:
 
 # --- Pydantic Validators (Phase 4: Anti-Hallucination) ---
 def validate_no_placeholder_paths(v: str) -> str:
-    forbidden_substrings = ["path/to", "your/file", "source/file", "target/file", "...", "<", "my_module"]
+    # Added XML tag patterns and more literal string bans
+    forbidden = ["<", ">", "path/to", "your_project", "...", "dummy", "project_root", "repo_root", "project-root", "target_file path", "context_file path"]
     v_lower = v.lower()
     
-    for sub in forbidden_substrings:
+    for sub in forbidden:
         if sub in v_lower:
             raise ValueError(f"Invalid path hallucination detected: '{v}'. You MUST output exact repository paths from the context.")
             
@@ -275,6 +265,23 @@ def validate_no_placeholder_paths(v: str) -> str:
     return v
 
 # --- Pydantic Models (Step 2: Constrained Decoding) ---
+
+class RefactorActionBase(BaseModel):
+    file_path: str = Field(..., description="The exact repository path to the file.")
+
+    @field_validator('file_path')
+    @classmethod
+    def validate_strict_path(cls, v):
+        # Block generic placeholders and angle brackets
+        forbidden = ["<", ">", "path/to", "your_project", "...", "dummy", "project_root", "repo_root", "project-root", "target_file path", "context_file path"]
+        if any(f in v.lower() for f in forbidden):
+            raise ValueError(f"Invalid placeholder path detected: {v}. You MUST use the exact paths from the context.")
+            
+        # Block absolute paths and parent traversal
+        if v.startswith("/") or "../" in v:
+            raise ValueError(f"Paths must be strictly relative to the project root. Do not use '/' or '../'. Received: {v}")
+            
+        return v
 
 class TaskItem(BaseModel):
     task: str = Field(..., description="A clear, actionable description of the refactoring step.")
@@ -287,41 +294,21 @@ class TaskList(BaseModel):
     )
     tasks: List[TaskItem] = Field(..., description="A sequential list of tasks to complete the refactor.")
 
-class CreateFile(BaseModel):
+class CreateFile(RefactorActionBase):
     action: Literal["create_file"] = "create_file"
-    file_path: str = Field(..., description="Path to the new file.")
     content: str = Field(..., description="The complete content of the new file.")
-    
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
-class DeleteFile(BaseModel):
+class DeleteFile(RefactorActionBase):
     action: Literal["delete_file"] = "delete_file"
-    file_path: str = Field(..., description="Path to the file to delete.")
 
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
-
-class ModifyNode(BaseModel):
+class ModifyNode(RefactorActionBase):
     action: Literal["modify_node"] = "modify_node"
-    file_path: str = Field(..., description="Path to the file to modify.")
     target_node_signature: str = Field(..., description="The function or class name to replace (e.g., 'my_func' or 'MyClass.my_method').")
     proposed_replace_string: str = Field(..., description="The NEW complete code for that node (function/class).")
 
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
-
-class AddImport(BaseModel):
+class AddImport(RefactorActionBase):
     action: Literal["add_import"] = "add_import"
-    file_path: str = Field(..., description="Path to the file to modify.")
     import_statement: str = Field(..., description="The import statement to add (e.g., 'import os' or 'from typing import Any').")
-
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 class MoveNode(BaseModel):
     action: Literal["move_node"] = "move_node"
@@ -337,46 +324,38 @@ class MoveNode(BaseModel):
     @classmethod
     def check_path(cls, v): return validate_no_placeholder_paths(v)
 
-class InsertNode(BaseModel):
+class InsertNode(RefactorActionBase):
     action: Literal["insert_node"] = "insert_node"
-    file_path: str = Field(..., description="Path to the existing file.")
     new_node_code: str = Field(..., description="The complete code for the new function or class.")
     target_class_signature: Optional[str] = Field(None, description="If inserting a method into an existing class, provide the class name here (e.g., 'AbstractOrder'). Leave null for global functions.")
-    
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
-class UpdateDocstring(BaseModel):
+class UpdateDocstring(RefactorActionBase):
     action: Literal["update_docstring"] = "update_docstring"
-    file_path: str = Field(..., description="Path to the file.")
-    target_node_signature: str = Field(..., description="The function or class name.")
+    target_node_signature: str = Field(..., description="The function or class name. Use 'MODULE' to update the file-level docstring.")
     new_docstring: str = Field(..., description="The new docstring text, including quotes.")
 
-    @field_validator('file_path')
+    @field_validator('target_node_signature')
     @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
+    def validate_signature(cls, v):
+        if not v or not v.strip():
+            raise ValueError("target_node_signature cannot be empty. Use a specific class/method name, or 'MODULE' for the file-level docstring.")
+        return v
 
-class DeleteLines(BaseModel):
+class DeleteLines(RefactorActionBase):
     action: Literal["delete_lines"] = "delete_lines"
-    file_path: str = Field(..., description="Path to the file.")
     exact_string_match: str = Field(..., description="The exact line(s) of code to delete (e.g., 'Field.register_lookup(ReverseStartsWith)').")
-
-    @field_validator('file_path')
-    @classmethod
-    def check_path(cls, v): return validate_no_placeholder_paths(v)
 
 # --- Define the dynamic Unions (Phase 1: Dynamic Schema Pruning) ---
 class RefactorProposalSafe(BaseModel):
     """Schema used for standard refactoring. DeleteFile is mathematically impossible."""
-    actions: List[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of safe refactoring actions.")
+    actions: List[Annotated[Union[CreateFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of safe refactoring actions.")
 
 class RefactorProposalUnsafe(BaseModel):
     """Schema used ONLY when the user explicitly requests a deletion."""
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of refactoring actions, including deletion.")
+    actions: List[Annotated[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of refactoring actions, including deletion.")
 
 class RefactorProposal(BaseModel):
-    actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]] = Field(..., description="A list of discrete refactoring actions.")
+    actions: List[Annotated[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines], Field(discriminator='action')]] = Field(..., description="A list of discrete refactoring actions.")
 
 
 # Global Parser setup
@@ -461,92 +440,97 @@ def find_node_range(source_code: str, signature: str) -> Optional[tuple[int, int
         
     return None
 
-def resolve_path(target_path: str, master_state: dict) -> str:
-    """
-    Repo-agnostic path resolution. Maps an LLM's potentially truncated 
-    or relative path to the true workspace path.
-    """
-    known_paths = list(master_state.keys())
-    if not known_paths:
-        return target_path
-
-    # 1. Exact Match (The LLM provided the perfect path)
-    if target_path in known_paths:
-        return target_path
-    
-    # 1b. Check if target_path exists on disk as is
-    if os.path.exists(target_path):
-        return target_path
-
-    # 2. Suffix Match (Handles Modification of existing files)
-    # If LLM outputs "core/csv_utils.py", we match it to "src/app/core/csv_utils.py"
-    suffix_matches = [p for p in known_paths if p.endswith(target_path)]
-    if len(suffix_matches) == 1:
-        return suffix_matches[0]
-
-    # 3. Path Reconstruction (Handles CreateFile)
-    # If the path already looks like it starts with 'django-oscar' (repo root), don't join
-    if target_path.startswith("django-oscar/"):
-        return target_path
-
-    try:
-        common_path = os.path.commonpath(known_paths)
-        if common_path in known_paths:
-            common_dir = os.path.dirname(common_path)
-        else:
-            common_dir = common_path
-    except ValueError:
-        common_dir = ""
-
-    if common_dir and not target_path.startswith(common_dir):
-        # Normalize separators for cross-platform compatibility
-        target_parts = target_path.replace('\\', '/').split('/')
-        common_parts = common_dir.replace('\\', '/').split('/')
-
-        # Detect overlap to prevent directory duplication 
-        # (e.g., common_dir="src/app", target="app/new.py" -> "src/app/new.py")
-        overlap_idx = 0
-        for i in range(1, min(len(common_parts), len(target_parts)) + 1):
-            if common_parts[-i:] == target_parts[:i]:
-                overlap_idx = i
-
-        if overlap_idx > 0:
-            return os.path.join(common_dir, *target_parts[overlap_idx:])
-        else:
-            return os.path.join(common_dir, target_path)
-
-    return target_path
-
 def calculate_checksum(content: str) -> str:
-    import hashlib
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
 def path_to_python_module(filepath: str) -> str:
-    """Converts a file path to a python module path without destroying app namespaces."""
+    """Converts a file path to a python module path, dynamically stripping repo root wrappers."""
     path = filepath
     if path.endswith(".py"): path = path[:-3]
     
-    # ONLY strip src/ or other top-level project wrappers. 
-    # Do NOT strip 'oscar/' as that is the actual root package namespace.
-    if path.startswith("src/"):
-        path = path[4:]
+    # Dynamically strip anything up to and including 'src/' (e.g., 'django-oscar/src/')
+    # If no 'src/' exists, it falls back to stripping the top-level repo folder
+    if "/src/" in path or path.startswith("src/"):
+        path = re.sub(r"^(.*?/)?src/", "", path)
+    elif "/" in path:
+        # Fallback: Strip the first directory (assumed to be the repo root)
+        path = path.split("/", 1)[1]
         
     return path.replace("/", ".").replace("\\", ".")
 
-def execute_graph_query(query: str, parameters: dict = None) -> list:
+def execute_graph_query(query: str, parameters: Optional[dict] = None) -> list:
     """Executes a Cypher query and returns the results as a list of dictionaries."""
     with driver.session() as session:
         result = session.run(query, parameters or {})
         return [record for record in result]
 
-def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode]], original_checksums: Dict[str, str] = None, intent: str = "") -> Dict[str, str]:
+def resolve_dynamic_path(raw_path: str, master_state: dict, is_new_file: bool = False) -> str:
+    """Generically resolves hallucinated or truncated LLM paths for ANY project structure."""
+    if not raw_path:
+        return raw_path
+        
+    # 1. Strip explicit literal placeholders (these are universally bad LLM habits)
+    raw_path = re.sub(r'^(project_root/|repo_root/|your_project/|dummy/|project-root/|<target_file path=)', '', raw_path, flags=re.IGNORECASE)
+    raw_path = raw_path.strip("'>\"") # Clean up trailing XML/quote artifacts
+    
+    if raw_path in master_state:
+        return raw_path
+        
+    # 2. PROGRESSIVE SUFFIX MATCHING (For existing files)
+    # If the LLM prepends garbage (e.g. 'oscarmain/src/api.py' instead of 'my_repo/src/api.py'),
+    # we iteratively drop the leftmost directory until we lock onto a unique real path.
+    parts = raw_path.split('/')
+    for i in range(len(parts)):
+        test_suffix = "/".join(parts[i:])
+        possible_matches = [p for p in master_state.keys() if p.endswith("/" + test_suffix) or p == test_suffix]
+        
+        if len(possible_matches) == 1:
+            print(f"   🔍 Auto-corrected existing path: '{raw_path}' -> '{possible_matches[0]}'")
+            return possible_matches[0]
+        # If len > 1, it's ambiguous (e.g., dropping until just 'utils.py' remains). We continue to fail safely.
+
+    # 3. DIRECTORY-AWARE MATCHING (For new files like MoveNode targets)
+    # If the file doesn't exist yet, we apply the progressive matching to its parent directory
+    if is_new_file or not possible_matches:
+        parent_dir = os.path.dirname(raw_path)
+        filename = os.path.basename(raw_path)
+        
+        if parent_dir:
+            parent_parts = parent_dir.split('/')
+            for i in range(len(parent_parts)):
+                test_parent_suffix = "/".join(parent_parts[i:])
+                for existing_path in master_state.keys():
+                    if f"/{test_parent_suffix}/" in existing_path or existing_path.startswith(f"{test_parent_suffix}/"):
+                        # Extract the true project root prefix from the existing sibling file
+                        prefix = existing_path.split(test_parent_suffix)[0]
+                        resolved = os.path.join(prefix, test_parent_suffix, filename).replace('\\', '/')
+                        print(f"   🔍 Auto-corrected new file path: '{raw_path}' -> '{resolved}'")
+                        return resolved
+                        
+    return raw_path # Fallback to original if no match found
+
+def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[CreateFile, DeleteFile, ModifyNode, AddImport, MoveNode, InsertNode, UpdateDocstring, DeleteLines]], original_checksums: Optional[Dict[str, str]] = None, intent: str = "") -> Dict[str, str]:
     """
     Programmatically applies surgical actions (Phase 2 Upgrade).
     """
     new_state = master_state.copy()
     for action in actions:
-        # 1. Resolve the path dynamically (Phase 1: Repo-Agnostic Path Resolution)
-        path = resolve_path(action.file_path if hasattr(action, 'file_path') else "", master_state)
+        # 1. Pre-process and sanitize all paths dynamically before execution
+        if hasattr(action, 'file_path'):
+            action.file_path = resolve_dynamic_path(
+                action.file_path, master_state, getattr(action, 'action', '') == 'create_file'
+            )
+            
+        if hasattr(action, 'source_file'):
+            action.source_file = resolve_dynamic_path(action.source_file, master_state, False)
+            
+        if hasattr(action, 'target_file'):
+            action.target_file = resolve_dynamic_path(action.target_file, master_state, True)
+            
+        # 2. Extract the primary path for the current action
+        path = getattr(action, 'file_path', None)
+        if not path and hasattr(action, 'source_file'):
+            path = action.source_file
         
         # Step 3A: Pre-flight checksum check
         if original_checksums and path in original_checksums and path in new_state:
@@ -556,13 +540,14 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 continue
 
         if action.action == "create_file":
-            # THE ABUSE SHIELD
             if path in master_state or path in new_state:
                 raise ValueError(
-                    f"Action Rejected: You attempted to use 'create_file' on '{path}', "
+                    f"Tool Selection Error: You attempted to use 'create_file' on '{path}', "
                     f"but this file ALREADY EXISTS in the repository. "
-                    f"You MUST use 'modify_node', 'insert_node', or 'update_docstring' to edit existing files."
+                    f"If you are adding TYPE HINTS or DOCSTRINGS to existing code, use 'modify_node'. "
+                    f"If you are adding a BRAND NEW function, use 'insert_node'."
                 )
+                
             new_state[path] = action.content
             print(f"   📄 Created new file {path}")
 
@@ -636,8 +621,15 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 raise ValueError(f"LibCST modification failed for '{action.target_node_signature}': {e}")
 
         elif action.action == "move_node":
-            source_path = resolve_path(action.source_file, master_state)
-            target_path = resolve_path(action.target_file, master_state)
+            source_path = action.source_file
+            target_path = action.target_file
+
+            # --- THE AUTO-INITIALIZATION PATCH ---
+            # If the target file doesn't exist yet, create it in the state so LibCST has a canvas
+            if target_path not in new_state and target_path not in master_state:
+                new_state[target_path] = ""
+                print(f"   📄 Auto-created target file for MoveNode: {target_path}")
+            # -------------------------------------
             
             if source_path not in new_state:
                 print(f"❌ Move Error: Source file {source_path} not found in state.")
@@ -690,8 +682,8 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             # Phase 2: Graph-Automated Downstream Imports
             # 1. Query Neo4j to find downstream consumers
             node_name = extract_name_from_signature(action.node_signature)
-            cypher_query = f"""
-            MATCH (f:File)-[:IMPORTS]->(n:Node {{name: $node_name}})
+            cypher_query = """
+            MATCH (f:File)-[:IMPORTS]->(n:Node {name: $node_name})
             RETURN f.path as affected_path
             """
             affected_records = execute_graph_query(cypher_query, {"node_name": node_name})
@@ -717,6 +709,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                     new_state[file_path] = new_import + content.lstrip()
                     print(f"   ⚓ Automatically updated downstream import in {file_path}")
 
+
         elif action.action == "add_import":
             if path not in new_state:
                 new_state[path] = ""
@@ -727,8 +720,23 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 print(f"   ⚓ Added import to {path}: {action.import_statement}")
 
         elif action.action == "insert_node":
-            if path not in new_state: continue
-            content = new_state[path]
+            content = new_state.get(path, "")
+            
+            # --- THE DUPLICATION SHIELD ---
+            # Extract the name of the function or class the LLM is trying to insert
+            import re
+            match = re.search(r'^\s*(?:async\s+)?(?:def|class)\s+([a-zA-Z0-9_]+)', action.new_node_code.lstrip())
+            if match:
+                node_name = match.group(1)
+                # If a definition with this exact name already exists in the file, block it
+                if re.search(rf'^(?:async\s+)?(?:def|class)\s+{node_name}\b', content, re.MULTILINE):
+                    raise ValueError(
+                        f"Duplication Error: '{node_name}' already exists in this file. "
+                        f"Because you are trying to ADD TYPE HINTS or update an existing node, "
+                        f"you MUST use the 'modify_node' tool instead of 'insert_node'."
+                    )
+            # ------------------------------
+
             try:
                 # 1. Force the LLM's code into a valid, dedented string
                 raw_llm_code = textwrap.dedent(action.new_node_code.strip('\n'))
@@ -769,22 +777,33 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 source_tree = cst.parse_module(content)
                 # Parse the new docstring string into a SimpleStatementLine
                 clean_doc = action.new_docstring.strip('"').strip("'")
-                new_doc_node = cst.parse_module(f'"""{clean_doc}"""').body[0]
+                new_doc_node = cst.parse_module(f'"""{clean_doc}"""\n').body[0]
                 
-                class DocstringTransformer(cst.CSTTransformer):
-                    def leave_FunctionDef(self, original_node, updated_node):
-                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
-                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
-                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
-                        return updated_node
-                        
-                    def leave_ClassDef(self, original_node, updated_node):
-                        if original_node.name.value == action.target_node_signature.split('.')[-1]:
-                            new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
-                            return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
-                        return updated_node
+                # BRANCH 1: Module-level docstrings
+                if action.target_node_signature == "MODULE":
+                    if source_tree.get_docstring():
+                        new_body = [new_doc_node] + list(source_tree.body)[1:]
+                    else:
+                        new_body = [new_doc_node] + list(source_tree.body)
+                    modified_tree = source_tree.with_changes(body=new_body)
+                
+                # BRANCH 2: Class and Function docstrings
+                else:
+                    class DocstringTransformer(cst.CSTTransformer):
+                        def leave_FunctionDef(self, original_node, updated_node):
+                            if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                                new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                                return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                            return updated_node
+                            
+                        def leave_ClassDef(self, original_node, updated_node):
+                            if original_node.name.value == action.target_node_signature.split('.')[-1]:
+                                new_body = [new_doc_node] + list(updated_node.body.body)[1:] if updated_node.get_docstring() else [new_doc_node] + list(updated_node.body.body)
+                                return updated_node.with_changes(body=updated_node.body.with_changes(body=new_body))
+                            return updated_node
 
-                modified_tree = source_tree.visit(DocstringTransformer())
+                    modified_tree = source_tree.visit(DocstringTransformer())
+                
                 new_state[path] = modified_tree.code
                 
                 # THE FALSE SUCCESS SHIELD
@@ -819,7 +838,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
         
     return new_state
 
-def apply_updates(file_updates: Dict[str, str], original_checksums: Dict[str, str] = None):
+def apply_updates(file_updates: Dict[str, str], original_checksums: Optional[Dict[str, str]] = None):
     """Writes changes to disk with strict checksum verification (Step 3A)."""
     for path, content in file_updates.items():
         if original_checksums and path in original_checksums:
@@ -868,7 +887,7 @@ def get_file_skeleton(source_code: str) -> str:
 
 def get_hybrid_context(instruction: str) -> Dict[str, List[str]]:
     """Phase 1: Dynamic Context Scoping. Pulls entire file AST if 'audit' intent detected."""
-    context_map = {}
+    context_map: Dict[str, List[str]] = {}
     
     # Heuristic for intent-based scoping
     audit_match = re.search(r"(audit|all functions in|all classes in|everything in)\s+([a-zA-Z0-9_\-\./]+)", instruction, re.IGNORECASE)
@@ -946,9 +965,13 @@ async def main():
 
         task_sys_prompt = (
             "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
-            "CRITICAL: You MUST identify the 'primary_target_files'. These are the files you are explicitly asked to refactor or audit. "
-            "Do NOT include files that are only provided for context or that might need minor caller updates.\n"
-            "NEW FILES: If the instruction requires creating a new file (e.g., a new utils.py), your VERY FIRST task MUST be to create that file using a 'create_file' instruction description."
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. NO OVER-ENGINEERING: Do NOT create new utility files or helper modules unless explicitly commanded.\n"
+            "2. TYPE HINTS & DOCSTRINGS: NEVER create a new file for type hints (e.g. `type_hints.py`). Type hints and docstrings MUST be added inline to the existing files.\n"
+            "3. MACRO-ACTIONS: The execution engine has a powerful 'move_node' tool that automatically creates the target file, moves the code, and updates all downstream imports. If asked to move a class/function, output a SINGLE task instructing the executor to 'Use move_node'.\n"
+            "4. PRIMARY TARGETS: You MUST identify the 'primary_target_files'.\n"
+            "5. NEW FILES: If the instruction requires creating a new file, your VERY FIRST task MUST be to create that file.\n"
+            "6. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context. Do not use placeholders like 'project_root/' or 'your_project/'."
         )
         task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}"
         
@@ -1063,16 +1086,20 @@ async def main():
         context_str = "\n\n".join(context_blocks) + parent_context_xml
         
         sys_prompt = (
-            "You are an elite Principal AI Engineer refactoring a complex Python monolith. "
-            "CRITICAL RULES: \n"
-            "1. NO HALLUCINATIONS: You MUST strictly use the variables, kwargs, and attributes exactly as they appear in the provided file context. Do not invent `self.order_number` if the code uses `self.number`. Do not invent exception names.\n"
-            "2. ABSOLUTE IMPORTS ONLY: Never use relative imports (like `from . import lookups`). ALL imports must be absolute paths from the project root (e.g., `from oscar.core.models import lookups`).\n"
-            "3. SCOPE AWARENESS: Do not use `self` inside global utility functions, static decorators, or outside of a Class instance.\n"
-            "4. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
-            "5. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file.\n"
-            "6. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
-            "7. CLASS METHOD AWARENESS: When modifying a method within a class (like `get_context_data`), you MUST use `self.request` instead of `request` to access the request object. Never assume `request` is available in the local scope unless it is a function argument.\n"
-            "8. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
+            "You are an elite Principal AI Engineer refactoring a complex codebase. "
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. MANDATORY ACTION KEY: You are generating a JSON list of actions. EVERY single action object MUST contain the exact 'action' key so the validator knows which schema to use. (e.g., `\"action\": \"modify_node\"` or `\"action\": \"insert_node\"`). If you omit this key, the system will crash.\n"
+            "2. NO OVER-ENGINEERING: Do NOT create new utility files, configuration files, or helper modules unless the user's prompt explicitly commands you to do so. If asked to add type hints, docstrings, or extract logic, modify the existing files ONLY.\n"
+            "3. TOOL SELECTION: \n"
+            "- To add TYPE HINTS, docstrings, or change an existing function, you MUST use 'modify_node'.\n"
+            "- To add a BRAND NEW function to an existing file, you MUST use 'insert_node'.\n"
+            "- Do NOT use 'create_file' on a file that already exists.\n"
+            "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the `<target_file path='...'>` or `<context_file path='...'>` attributes provided to you.\n"
+            "5. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+            "6. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file.\n"
+            "7. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+            "8. ABSOLUTE IMPORTS ONLY: Never use relative imports. ALL imports must be absolute paths from the project root.\n"
+            "9. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
@@ -1169,7 +1196,7 @@ async def main():
             # We check if this was a creation task
             is_critical = "create" in task.task.lower() or "insert" in task.task.lower() or "add" in task.task.lower()
             if is_critical:
-                print(f"🛑 CRITICAL FAILURE: Node creation/insertion failed. Arming 'Do No Harm' shield for downstream tasks.")
+                print("🛑 CRITICAL FAILURE: Node creation/insertion failed. Arming 'Do No Harm' shield for downstream tasks.")
                 failed_critical_tasks = True
                 
             continue

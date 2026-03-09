@@ -4,17 +4,23 @@ from tree_sitter import Language, Parser
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 
-source_code = """
-import requests as req
-import boto3
-from os import path as p
-"""
+with open('api_cityscape.py', 'r') as f:
+    source = f.read()
 
-tree = parser.parse(bytes(source_code, "utf8"))
+tree = parser.parse(bytes(source, "utf8"))
 
-def print_node(node, level=0):
-    print("  " * level + f"{node.type}: {source_code[node.start_byte:node.end_byte]}")
+def find_node(node):
+    if node.type == "decorated_definition" and "async def" in source[node.start_byte:node.end_byte]:
+        print(f"Node: {node.type}")
+        for child in node.children:
+             print(f"  Child: {child.type}")
+             if child.type == "function_definition":
+                 for gchild in child.children:
+                     print(f"    GChild: {gchild.type}")
+        return True
     for child in node.children:
-        print_node(child, level + 1)
+        if find_node(child):
+            return True
+    return False
 
-print_node(tree.root_node)
+find_node(tree.root_node)

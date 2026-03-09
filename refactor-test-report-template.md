@@ -1,6 +1,6 @@
 # Refactoring Test Report - Suite [Number] ([Round/Context])
 
-This report documents the results of rerunning the refactoring tests after [Context/Engineer Fixes].
+This report documents the detailed results of the refactoring tests, including raw JSON outputs, error traces, and target code snapshots for each run.
 
 | Test # | Prompt | Status | Correctness (1-5) | Summary |
 |---|---|---|---|---|
@@ -12,17 +12,18 @@ This report documents the results of rerunning the refactoring tests after [Cont
 **Prompt:**
 [Exact text of the prompt given to the tool]
 
-**Tasks:**
+**Planner Tasks:**
 1. [Task description from the planner]
 2. [Task description from the planner]
 ...
 
-**Raw LLM Plan (Segment):**
+**Raw LLM Plan (Full JSON Output):**
 ```json
 {
+  "primary_target_files": ["[path/to/file.py]"],
   "tasks": [
     {
-      "task": "[Example Task Name]",
+      "task": "[Task Name]",
       "context": { "[path/to/file.py]": ["[NodeName]"] }
     }
   ]
@@ -31,28 +32,32 @@ This report documents the results of rerunning the refactoring tests after [Cont
 
 **Target Code (Before):**
 ```python
-# Snippet of the original code before modification
-def example_method(self):
+# Exact snippet of the original code targeted for modification
+# Include enough context to understand the state before refactoring
+def original_method(self):
     pass
 ```
 
-**Python Error Trace:**
+**Python Error Trace & Self-Healing Logs:**
 ```text
-# Exact error output from the engine (SyntaxError, LibCST error, validation errors, etc.)
-# e.g., 🔄 Self-Healing Retry 1/3 due to: Verification failed...
+# Exact error output from the engine for every failed attempt or validation error
+# Include: SyntaxError, LibCST errors, Pydantic validation errors, etc.
+# Example:
+# 🔄 Self-Healing Retry 1/3 due to: LibCST modification failed...
+# ❌ Task [N] failed after 3 attempts.
 ```
 
-**Evaluation:**
-- **Task 1 ([Short Description]):** [Success/Failed]. [Detailed explanation of why].
+**Detailed Task Evaluation:**
+- **Task 1 ([Short Description]):** [Success/Failed]. [Detailed explanation of why it passed or failed, comparing it to a senior engineer's approach].
 - **Task 2 ([Short Description]):** [Success/Failed]. [Detailed explanation of why].
-- **Self-Healing:** [Analysis of how the tool attempted to fix its own errors].
-- **Note:** [Any additional observations, e.g., hallucinations or regressions].
+- **Self-Healing Performance:** [Analysis of whether the tool identified the correct issue and if its fix was effective].
+- **Tool Behavior Notes:** [Observations on path hallucinations, code duplication, safety blocks, or unintended deletions].
 
 ---
 
 ## Overall Summary (Suite [Number])
 
-[General narrative overview of the round's performance]
+[General narrative overview of the round's performance across all tests]
 
 ### Key Strengths:
 1.  **[Strength 1]:** [Description]
@@ -63,4 +68,4 @@ def example_method(self):
 2.  **[Weakness 2]:** [Description]
 
 ### Suggestions for Improvement:
-- [Actionable advice for developers]
+- [Specific actionable advice for the RepoOS development team to address identified weaknesses]
