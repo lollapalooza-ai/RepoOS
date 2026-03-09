@@ -2752,3 +2752,141 @@ sys_prompt = (
     "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context.\n"
     "5. NO DUMMY LOGIC: Preserve the EXACT original business logic. Never use placeholders like `pass`."
 )
+
+# Milestone 3.6.14
+
+# ENGINEERING BRIEF: The Final Prompt Alignment
+
+**To:** Lead/Senior AI Engineer
+**From:** Principal AI Architect
+**Subject:** Aligning Planner Strategy and Pydantic Compliance
+
+Please replace the two system prompt blocks in `refactor2.py` with these updated versions.
+
+### Phase 1: Syncing the Planner's Brain (Fixes Test 1)
+
+**Task:** Replace the existing `task_sys_prompt` (around line 368 in `refactor2.py`) to inform the Planner about the `move_node` macro-action and forbid manual file creation for moves.
+
+```python
+        task_sys_prompt = (
+            "You are a senior architect. Generate a sequential list of refactoring tasks.\n"
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. NO OVER-ENGINEERING: Do NOT create new utility files or helper modules unless explicitly commanded.\n"
+            "2. TYPE HINTS & DOCSTRINGS: NEVER create a new file for type hints (e.g. `type_hints.py`). Type hints and docstrings MUST be added inline to the existing files.\n"
+            "3. MACRO-ACTIONS: The execution engine has a powerful 'move_node' tool that automatically creates the target file, moves the code, and updates all downstream imports. If asked to move a class/function, output a SINGLE task instructing the executor to 'Use move_node'. Do NOT create the file manually first.\n"
+            "4. PRIMARY TARGETS: You MUST identify the 'primary_target_files'.\n"
+            "5. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context."
+        )
+
+```
+
+### Phase 2: Forcing the Discriminator Key (Fixes Test 2)
+
+**Task:** Replace the existing `sys_prompt` (around line 430 in `refactor2.py`) to inject the "MANDATORY ACTION KEY" instruction, forcing DeepSeek to comply with Pydantic's discriminator requirement.
+
+```python
+        sys_prompt = (
+            "You are an elite Principal AI Engineer refactoring a complex codebase. "
+            "CRITICAL ARCHITECTURAL RULES: \n"
+            "1. MANDATORY ACTION KEY: You are generating a JSON list of actions. EVERY single action object MUST contain the exact 'action' key so the validator knows which schema to use (e.g., `\"action\": \"modify_node\"` or `\"action\": \"insert_node\"`). If you omit this key, the system will crash.\n"
+            "2. NO OVER-ENGINEERING: Modify the existing files ONLY unless commanded to create a new one.\n"
+            "3. TOOL SELECTION: \n"
+            "- To add TYPE HINTS, docstrings, or change an existing function, you MUST use 'modify_node'.\n"
+            "- To add a BRAND NEW function to an existing file, you MUST use 'insert_node'.\n"
+            "- Do NOT use 'create_file' on a file that already exists.\n"
+            "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the `<target_file path='...'>` or `<context_file path='...'>` attributes provided to you.\n"
+            "5. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
+            "6. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+            "7. ABSOLUTE IMPORTS ONLY: Never use relative imports. ALL imports must be absolute paths from the project root.\n"
+            "8. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
+        )
+
+```
+
+# Milestone 3.6.15 : The Final Lock-Down
+### The Autopsy of the 8th Attempt
+# ENGINEERING BRIEF: The Final Lock-Down
+
+**To:** Lead/Senior AI Engineer
+
+**From:** Principal AI Architect
+
+**Subject:** Resolving AST Node Destruction and Path Ambiguity
+
+Please apply these three precise patches to `refactor2.py`.
+
+### Phase 1: The Ambiguity Tie-Breaker
+
+**Task:** We must teach `resolve_dynamic_path` how to break ties when a path matches both a source file and a test file.
+
+**Update the `resolve_dynamic_path` loop in `refactor2.py`:**
+
+```python
+    # 2. PROGRESSIVE SUFFIX MATCHING (For existing files)
+    parts = raw_path.split('/')
+    for i in range(len(parts)):
+        test_suffix = "/".join(parts[i:])
+        possible_matches = [p for p in master_state.keys() if p.endswith("/" + test_suffix) or p == test_suffix]
+        
+        if len(possible_matches) == 1:
+            print(f"   🔍 Auto-corrected existing path: '{raw_path}' -> '{possible_matches[0]}'")
+            return possible_matches[0]
+        elif len(possible_matches) > 1:
+            # THE TIE-BREAKER: Filter out 'tests/' directories unless explicitly asked for
+            non_test_matches = [p for p in possible_matches if "/tests/" not in p and "test_" not in p.split('/')[-1]]
+            if len(non_test_matches) == 1:
+                print(f"   🔍 Auto-corrected ambiguous path (Tie-breaker won): '{raw_path}' -> '{non_test_matches[0]}'")
+                return non_test_matches[0]
+            
+            # If still ambiguous, default to the shortest path (usually the core source file)
+            best_match = min(possible_matches, key=len)
+            print(f"   ⚠️ Ambiguous path '{raw_path}'. Defaulting to shortest: '{best_match}'")
+            return best_match
+
+```
+
+### Phase 2: The `MoveNode` State Fallback
+
+**Task:** We must ensure `MoveNode` reads from the `master_state` if the source file hasn't been edited yet.
+
+**Update the variable assignment inside the `move_node` execution block:**
+
+```python
+        elif action.action == "move_node":
+            source_path = action.source_file
+            target_path = action.target_file
+            
+            if target_path not in new_state and target_path not in master_state:
+                new_state[target_path] = ""
+                print(f"   📄 Auto-created target file for MoveNode: {target_path}")
+
+            # THE STATE FALLBACK PATCH: Must check master_state if not in new_state
+            content_source = new_state.get(source_path, master_state.get(source_path, ""))
+            content_target = new_state.get(target_path, master_state.get(target_path, ""))
+            
+            if not content_source:
+                raise ValueError(f"Move Error: Source file {source_path} is empty or not found in state.")
+
+```
+
+### Phase 3: The "Anti-Destruction" Prompt Rules
+
+**Task:** We must explicitly enforce the `add_import` tool so DeepSeek stops trying to overwrite functions with import strings.
+
+**Update the `sys_prompt` Tool Selection rules (around line 430):**
+
+```python
+            "3. TOOL SELECTION: \n"
+            "- To add IMPORTS, you MUST use the 'add_import' action. NEVER use 'modify_node' to add imports, as it will overwrite and destroy the target function.\n"
+            "- To add TYPE HINTS, docstrings, or change an existing function, you MUST use 'modify_node'.\n"
+            "- To add a BRAND NEW function to an existing file, you MUST use 'insert_node'.\n"
+            "- Do NOT use 'create_file' on a file that already exists.\n"
+
+```
+
+**Task 2:** We must also stop the Planner from hallucinating module names like `oscarmodule`. Add this rule to the `task_sys_prompt`:
+
+```python
+            "5. EXACT CONTEXT: Do NOT hallucinate module names (like 'oscarmodule') in your context output. You MUST use the exact file paths provided to you."
+
+```

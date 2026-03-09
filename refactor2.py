@@ -364,7 +364,9 @@ parser = Parser(PY_LANGUAGE)
 
 async def generate_streaming_json(system_prompt: str, user_prompt: str, response_model: BaseModel) -> AsyncGenerator[str, None]:
     """
-    Streams tokens from Ollama while enforcing the Pydantic schema (Step 2: Constrained Decoding).
+    Streams tokens from Ollama. 
+    Switched from strict schema grammar to native JSON mode to prevent MoE token-looping 
+    and union_tag_not_found bugs.
     """
     client = ollama.AsyncClient()
     schema = response_model.model_json_schema()
@@ -372,12 +374,18 @@ async def generate_streaming_json(system_prompt: str, user_prompt: str, response
     async for part in await client.chat(
         model=MODEL_NAME,
         messages=[
-            {'role': 'system', 'content': f"{system_prompt}\nReturn ONLY JSON matching this schema: {json.dumps(schema)}"},
+            {'role': 'system', 'content': f"{system_prompt}\nReturn ONLY valid JSON exactly matching this schema: {json.dumps(schema)}"},
             {'role': 'user', 'content': user_prompt}
         ],
-        format=schema,
+        # FIX 1: Change format=schema to format="json"
+        format="json", 
         stream=True,
-        options={'temperature': 0.1, 'num_ctx': 32768}
+        options={
+            'temperature': 0.1, 
+            'num_ctx': 32768,
+            # FIX 2: Explicitly grant 8k tokens for output generation to prevent EOF truncations
+            'num_predict': 8192 
+        }
     ):
         yield part['message']['content']
 
@@ -487,7 +495,17 @@ def resolve_dynamic_path(raw_path: str, master_state: dict, is_new_file: bool = 
         if len(possible_matches) == 1:
             print(f"   🔍 Auto-corrected existing path: '{raw_path}' -> '{possible_matches[0]}'")
             return possible_matches[0]
-        # If len > 1, it's ambiguous (e.g., dropping until just 'utils.py' remains). We continue to fail safely.
+        elif len(possible_matches) > 1:
+            # THE TIE-BREAKER: Filter out 'tests/' directories unless explicitly asked for
+            non_test_matches = [p for p in possible_matches if "/tests/" not in p and "test_" not in p.split('/')[-1]]
+            if len(non_test_matches) == 1:
+                print(f"   🔍 Auto-corrected ambiguous path (Tie-breaker won): '{raw_path}' -> '{non_test_matches[0]}'")
+                return non_test_matches[0]
+
+            # If still ambiguous, default to the shortest path (usually the core source file)
+            best_match = min(possible_matches, key=len)
+            print(f"   ⚠️ Ambiguous path '{raw_path}'. Defaulting to shortest: '{best_match}'")
+            return best_match
 
     # 3. DIRECTORY-AWARE MATCHING (For new files like MoveNode targets)
     # If the file doesn't exist yet, we apply the progressive matching to its parent directory
@@ -631,11 +649,14 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
                 print(f"   📄 Auto-created target file for MoveNode: {target_path}")
             # -------------------------------------
             
-            if source_path not in new_state:
-                print(f"❌ Move Error: Source file {source_path} not found in state.")
-                continue
+            # THE STATE FALLBACK PATCH: Must check master_state if not in new_state
+            content_source = new_state.get(source_path, master_state.get(source_path, ""))
+            content_target = new_state.get(target_path, master_state.get(target_path, ""))
             
-            source_content = new_state[source_path]
+            if not content_source:
+                raise ValueError(f"Move Error: Source file {source_path} is empty or not found in state.")
+
+            source_content = content_source
             node_range = find_node_range(source_content, action.node_signature)
             if not node_range:
                 print(f"❌ Move Error: Node '{action.node_signature}' not found in {source_path}.")
@@ -645,7 +666,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             node_code = source_content[start:end]
             
             # Phase 6: AST Collision Check
-            target_content = new_state.get(target_path, "")
+            target_content = content_target
             if target_content:
                 target_namespace = get_namespace_identifiers(target_content)
                 moved_node_name = extract_name_from_signature(action.node_signature)
@@ -670,7 +691,7 @@ def apply_actions_to_state(master_state: Dict[str, str], actions: List[Union[Cre
             if hasattr(action, 'required_imports') and action.required_imports:
                 import_block = "\n".join(action.required_imports) + "\n\n"
 
-            existing_content = new_state.get(target_path, "")
+            existing_content = content_target
             # Avoid duplicating imports if they already exist
             if import_block.strip() and import_block.strip() not in existing_content:
                 new_state[target_path] = import_block + existing_content + "\n\n" + node_code
@@ -968,12 +989,12 @@ async def main():
             "CRITICAL ARCHITECTURAL RULES: \n"
             "1. NO OVER-ENGINEERING: Do NOT create new utility files or helper modules unless explicitly commanded.\n"
             "2. TYPE HINTS & DOCSTRINGS: NEVER create a new file for type hints (e.g. `type_hints.py`). Type hints and docstrings MUST be added inline to the existing files.\n"
-            "3. MACRO-ACTIONS: The execution engine has a powerful 'move_node' tool that automatically creates the target file, moves the code, and updates all downstream imports. If asked to move a class/function, output a SINGLE task instructing the executor to 'Use move_node'.\n"
+            "3. MACRO-ACTIONS: The execution engine has a powerful 'move_node' tool that automatically creates the target file, moves the code, and updates all downstream imports. If asked to move a class/function, output a SINGLE task instructing the executor to 'Use move_node'. Do NOT create the file manually first.\n"
             "4. PRIMARY TARGETS: You MUST identify the 'primary_target_files'.\n"
-            "5. NEW FILES: If the instruction requires creating a new file, your VERY FIRST task MUST be to create that file.\n"
-            "6. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the provided context. Do not use placeholders like 'project_root/' or 'your_project/'."
+            "5. EXACT CONTEXT: Do NOT hallucinate module names (like 'oscarmodule') in your context output. You MUST use the exact file paths provided to you.\n"
+            "6. PATH ACCURACY: Never invent or truncate paths. ALL file paths must exactly match the keys in the CONTEXT dictionary provided to you. If a key is 'django-oscar/src/oscar/core/compat.py', you MUST use that exact string, not 'oscar/core/compat.py'."
         )
-        task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT: {json.dumps(context_map)}"
+        task_user_prompt = f"INSTRUCTION: {intent}\nCONTEXT (Dictionary keys are the ONLY valid file paths): {json.dumps(context_map)}"
         
         print("\n🧠 Generating Refactoring Plan...")
         full_task_json = ""
@@ -1088,18 +1109,18 @@ async def main():
         sys_prompt = (
             "You are an elite Principal AI Engineer refactoring a complex codebase. "
             "CRITICAL ARCHITECTURAL RULES: \n"
-            "1. MANDATORY ACTION KEY: You are generating a JSON list of actions. EVERY single action object MUST contain the exact 'action' key so the validator knows which schema to use. (e.g., `\"action\": \"modify_node\"` or `\"action\": \"insert_node\"`). If you omit this key, the system will crash.\n"
-            "2. NO OVER-ENGINEERING: Do NOT create new utility files, configuration files, or helper modules unless the user's prompt explicitly commands you to do so. If asked to add type hints, docstrings, or extract logic, modify the existing files ONLY.\n"
+            "1. MANDATORY ACTION KEY: You are generating a JSON list of actions. EVERY single action object MUST contain the exact 'action' key so the validator knows which schema to use (e.g., `\"action\": \"modify_node\"` or `\"action\": \"insert_node\"`). If you omit this key, the system will crash.\n"
+            "2. NO OVER-ENGINEERING: Modify the existing files ONLY unless commanded to create a new one.\n"
             "3. TOOL SELECTION: \n"
+            "- To add IMPORTS, you MUST use the 'add_import' action. NEVER use 'modify_node' to add imports, as it will overwrite and destroy the target function.\n"
             "- To add TYPE HINTS, docstrings, or change an existing function, you MUST use 'modify_node'.\n"
             "- To add a BRAND NEW function to an existing file, you MUST use 'insert_node'.\n"
             "- Do NOT use 'create_file' on a file that already exists.\n"
             "4. PATH ACCURACY: Never invent paths. ALL file paths must exactly match the `<target_file path='...'>` or `<context_file path='...'>` attributes provided to you.\n"
             "5. NO DUMMY LOGIC: When extracting or modifying code, preserve the EXACT original business logic. Never use placeholders like `pass`.\n"
-            "6. NO CONTEXT WANDERING: You will be provided with context files to help you understand the codebase. Do NOT modify these context files unless explicitly required to update a caller. If asked to audit a specific file, restrict 100% of your docstring/formatting updates to that specific file.\n"
-            "7. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
-            "8. ABSOLUTE IMPORTS ONLY: Never use relative imports. ALL imports must be absolute paths from the project root.\n"
-            "9. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
+            "6. EXTRACTION COMPLETENESS: If extracting logic, you MUST output the full extracted utility function, and you MUST update the original caller to use it.\n"
+            "7. ABSOLUTE IMPORTS ONLY: Never use relative imports. ALL imports must be absolute paths from the project root.\n"
+            "8. NO CODE OMISSION: Never use `# ...`, `// ...`, or `[rest of code]` placeholders. You MUST provide the COMPLETE and functional code for every node you output. Token laziness is strictly forbidden.\n"
         )
         user_prompt = f"CONTEXT:\n{context_str}\n\nINSTRUCTION:\n{task.task}\n\nOutput MUST strictly conform to the Pydantic Action Union. DO NOT modify any code outside the provided node bounds."
         
