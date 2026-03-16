@@ -1,5 +1,6 @@
 import ctypes
 import asyncio
+import sys
 from neo4j import GraphDatabase
 from component2_smt import verified_generation_loop
 from component4_jit import PolyKernelJIT
@@ -21,9 +22,14 @@ class LazyCallManager:
             print(f"\n⚡ [TRAP] Intercepted call to uncompiled function: '{func_name}'")
             print(f"⚡ [TRAP] Suspending thread. Triggering AI Poly-Kernel...")
             
-            # Note: In a deep production async app, you'd manage event loops differently. 
-            # For this MVP orchestrator thread, asyncio.run is sufficient to block until compiled.
-            compiled_func = asyncio.run(self.compile_on_demand(func_name, arg_types, return_type))
+            # Use current event loop if it exists, else create one
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            compiled_func = loop.run_until_complete(self.compile_on_demand(func_name, arg_types, return_type))
             
             # Hot-Patch
             self.registry[func_name] = compiled_func
@@ -36,43 +42,69 @@ class LazyCallManager:
 
     async def compile_on_demand(self, func_name: str, arg_types, return_type):
         with self.driver.session() as session:
-            result = session.run("MATCH (f:Function {name: $name}) RETURN f.code", name=func_name)
+            result = session.run("MATCH (f:Function {name: $name}) RETURN f.code, f.arg_count", name=func_name)
             record = result.single()
             if not record:
                 raise Exception(f"Function {func_name} not found in Neo4j.")
-            func_code = record[0]
+            func_code, arg_count = record[0], record[1]
 
-        # Improved intent for better LLM results
+        # GENERIC INTENT
         intent = (
-            f"Implement the logic of this Python function: \n{func_code}\n"
-            f"It takes {len(arg_types)} float inputs: 'arg1' is the amount, 'arg2' is the region.\n"
-            "MAPPING RULES:\n"
-            "- If region is 'CA', the input 'arg2' will be 1.0. Use 'cmp_eq' with 1.0.\n"
-            "- If region is 'NY', the input 'arg2' will be 2.0. Use 'cmp_eq' with 2.0.\n"
-            "- Otherwise tax is 0.0.\n"
-            "Return the calculated result."
+            f"Translate this Python logic into a DOD MLIR execution graph: \n{func_code}\n"
+            f"It takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'.\n"
+            "Return the calculated result in the final operation."
         )
+        
+        # NOTE: In component2_smt, semantic equivalence might need bypassing for arbitrary functions
         verified_mlir = await verified_generation_loop(intent)
         
         CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)
-        return self.kernel.incremental_compile(func_name, verified_mlir, CFuncType)
+        return self.kernel.incremental_compile(func_name, verified_mlir, CFuncType, arg_count)
 
-# --- Boot & Execute ---
+# --- Boot & Interactive REPL ---
 if __name__ == "__main__":
     orchestrator = LazyCallManager()
     
-    # 1. Boot: Register functions found in the directory as Trampolines
-    # (Mocking 'calculate_tax' from legacy_shop)
-    orchestrator.register_lazy_function("calculate_tax", [ctypes.c_double, ctypes.c_double], ctypes.c_double)
-    print("--- Poly-Kernel OS Booted. Awaiting Execution ---")
+    print("--- Booting Poly-Kernel OS ---")
+    print("Mapping Semantic Graph to Global Offset Table...")
     
-    # 2. Execution Run 1 (Cold Start -> Trap -> Compile -> Execute)
-    # Using 1.0 for CA as per previous successful run logic
-    print("\n>>> Calling 'calculate_tax(100.0, 1.0)' [1st Time]")
-    result1 = orchestrator.registry["calculate_tax"](100.0, 1.0)
-    print(f"Result 1: {result1}")
+    # DYNAMIC BOOT SEQUENCE
+    with orchestrator.driver.session() as session:
+        result = session.run("MATCH (f:Function) WHERE f.arg_count IS NOT NULL RETURN f.name, f.arg_count")
+        count = 0
+        for record in result:
+            name, arg_c = record["f.name"], record["f.arg_count"]
+            arg_types = [ctypes.c_double] * arg_c
+            orchestrator.register_lazy_function(name, arg_types, ctypes.c_double)
+            count += 1
+            
+    print(f"✅ Boot Complete. {count} functions registered.")
     
-    # 3. Execution Run 2 (Warm Start -> Direct Bare-Metal Execution)
-    print("\n>>> Calling 'calculate_tax(200.0, 1.0)' [2nd Time]")
-    result2 = orchestrator.registry["calculate_tax"](200.0, 1.0)
-    print(f"Result 2: {result2}")
+    # GENERIC REPL
+    print("\n[Poly-Kernel] Ready. Type 'exit' to quit.")
+    while True:
+        try:
+            cmd = input("\n[Poly-Kernel] Enter function call (e.g., 'calculate_tax 100 1.0') or 'exit': ")
+        except EOFError:
+            break
+            
+        if cmd.lower() == 'exit': break
+        parts = cmd.split()
+        if not parts: continue
+        
+        f_name = parts[0]
+        try:
+            args = [float(x) for x in parts[1:]]
+        except ValueError:
+            print("❌ Invalid arguments. Use numbers.")
+            continue
+        
+        if f_name in orchestrator.registry:
+            try:
+                # Execute dynamically
+                res = orchestrator.registry[f_name](*args)
+                print(f"🔥 Result: {res}")
+            except Exception as e:
+                print(f"❌ Execution Error: {e}")
+        else:
+            print(f"Unknown function: {f_name}")

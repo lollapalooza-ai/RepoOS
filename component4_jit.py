@@ -13,15 +13,19 @@ class PolyKernelJIT:
         self.empty_mod = llvm.parse_assembly("")
         self.engine = llvm.create_mcjit_compiler(self.empty_mod, self.target_machine)
 
-    def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature):
+    def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature, arg_count: int):
         module = ir.Module(name=f"module_{func_name}")
-        func_type = ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()])
+        
+        # DYNAMIC ARGUMENT ARRAY
+        arg_types = [ir.DoubleType()] * arg_count
+        func_type = ir.FunctionType(ir.DoubleType(), arg_types)
         func = ir.Function(module, func_type, name=func_name)
         
         block = func.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
         
-        variables = {"arg1": func.args[0], "arg2": func.args[1]}
+        # Map variables: arg0, arg1, arg2 ... argN
+        variables = {f"arg{i}": func.args[i] for i in range(arg_count)}
         last_res = None
         
         def resolve_arg(arg_str):
@@ -38,16 +42,12 @@ class PolyKernelJIT:
             if op == "cmp_eq":
                 v1 = resolve_arg(instruction.args[0])
                 v2 = resolve_arg(instruction.args[1])
-                # returns i1
                 cmp = builder.fcmp_ordered('==', v1, v2, name=f"{instruction.target_var}_cmp")
-                # cast i1 to double (1.0 or 0.0)
                 last_res = builder.uitofp(cmp, ir.DoubleType(), name=instruction.target_var)
             elif op == "select":
                 cond_val = resolve_arg(instruction.args[0])
                 true_val = resolve_arg(instruction.args[1])
                 false_val = resolve_arg(instruction.args[2])
-                # cast double back to i1 for select
-                # 1.0 is true, anything else false? Let's check > 0.5
                 cond_i1 = builder.fcmp_ordered('>', cond_val, ir.Constant(ir.DoubleType(), 0.5), name=f"{instruction.target_var}_cond")
                 last_res = builder.select(cond_i1, true_val, false_val, name=instruction.target_var)
             else:
