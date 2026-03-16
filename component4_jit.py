@@ -1,97 +1,73 @@
 import llvmlite.ir as ir
 import llvmlite.binding as llvm
 import ctypes
-from component2_smt import VerifiedMLIR # Import the schema
+from component2_smt import VerifiedMLIR
 
-# Initialize LLVM backend
 llvm.initialize()
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
 
-def dynamic_jit_compile_and_run(mlir_data: VerifiedMLIR, input_args: list[float]):
-    """
-    Takes the mathematically verified Pydantic schema and dynamically synthesizes machine code.
-    """
-    # 1. Setup Module
-    module = ir.Module(name="dynamic_repo_kernel")
-    
-    # Assuming 2 inputs and 1 output for the MVP schema
-    func_type = ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()])
-    func = ir.Function(module, func_type, name="synthesized_task")
-    
-    block = func.append_basic_block(name="entry")
-    builder = ir.IRBuilder(block)
-    
-    # 2. Variable Registry
-    variables = {"arg1": func.args[0], "arg2": func.args[1]}
-    last_res = None
-    
-    # 3. The Opcode Router (Translates JSON Intent to Metal)
-    for instruction in mlir_data.operations:
-        op = instruction.op
+class PolyKernelJIT:
+    def __init__(self):
+        self.target_machine = llvm.Target.from_default_triple().create_target_machine()
+        self.empty_mod = llvm.parse_assembly("")
+        self.engine = llvm.create_mcjit_compiler(self.empty_mod, self.target_machine)
+
+    def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature):
+        module = ir.Module(name=f"module_{func_name}")
+        func_type = ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()])
+        func = ir.Function(module, func_type, name=func_name)
         
-        # Resolve arguments (are they literal numbers or variables?)
+        block = func.append_basic_block(name="entry")
+        builder = ir.IRBuilder(block)
+        
+        variables = {"arg1": func.args[0], "arg2": func.args[1]}
+        last_res = None
+        
         def resolve_arg(arg_str):
             if arg_str in variables:
                 return variables[arg_str]
             try:
-                # Try to parse as float literal
                 return ir.Constant(ir.DoubleType(), float(arg_str))
             except ValueError:
-                # If not a known variable and not a float, default to 0.0 or raise error
-                # For MVP, let's just use 0.0
                 return ir.Constant(ir.DoubleType(), 0.0)
 
-        val1 = resolve_arg(instruction.args[0])
-        val2 = resolve_arg(instruction.args[1])
-        
-        # Execute routing
-        if op == "add":
-            last_res = builder.fadd(val1, val2, name=instruction.target_var)
-        elif op == "sub":
-            last_res = builder.fsub(val1, val2, name=instruction.target_var)
-        elif op == "mul":
-            last_res = builder.fmul(val1, val2, name=instruction.target_var)
-        elif op == "div":
-            last_res = builder.fdiv(val1, val2, name=instruction.target_var)
+        for instruction in mlir_data.operations:
+            op = instruction.op
             
-        variables[instruction.target_var] = last_res
+            if op == "cmp_eq":
+                v1 = resolve_arg(instruction.args[0])
+                v2 = resolve_arg(instruction.args[1])
+                # returns i1
+                cmp = builder.fcmp_ordered('==', v1, v2, name=f"{instruction.target_var}_cmp")
+                # cast i1 to double (1.0 or 0.0)
+                last_res = builder.uitofp(cmp, ir.DoubleType(), name=instruction.target_var)
+            elif op == "select":
+                cond_val = resolve_arg(instruction.args[0])
+                true_val = resolve_arg(instruction.args[1])
+                false_val = resolve_arg(instruction.args[2])
+                # cast double back to i1 for select
+                # 1.0 is true, anything else false? Let's check > 0.5
+                cond_i1 = builder.fcmp_ordered('>', cond_val, ir.Constant(ir.DoubleType(), 0.5), name=f"{instruction.target_var}_cond")
+                last_res = builder.select(cond_i1, true_val, false_val, name=instruction.target_var)
+            else:
+                v1 = resolve_arg(instruction.args[0])
+                v2 = resolve_arg(instruction.args[1])
+                if op == "add": last_res = builder.fadd(v1, v2, name=instruction.target_var)
+                elif op == "sub": last_res = builder.fsub(v1, v2, name=instruction.target_var)
+                elif op == "mul": last_res = builder.fmul(v1, v2, name=instruction.target_var)
+                elif op == "div": last_res = builder.fdiv(v1, v2, name=instruction.target_var)
+            
+            variables[instruction.target_var] = last_res
+            
+        if last_res is None:
+            last_res = ir.Constant(ir.DoubleType(), 0.0)
+            
+        builder.ret(last_res)
         
-    # If no operations, return 0.0 or something sensible
-    if last_res is None:
-        last_res = builder.constant(ir.DoubleType(), 0.0)
+        llmod = llvm.parse_assembly(str(module))
+        self.engine.add_module(llmod)
+        self.engine.finalize_object()
         
-    builder.ret(last_res)
-    
-    # 4. ORC JIT Compilation
-    target_machine = llvm.Target.from_default_triple().create_target_machine()
-    jit = llvm.create_mcjit_compiler(llvm.parse_assembly(str(module)), target_machine)
-    
-    jit.finalize_object()
-    jit.run_static_constructors()
-    
-    # 5. Execute Machine Code from RAM
-    func_ptr = jit.get_function_address("synthesized_task")
-    cfunc = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double, ctypes.c_double)(func_ptr)
-    
-    # Run the compiled pointer using the provided float arguments
-    result = cfunc(input_args[0], input_args[1])
-    return result
-
-# --- Mock Execution Test ---
-if __name__ == "__main__":
-    # Simulate receiving the Pydantic object from Component 2
-    mock_mlir = VerifiedMLIR(
-        memory_allocations=[{"name": "calc_buffer", "size": 10}],
-        loop_limit=5,
-        access_offset=0,
-        operations=[
-            {"op": "mul", "args": ["arg1", "1.2"], "target_var": "taxed_val"}, # arg1 * 1.2
-            {"op": "add", "args": ["taxed_val", "arg2"], "target_var": "final_total"} # taxed + arg2
-        ]
-    )
-    
-    # Simulate executing the dynamically compiled code with inputs (100.0, 15.0)
-    print("Compiling directly to Native Assembly...")
-    out = dynamic_jit_compile_and_run(mock_mlir, [100.0, 15.0])
-    print(f"Execution Result (100 * 1.2 + 15): {out}")
+        func_ptr = self.engine.get_function_address(func_name)
+        return ctypes_signature(func_ptr)

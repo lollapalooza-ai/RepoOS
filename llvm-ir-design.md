@@ -1,4 +1,4 @@
-Milestone : 1.0.0
+# Milestone : 1.0.0
 
 # ENGINEERING BLUEPRINT: Repo OS Poly-Kernel MVP
 
@@ -230,7 +230,7 @@ compile_and_execute_jit()
 3. **Phase 3:** Wire Tree-sitter -> Neo4j -> LLM -> Z3 -> LLVM IR end-to-end.
 
 
-Milestone 1.0.1
+# Milestone 1.0.1
 
 **MEMO: ENGINEERING BLUEPRINT v2.0**
 **To:** Lead Senior Engineer
@@ -595,3 +595,471 @@ if __name__ == "__main__":
     print(f"Execution Result (100 * 1.2 + 15): {out}")
 
 ```
+
+# Milestone 1.0.3
+
+**MEMO: ENGINEERING BLUEPRINT v3.0 (THE POLY-KERNEL ORCHESTRATOR)**
+**To:** Lead Senior Engineer
+**From:** Principal Architecture / AI Systems
+**Subject:** Implementation Guide for Demand-Driven Poly-Kernel Architecture
+
+We are officially moving past the micro-benchmark phase. Do not attempt to AOT (Ahead-of-Time) compile the entire `legacy_shop` directory. We are building a **Demand-Driven Lazy Lowering** system.
+
+The architecture relies on a **Trampoline Mesh**. The OS boots instantly, registering all known functions as fake memory pointers (Trampolines). When the execution thread hits a Trampoline, it traps the system, calls the AI to generate mathematically verified MLIR, JIT-compiles it directly into the running RAM, patches the pointer, and resumes execution.
+
+Below is the complete, 5-component production code required to execute this architecture. Please build and run them in this exact order.
+
+---
+
+### Component 1: The Generic Ingestor (`component1_ingest.py`)
+
+**Objective:** Recursively map the target directory (`legacy_shop`) into a Neo4j Code Property Graph. This provides the Semantic Ground Truth.
+
+```python
+import os
+import tree_sitter_python as tspython
+from tree_sitter import Language, Parser
+from neo4j import GraphDatabase
+
+# --- Configuration ---
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "password")
+TARGET_DIR = "./legacy_shop"
+
+PY_LANGUAGE = Language(tspython.language())
+parser = Parser(PY_LANGUAGE)
+driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+
+def process_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        source_code = f.read()
+    
+    tree = parser.parse(bytes(source_code, "utf8"))
+    func_query = PY_LANGUAGE.query("(function_definition name: (identifier) @func.name)")
+    call_query = PY_LANGUAGE.query("(call function: (identifier) @call.name)")
+    
+    with driver.session() as session:
+        session.run("MERGE (file:File {path: $path})", path=file_path)
+        
+        # 1. Map Functions & Code
+        for capture_name, nodes in func_query.captures(tree.root_node).items():
+            for node in nodes:
+                func_name = node.text.decode('utf8')
+                func_body = source_code[node.parent.start_byte:node.parent.end_byte]
+                
+                session.run("""
+                    MATCH (file:File {path: $path})
+                    MERGE (f:Function {name: $name, file: $path})
+                    SET f.code = $code
+                    MERGE (file)-[:CONTAINS]->(f)
+                """, name=func_name, path=file_path, code=func_body)
+                
+        # 2. Map Dependencies (The Blast Radius)
+        for capture_name, nodes in call_query.captures(tree.root_node).items():
+            for node in nodes:
+                callee_name = node.text.decode('utf8')
+                parent = node.parent
+                while parent and parent.type != 'function_definition':
+                    parent = parent.parent
+                
+                if parent:
+                    name_node = parent.child_by_field_name('name')
+                    if name_node:
+                        caller_name = name_node.text.decode('utf8')
+                        session.run("""
+                            MERGE (caller:Function {name: $caller})
+                            MERGE (callee:Function {name: $callee})
+                            MERGE (caller)-[:CALLS]->(callee)
+                        """, caller=caller_name, callee=callee_name)
+
+def ingest_folder(folder_path):
+    print(f"🚀 Starting Deep Ingestion: {folder_path}")
+    for root, dirs, files in os.walk(folder_path):
+        dirs[:] = [d for d in dirs if d not in ['.git', 'venv', '.venv', '__pycache__']]
+        for file in files:
+            if file.endswith(".py"):
+                process_file(os.path.join(root, file))
+    print("✅ Semantic Graph Ingestion Complete.")
+
+if __name__ == "__main__":
+    ingest_folder(TARGET_DIR)
+
+```
+
+---
+
+### Component 2: The MLIR/SMT Generator (`component2_smt.py`)
+
+**Objective:** Define the rigid Pydantic schema for the LLM. Mathematically prove via Z3 that the AI did not hallucinate memory bounds or logic traps.
+
+```python
+import json
+import asyncio
+from typing import List, Literal
+from pydantic import BaseModel, Field
+from z3 import *
+import ollama
+
+# --- 1. The Strict Pydantic Schema ---
+class MemoryAllocation(BaseModel):
+    name: str = Field(..., description="Name of the array/struct.")
+    size: int = Field(..., description="Exact allocated size in elements.")
+
+class Operation(BaseModel):
+    op: Literal["add", "sub", "mul", "div"] = Field(..., description="The mathematical opcode.")
+    args: List[str] = Field(..., description="Variables or literal numbers to operate on.")
+    target_var: str = Field(..., description="The variable to store the result in.")
+
+class VerifiedMLIR(BaseModel):
+    memory_allocations: List[MemoryAllocation] = Field(..., description="Memory constraints.")
+    loop_limit: int = Field(..., description="Max loop iterations.")
+    access_offset: int = Field(..., description="Offset pointer for memory access.")
+    operations: List[Operation] = Field(..., description="The Execution Graph.")
+
+# --- 2. Z3 SMT Verification ---
+def verify_llm_safety(mlir_data: VerifiedMLIR) -> tuple[bool, str]:
+    solver = Solver()
+    i = Int('i')
+    loop_limit = IntVal(mlir_data.loop_limit)
+    offset = IntVal(mlir_data.access_offset)
+    loop_condition = And(i >= 0, i < loop_limit)
+    
+    for alloc in mlir_data.memory_allocations:
+        array_size = IntVal(alloc.size)
+        access_index = i + offset
+        memory_violation = Or(access_index >= array_size, access_index < 0)
+        solver.push()
+        solver.add(loop_condition)
+        solver.add(memory_violation)
+        if solver.check() == sat:
+            return False, f"FATAL: Memory violation in '{alloc.name}' at index {solver.model()[i]}."
+        solver.pop()
+
+    for op in mlir_data.operations:
+        if op.op == "div" and op.args[1].isdigit() and int(op.args[1]) == 0:
+            return False, "FATAL: Division by zero detected."
+    return True, "PROVEN SAFE"
+
+# --- 3. Generative Feedback Loop ---
+async def generate_execution_graph(intent: str, error_context: str = "") -> str:
+    client = ollama.AsyncClient()
+    prompt = f"Convert this business intent into a DOD MLIR execution graph: '{intent}'."
+    if error_context:
+        prompt += f"\nYOUR PREVIOUS ATTEMPT FAILED MATHEMATICAL VERIFICATION:\n{error_context}\nFix it."
+        
+    response = await client.chat(
+        model="llama3", # Swap to local Meta LLM Compiler when ready
+        messages=[{'role': 'user', 'content': prompt}],
+        format=VerifiedMLIR.model_json_schema()
+    )
+    return response['message']['content']
+
+async def verified_generation_loop(intent: str) -> VerifiedMLIR:
+    error_msg = ""
+    for attempt in range(3):
+        print(f"   [AI] Generating Graph (Attempt {attempt + 1})...")
+        mlir_json = await generate_execution_graph(intent, error_msg)
+        try:
+            mlir_data = VerifiedMLIR.model_validate_json(mlir_json)
+        except Exception as e:
+            error_msg = f"JSON schema violation: {e}"
+            continue
+            
+        is_safe, msg = verify_llm_safety(mlir_data)
+        if is_safe:
+            print("   [Z3] ✅ Graph mathematically verified.")
+            return mlir_data
+        error_msg = msg 
+        
+    raise Exception("System halted: LLM failed to generate safe graph after 3 attempts.")
+
+```
+
+---
+
+### Component 3: The Semantic API (`component3_api.py`)
+
+**Objective:** Serve the human-readable intent. PMs and developers look at this, *never* the LLVM IR.
+
+```python
+from fastapi import FastAPI, HTTPException
+from neo4j import GraphDatabase
+
+app = FastAPI()
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+
+@app.get("/api/semantic_projection/{func_name}")
+def get_business_logic(func_name: str):
+    with driver.session() as session:
+        query = """
+        MATCH (f:Function {name: $name})
+        OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+        RETURN f.name AS func, f.code AS raw_code, collect(callee.name) AS dependencies
+        """
+        result = session.run(query, name=func_name).single()
+        
+        if not result or not result["func"]:
+            raise HTTPException(status_code=404, detail="Semantic node not found.")
+            
+        pseudo_code = f"BUSINESS REQUIREMENT: {result['func'].title()}\n" + ("=" * 50) + "\n"
+        pseudo_code += "DEPENDENCY FLOW:\n"
+        deps = [d for d in result["dependencies"] if d]
+        if deps:
+            for d in deps: pseudo_code += f"  ↳ Triggers module: {d}\n"
+        else:
+            pseudo_code += "  ↳ Isolated execution\n"
+            
+        pseudo_code += "\nCORE LOGIC ANCHOR:\n"
+        raw_code = result["raw_code"] if result["raw_code"] else "No code snippet available."
+        pseudo_code += "\n".join([f"    {line}" for line in raw_code.split("\n")[:5]]) 
+        return {"ide_view_content": pseudo_code}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+```
+
+---
+
+### Component 4: The Persistent JIT Engine (`component4_jit.py`)
+
+**Objective:** A stateful class that keeps LLVM alive in memory. It incrementally patches new modules into the RAM space without disrupting existing compiled functions.
+
+```python
+import llvmlite.ir as ir
+import llvmlite.binding as llvm
+from component2_smt import VerifiedMLIR
+
+llvm.initialize()
+llvm.initialize_native_target()
+llvm.initialize_native_asmprinter()
+
+class PolyKernelJIT:
+    def __init__(self):
+        self.target_machine = llvm.Target.from_default_triple().create_target_machine()
+        self.backing_mod = llvm.parse_assembly("")
+        self.engine = llvm.create_mcjit_compiler(self.backing_mod, self.target_machine)
+
+    def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature):
+        module = ir.Module(name=f"module_{func_name}")
+        func_type = ir.FunctionType(ir.DoubleType(), [ir.DoubleType(), ir.DoubleType()])
+        func = ir.Function(module, func_type, name=func_name)
+        
+        block = func.append_basic_block(name="entry")
+        builder = ir.IRBuilder(block)
+        
+        variables = {"arg1": func.args[0], "arg2": func.args[1]}
+        last_res = None
+        
+        for instruction in mlir_data.operations:
+            op = instruction.op
+            val1 = builder.constant(ir.DoubleType(), float(instruction.args[0])) if instruction.args[0].replace('.','',1).isdigit() else variables[instruction.args[0]]
+            val2 = builder.constant(ir.DoubleType(), float(instruction.args[1])) if instruction.args[1].replace('.','',1).isdigit() else variables[instruction.args[1]]
+            
+            if op == "add": last_res = builder.fadd(val1, val2, name=instruction.target_var)
+            elif op == "sub": last_res = builder.fsub(val1, val2, name=instruction.target_var)
+            elif op == "mul": last_res = builder.fmul(val1, val2, name=instruction.target_var)
+            elif op == "div": last_res = builder.fdiv(val1, val2, name=instruction.target_var)
+            variables[instruction.target_var] = last_res
+            
+        if last_res is None:
+            last_res = builder.constant(ir.DoubleType(), 0.0)
+            
+        builder.ret(last_res)
+        
+        # Add to the running engine
+        self.engine.add_module(llvm.parse_assembly(str(module)))
+        self.engine.finalize_object()
+        
+        # Extract native pointer and cast it
+        func_ptr = self.engine.get_function_address(func_name)
+        return ctypes_signature(func_ptr)
+
+```
+
+---
+
+### Component 5: The Trampoline Mesh (`component5_orchestrator.py`)
+
+**Objective:** The control plane. It registers fake pointers for uncompiled functions. When triggered, it halts execution, orchestrates the AI compilation, hot-patches the memory, and resumes.
+
+```python
+import ctypes
+import asyncio
+from neo4j import GraphDatabase
+from component2_smt import verified_generation_loop
+from component4_jit import PolyKernelJIT
+
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "password")
+
+class LazyCallManager:
+    def __init__(self):
+        self.kernel = PolyKernelJIT()
+        self.registry = {} # Global Offset Table
+        self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+        self._trampoline_refs = [] # Prevent garbage collection of ctypes hooks
+
+    def register_lazy_function(self, func_name: str, arg_types, return_type):
+        CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)
+        
+        def trampoline_trap(*args):
+            print(f"\n⚡ [TRAP] Intercepted call to uncompiled function: '{func_name}'")
+            print(f"⚡ [TRAP] Suspending thread. Triggering AI Poly-Kernel...")
+            
+            # Note: In a deep production async app, you'd manage event loops differently. 
+            # For this MVP orchestrator thread, asyncio.run is sufficient to block until compiled.
+            compiled_func = asyncio.run(self.compile_on_demand(func_name, arg_types, return_type))
+            
+            # Hot-Patch
+            self.registry[func_name] = compiled_func
+            print(f"⚡ [TRAP] Hot-patch complete. Resuming bare-metal execution.\n")
+            return compiled_func(*args)
+
+        c_trampoline = CFuncType(trampoline_trap)
+        self._trampoline_refs.append(c_trampoline)
+        self.registry[func_name] = c_trampoline
+
+    async def compile_on_demand(self, func_name: str, arg_types, return_type):
+        with self.driver.session() as session:
+            result = session.run("MATCH (f:Function {name: $name}) RETURN f.code", name=func_name)
+            record = result.single()
+            if not record:
+                raise Exception(f"Function {func_name} not found in Neo4j.")
+            func_code = record[0]
+
+        intent = f"Implement this logic: {func_code}. It takes {len(arg_types)} inputs."
+        verified_mlir = await verified_generation_loop(intent)
+        
+        CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)
+        return self.kernel.incremental_compile(func_name, verified_mlir, CFuncType)
+
+# --- Boot & Execute ---
+if __name__ == "__main__":
+    orchestrator = LazyCallManager()
+    
+    # 1. Boot: Register functions found in the directory as Trampolines
+    # (Mocking 'calculate_tax' from legacy_shop)
+    orchestrator.register_lazy_function("calculate_tax", [ctypes.c_double, ctypes.c_double], ctypes.c_double)
+    print("--- Poly-Kernel OS Booted. Awaiting Execution ---")
+    
+    # 2. Execution Run 1 (Cold Start -> Trap -> Compile -> Execute)
+    print("\n>>> Calling 'calculate_tax(100.0, 15.0)' [1st Time]")
+    result1 = orchestrator.registry["calculate_tax"](100.0, 15.0)
+    print(f"Result 1: {result1}")
+    
+    # 3. Execution Run 2 (Warm Start -> Direct Bare-Metal Execution)
+    print("\n>>> Calling 'calculate_tax(200.0, 30.0)' [2nd Time]")
+    result2 = orchestrator.registry["calculate_tax"](200.0, 30.0)
+    print(f"Result 2: {result2}")
+
+```
+
+### Engineering Validation Steps:
+
+Run `component1` to ingest your test directory. Then run `component5`. You will physically see the Trampoline trap the execution, invoke the LLM, verify it with Z3, compile it to RAM, and execute it natively.
+
+
+# Milestone 1.0.3.1
+
+We then ask Z3 to prove a negative: "Is there any possible combination of inputs where Oracle Output ≠ Candidate Output?" If Z3 returns unsat (unsatisfiable), we have mathematical proof that the AI perfectly translated the business logic.
+
+Upgrading Component 2 for Semantic Equivalence
+Here is how you instruct your Senior Engineer to add this Semantic Equivalence check to component2_smt.py.
+
+For the MVP, we will simulate the "Oracle" logic (what we expect the function to do mathematically) and compare it against the sequence of operations the LLM generated.
+
+Python
+from z3 import *
+from pydantic import BaseModel, Field
+from typing import List, Literal
+
+# (Assuming VerifiedMLIR schema is already defined here)
+
+def verify_semantic_equivalence(mlir_data: VerifiedMLIR, expected_formula) -> tuple[bool, str]:
+    """
+    Proves that the LLM-generated operations mathematically match the original business logic.
+    """
+    solver = Solver()
+    
+    # 1. Define our symbolic variables (representing the inputs to the function)
+    arg1 = Real('arg1')
+    arg2 = Real('arg2')
+    
+    # A registry to track the state of variables as Z3 processes the LLM's steps
+    z3_vars = {"arg1": arg1, "arg2": arg2}
+    
+    # 2. Build the Candidate Formula from the LLM's Execution Graph
+    for instruction in mlir_data.operations:
+        op = instruction.op
+        
+        # Parse arguments: Are they existing variables or literal numbers?
+        val1 = float(instruction.args[0]) if instruction.args[0].replace('.','',1).isdigit() else z3_vars[instruction.args[0]]
+        val2 = float(instruction.args[1]) if instruction.args[1].replace('.','',1).isdigit() else z3_vars[instruction.args[1]]
+        
+        # Apply the mathematical operation
+        if op == "add": result = val1 + val2
+        elif op == "sub": result = val1 - val2
+        elif op == "mul": result = val1 * val2
+        elif op == "div": result = val1 / val2
+            
+        # Store the intermediate Z3 equation in the registry
+        z3_vars[instruction.target_var] = result
+
+    # The final output of the LLM's graph
+    # (Assuming the last operation's target_var holds the final result)
+    candidate_output = z3_vars[mlir_data.operations[-1].target_var]
+    
+    # 3. Define the Oracle Formula (The Ground Truth from Neo4j)
+    # For example, if the original Python code was: "return arg1 * 1.2 + arg2"
+    # In a full production system, you use Symbolic Execution to extract this automatically.
+    # For this MVP, we pass it as a Z3 equation via `expected_formula`.
+    oracle_output = expected_formula(arg1, arg2)
+    
+    # 4. The Equivalence Query
+    # We ask Z3: "Is it possible for the Candidate Output to NOT equal the Oracle Output?"
+    solver.add(candidate_output != oracle_output)
+    
+    if solver.check() == sat:
+        # Z3 found a scenario where the AI's logic produces a different result than the original code
+        model = solver.model()
+        error_msg = (f"SEMANTIC MISMATCH: Logic fails equivalence test.\n"
+                     f"If arg1={model.evaluate(arg1)} and arg2={model.evaluate(arg2)},\n"
+                     f"Original Code Outputs: {model.evaluate(oracle_output)}\n"
+                     f"AI Generated Outputs: {model.evaluate(candidate_output)}")
+        return False, error_msg
+        
+    return True, "PROVEN SEMANTICALLY EQUIVALENT"
+
+# --- Test the Verification ---
+if __name__ == "__main__":
+    # Oracle: The original Python intent was "arg1 * 1.2 + arg2"
+    def oracle_logic(a, b):
+        return (a * 1.2) + b
+
+    # Scenario A: The LLM generated it perfectly
+    perfect_llm_ops = [
+        {"op": "mul", "args": ["arg1", "1.2"], "target_var": "taxed"},
+        {"op": "add", "args": ["taxed", "arg2"], "target_var": "final"}
+    ]
+    
+    # Scenario B: The LLM hallucinated a 50% tax instead of 20%
+    hallucinated_llm_ops = [
+        {"op": "mul", "args": ["arg1", "1.5"], "target_var": "taxed"},
+        {"op": "add", "args": ["taxed", "arg2"], "target_var": "final"}
+    ]
+    
+    # (Mocking the Pydantic object for the test)
+    class MockMLIR: operations = perfect_llm_ops
+    class MockBadMLIR: operations = hallucinated_llm_ops
+    
+    print("Testing Perfect AI Generation:")
+    is_valid, msg = verify_semantic_equivalence(MockMLIR(), oracle_logic)
+    print(msg) # Output: PROVEN SEMANTICALLY EQUIVALENT
+    
+    print("\nTesting Hallucinated AI Generation:")
+    is_valid, msg = verify_semantic_equivalence(MockBadMLIR(), oracle_logic)
+    print(msg) 
+    # Output: SEMANTIC MISMATCH: Logic fails equivalence test. 
+    # If arg1=10, Original Code Outputs: 12 + arg2, AI Generated Outputs: 15 + arg2

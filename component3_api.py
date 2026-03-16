@@ -17,24 +17,17 @@ def get_business_logic(func_name: str):
         if not result or not result["func"]:
             raise HTTPException(status_code=404, detail="Semantic node not found.")
             
-        # Reconstruct IDE View
-        pseudo_code = f"BUSINESS REQUIREMENT: {result['func'].replace('_', ' ').title()}\n"
-        pseudo_code += "=" * 50 + "\n"
-        
+        pseudo_code = f"BUSINESS REQUIREMENT: {result['func'].title()}\n" + ("=" * 50) + "\n"
         pseudo_code += "DEPENDENCY FLOW:\n"
         deps = [d for d in result["dependencies"] if d]
         if deps:
-            for d in deps:
-                pseudo_code += f"  ↳ Triggers module: {d}\n"
+            for d in deps: pseudo_code += f"  ↳ Triggers module: {d}\n"
         else:
-            pseudo_code += "  ↳ Isolated execution (No external dependencies)\n"
+            pseudo_code += "  ↳ Isolated execution\n"
             
         pseudo_code += "\nCORE LOGIC ANCHOR:\n"
-        # Ensure raw_code isn't None
         raw_code = result["raw_code"] if result["raw_code"] else "No code snippet available."
         pseudo_code += "\n".join([f"    {line}" for line in raw_code.split("\n")[:5]]) 
-        pseudo_code += "\n    ... (Execution paths managed by AI)"
-
         return {"ide_view_content": pseudo_code}
 
 if __name__ == "__main__":
