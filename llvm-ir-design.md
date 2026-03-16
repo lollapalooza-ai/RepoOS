@@ -1193,3 +1193,149 @@ if __name__ == "__main__":
                 print(f"❌ Execution Error: {e}")
         else:
             print(f"Unknown function: {f_name}")
+
+# Milestone 1.0.5: 
+**MEMO: ENGINEERING BLUEPRINT v4.0 (THE IMPORT HIJACKER)**
+**To:** Lead Senior Engineer
+**From:** Principal Architecture / AI Systems
+**Subject:** Implementation Guide for Milestone 1.0.5 (Transparent Module Interception)
+
+This is the component that turns our compiler prototype into a true operating system abstraction. We are going to abuse Python's internal module loading system (PEP 302) to create the **Import Hijacker**.
+
+The goal is absolute transparency. A developer should be able to write `import legacy_shop.tax` and call `legacy_shop.tax.calculate_tax(100)`. They will think they are running standard Python, but our Hijacker will have secretly swapped the Python bytecode with our `ctypes` Trampoline Mesh.
+
+Here is the exact architectural blueprint and the production code.
+
+### The Architecture: PEP 302 Meta Path Hooks
+
+Python's `import` statement checks a list called `sys.meta_path` to figure out how to load a file. We are going to inject a custom `MetaPathFinder` at index `0`.
+
+1. **The Finder:** When Python sees `import legacy_shop...`, our Finder raises its hand and says, *"I know how to load this."*
+2. **The Loader:** Instead of compiling bytecode, our Loader opens the `.py` text file, runs `component1_ingest.py` to push the logic to Neo4j, parses the AST for function signatures, creates an empty Python module in memory, and glues our JIT Trampolines directly onto it.
+
+---
+
+### Component 6: The Import Hijacker (`component6_hijacker.py`)
+
+**Instructions for the Engineer:**
+
+* Ensure `component1_ingest.py` and `component5_orchestrator.py` are in the same directory.
+* This file acts as the bridge. It instantiates the Orchestrator, intercepts the file read, triggers Neo4j ingestion on-the-fly, and maps the hardware trampolines to the Python namespace.
+
+```python
+import sys
+import os
+import ast
+import ctypes
+from importlib.abc import MetaPathFinder, Loader
+from importlib.machinery import ModuleSpec
+
+# Import our Poly-Kernel components
+from component1_ingest import process_file
+from component5_orchestrator import LazyCallManager
+
+class PolyKernelLoader(Loader):
+    def __init__(self, file_path: str, orchestrator: LazyCallManager):
+        self.file_path = file_path
+        self.orchestrator = orchestrator
+
+    def create_module(self, spec):
+        # Returning None tells Python to create a standard empty module object for us
+        return None 
+
+    def exec_module(self, module):
+        print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
+        print(f"[Hijacker] 1. Ingesting {self.file_path} directly to Semantic Graph (Neo4j)...")
+        
+        # 1. On-the-fly Neo4j Ingestion (Guarantees the AI can see it when the Trampoline trips)
+        process_file(self.file_path)
+
+        # 2. Extract function signatures via AST
+        with open(self.file_path, 'r', encoding='utf-8') as f:
+            source_code = f.read()
+
+        tree = ast.parse(source_code)
+        func_count = 0
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                func_name = node.name
+                arg_count = len(node.args.args)
+                
+                # 3. Register with the JIT Orchestrator (Creates the Trampoline)
+                arg_types = [ctypes.c_double] * arg_count
+                self.orchestrator.register_lazy_function(func_name, arg_types, ctypes.c_double)
+                
+                # 4. The Magic: Bind the C-level Trampoline to the Python Module
+                setattr(module, func_name, self.orchestrator.registry[func_name])
+                func_count += 1
+                
+        print(f"[Hijacker] 2. Attached {func_count} JIT Trampolines to '{module.__name__}'.\n")
+
+class PolyKernelFinder(MetaPathFinder):
+    def __init__(self, target_package: str, orchestrator: LazyCallManager):
+        self.target_package = target_package
+        self.orchestrator = orchestrator
+
+    def find_spec(self, fullname, path, target=None):
+        # Only hijack imports that belong to our target application
+        if fullname.startswith(self.target_package):
+            
+            # Resolve the module name to a physical file path
+            # e.g., 'legacy_shop.tax' -> './legacy_shop/tax.py'
+            file_path = f"./{fullname.replace('.', '/')}.py"
+            
+            # Handle package directories (__init__.py)
+            if os.path.isdir(file_path.replace('.py', '')):
+                file_path = f"./{fullname.replace('.', '/')}/__init__.py"
+
+            if os.path.exists(file_path):
+                return ModuleSpec(fullname, PolyKernelLoader(file_path, self.orchestrator))
+        
+        # Return None lets Python fall back to normal importing for things like 'json' or 'os'
+        return None 
+
+def boot_poly_kernel(target_package="legacy_shop"):
+    """
+    Initializes the OS layer. Must be called at the very top of the entry script.
+    """
+    print(f"--- 🚀 Booting Poly-Kernel OS Hijacker for '{target_package}' ---")
+    orchestrator = LazyCallManager()
+    
+    # Inject our Finder at index 0 to guarantee we intercept before standard Python
+    finder = PolyKernelFinder(target_package, orchestrator)
+    sys.meta_path.insert(0, finder)
+    
+    print("--- ✅ Hijacker Active. Awaiting standard Python execution. ---")
+    return orchestrator
+
+```
+
+---
+
+### How to Prove the Magic (The Developer Experience)
+
+To show your team what we have just accomplished, create a standard python file called `user_script.py`.
+
+**This is what the developer writes:**
+
+```python
+# user_script.py
+
+# 1. Boot the OS layer
+from component6_hijacker import boot_poly_kernel
+boot_poly_kernel("legacy_shop")
+
+# 2. Standard Developer Code (They don't know the kernel is AI-driven)
+import legacy_shop.tax
+
+print("Developer: Calling calculate_tax(100.0, 15.0)")
+result = legacy_shop.tax.calculate_tax(100.0, 15.0)
+
+print(f"Developer: The final result is {result}")
+
+```
+
+When they run `python user_script.py`, they will literally watch the `import` statement get trapped, parsed into Neo4j, bound to trampolines, and executed dynamically via Meta's LLM compiler in RAM.
+
+We have completely abstracted away the compilation pipeline.
