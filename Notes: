@@ -44,3 +44,9 @@ You are a tester AI. Your responsibilities are defined in gemini-tester.md.
 Review refactor-test-prompt.md which has 20 prompts. Run this command for each of the 20 prompts and generate a report and any suggestions on how well repoOS did. Command :
 source venv/bin/activate && python refactor2.py "<prompt from refactor-test-prompt.md>" -y. Each time a refactor is performed and you've assesed its correctness, write the report on how well repoOS did, logs and any suggestions for improvement to refactor-test-report-3-6-10.md file.
 Your report must follow the rules for writing report in template file refactor-test-report-template.md. Then undo the refactor before moving to the next prompt. No need to run clear_neo4j.py or ingest2.py between tests, since we undo the refactor after each test.
+
+
+
+LLVM IR : 
+end to end test:
+./venv/bin/python3 user_script.py
