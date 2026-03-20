@@ -41,21 +41,42 @@ class LazyCallManager:
         self.registry[func_name] = c_trampoline
 
     async def compile_on_demand(self, func_name: str, arg_types, return_type):
+        import os
+        from component2_smt import VerifiedMLIR
+        
+        cache_file = f"./.poly_cache/{func_name}.json"
+        
+        # --- THE AOT FAST PATH ---
+        if os.path.exists(cache_file):
+            print(f"   ⚡ [AOT Cache Hit] Loading verified MLIR from disk for '{func_name}'...")
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                mlir_json = f.read()
+            verified_mlir = VerifiedMLIR.model_validate_json(mlir_json)
+            
+            # Extract arg_count from the Neo4j or assume from arg_types length
+            arg_count = len(arg_types) 
+            
+            CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)
+            return self.kernel.incremental_compile(func_name, verified_mlir, CFuncType, arg_count)
+            
+        # --- THE JIT SLOW PATH (Fallback) ---
+        print(f"   🐢 [AOT Cache Miss] No cache found. Waking up AI compiler...")
         with self.driver.session() as session:
             result = session.run("MATCH (f:Function {name: $name}) RETURN f.code, f.arg_count", name=func_name)
             record = result.single()
             if not record:
-                raise Exception(f"Function {func_name} not found in Neo4j.")
+                raise Exception(f"Function '{func_name}' not found in Neo4j Semantic Graph.")
             func_code, arg_count = record[0], record[1]
 
-        # GENERIC INTENT
+        # THE DOMAIN-AGNOSTIC PROMPT
         intent = (
-            f"Translate this Python logic into a DOD MLIR execution graph: \n{func_code}\n"
-            f"It takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'.\n"
-            "Return the calculated result in the final operation."
+            f"You are an expert compiler frontend. Convert this exact Python logic into a DOD MLIR execution graph: \n"
+            f"```python\n{func_code}\n```\n"
+            f"The function takes {arg_count} float inputs. You MUST name them 'arg0' through 'arg{arg_count - 1}'.\n"
+            f"Only use opcodes: 'add', 'sub', 'mul', 'div', 'cmp_eq', 'select'.\n"
+            f"Store the final calculated result in the target_var of the last operation."
         )
         
-        # NOTE: In component2_smt, semantic equivalence might need bypassing for arbitrary functions
         verified_mlir = await verified_generation_loop(intent)
         
         CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)

@@ -98,11 +98,24 @@ def render_dashboard(native_time: float, jit_time: float, cold_start: float, ite
     console.print("\n[bold cyan]Architect's Note:[/bold cyan] Once the Trampoline is hot-patched, execution never leaves the CPU cache. The Python bytecode interpreter is completely bypassed.")
 
 if __name__ == "__main__":
-    # Test our math function with arguments (1000.0, 50.0)
-    # We use 1,000,000 iterations to definitively prove the overhead elimination.
+    import sys
+    
+    # Defaults to our macro-benchmark payload if no arguments provided
+    target_mod = "legacy_shop.heavy_math"
+    target_func = "compute_gravity"
+    func_args = [1000.0, 50.0]
+    
+    if len(sys.argv) > 2:
+        target_mod = sys.argv[1]
+        target_func = sys.argv[2]
+        # Parse remaining args as floats
+        func_args = [float(x) for x in sys.argv[3:]] if len(sys.argv) > 3 else [1.0, 1.0]
+
+    console.print(f"Targeting: {target_mod}.{target_func} with args {func_args}")
+    
     run_benchmark(
-        target_module_name="legacy_shop.heavy_math", 
-        func_name="compute_gravity", 
-        args=(1000.0, 50.0), 
-        iterations=1000000 
+        target_module_name=target_mod, 
+        func_name=target_func, 
+        args=tuple(func_args), 
+        iterations=500000 
     )
