@@ -68,11 +68,14 @@ class LazyCallManager:
                 raise Exception(f"Function '{func_name}' not found in Neo4j Semantic Graph.")
             func_code, arg_count = record[0], record[1]
 
+        # Fix for 0-argument functions to avoid 'arg-1' in prompt
+        arg_desc = f"takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'" if arg_count > 0 else "takes 0 inputs"
+
         # THE DOMAIN-AGNOSTIC PROMPT
         intent = (
             f"You are an expert compiler frontend. Convert this exact Python logic into a DOD MLIR execution graph: \n"
             f"```python\n{func_code}\n```\n"
-            f"The function takes {arg_count} float inputs. You MUST name them 'arg0' through 'arg{arg_count - 1}'.\n"
+            f"The function {arg_desc}.\n"
             f"Only use opcodes: 'add', 'sub', 'mul', 'div', 'cmp_eq', 'select'.\n"
             f"Store the final calculated result in the target_var of the last operation."
         )
