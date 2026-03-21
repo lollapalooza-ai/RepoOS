@@ -14,10 +14,10 @@ class Operation(BaseModel):
     # THE UPGRADED INSTRUCTION SET ARCHITECTURE (ISA)
     op: Literal[
         "add", "sub", "mul", "div", "cmp_eq", "select", 
-        "load", "store", "gep", "icmp", "br"
+        "load", "store", "gep", "icmp", "br", "label"
     ] = Field(..., description="The mathematical, memory, or control opcode.")
     
-    args: List[str] = Field(..., description="Variables, pointers, or literal numbers used as inputs.")
+    args: List[str] = Field(..., description="Variables, pointers, literal numbers, or block labels.")
     
     # Made Optional: 'store' and 'br' do not assign a new variable.
     target_var: Optional[str] = Field(None, description="The variable to store the result in, if applicable.")
