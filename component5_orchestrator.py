@@ -72,15 +72,36 @@ class LazyCallManager:
         arg_desc = f"takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'" if arg_count > 0 else "takes 0 inputs"
 
         # THE DOMAIN-AGNOSTIC PROMPT
-        intent = (
-            f"You are an expert compiler frontend. Convert this exact Python logic into a DOD MLIR execution graph: \n"
-            f"```python\n{func_code}\n```\n"
-            f"The function {arg_desc}.\n"
-            f"Only use opcodes: 'add', 'sub', 'mul', 'div', 'cmp_eq', 'select'.\n"
-            f"Store the final calculated result in the target_var of the last operation."
-        )
+        intent = f"""
+You are an expert compiler frontend. Convert this Python logic into a DOD MLIR JSON execution graph.
+You MUST use the `thinking_process` field first to trace the variables before writing the operations.
+
+EXAMPLE:
+Python: 
+def calc(arg0, arg1): return arg0 * 0.2 if arg1 > 10 else arg0
+
+Expected JSON Structure:
+{{
+  "thinking_process": "1. The function takes two args. 2. I need to multiply arg0 by 0.2 and store in t1. 3. I need to compare arg1 > 10 and store in cond. 4. I need to select t1 or arg0 based on cond.",
+  "memory_allocations": [],
+  "loop_limit": 0,
+  "operations": [
+    {{"op": "mul", "args": ["arg0", "0.2"], "target_var": "t1"}},
+    {{"op": "icmp", "args": [">", "arg1", "10"], "target_var": "cond"}},
+    {{"op": "select", "args": ["cond", "t1", "arg0"], "target_var": "final_result"}}
+  ]
+}}
+
+Now, compile this target:
+```python
+{func_code}
+```
+The function takes {arg_count} float inputs. Name them 'arg0' through 'arg{arg_count - 1}'.
+Only use allowed opcodes. Store the final calculated result in the target_var of the last operation.
+"""
         
-        verified_mlir = await verified_generation_loop(intent)
+        # MILESTONE 3.0: Pass func_code and arg_count down the pipeline
+        verified_mlir = await verified_generation_loop(intent, func_code, arg_count)
         
         CFuncType = ctypes.CFUNCTYPE(return_type, *arg_types)
         return self.kernel.incremental_compile(func_name, verified_mlir, CFuncType, arg_count)

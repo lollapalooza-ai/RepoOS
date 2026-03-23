@@ -16,15 +16,21 @@ class PolyKernelJIT:
     def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature, arg_count: int):
         module = ir.Module(name=f"module_{func_name}")
         
-        # MILESTONE 2.0: Entry arguments are now (char* buffer, int32 length)
-        byte_ptr_type = ir.PointerType(ir.IntType(8))
-        func_type = ir.FunctionType(ir.DoubleType(), [byte_ptr_type, ir.IntType(32)])
+        # Decide Signature: Vectorized FSM vs Scalar Math
+        # If arg_count is 0 but we have memory allocations, it's likely a scanner.
+        # However, for MVP, we'll use the presence of 'raw_buffer' in prompt/intent as a hint.
+        # To be safe and compatible with Milestone 1.0.4 AND 2.0:
+        if arg_count == 0 and any(m.name == "raw_buffer" for m in mlir_data.memory_allocations):
+            byte_ptr_type = ir.PointerType(ir.IntType(8))
+            func_type = ir.FunctionType(ir.DoubleType(), [byte_ptr_type, ir.IntType(32)])
+        else:
+            arg_types = [ir.DoubleType()] * arg_count
+            func_type = ir.FunctionType(ir.DoubleType(), arg_types)
+            
         func = ir.Function(module, func_type, name=func_name)
         
         # Two-Pass Block Allocation
         blocks = {"entry": func.append_basic_block(name="entry")}
-        
-        # Pass 1: Discover all labels
         for instruction in mlir_data.operations:
             if instruction.op == "label":
                 label_name = instruction.args[0]
@@ -32,17 +38,24 @@ class PolyKernelJIT:
                 
         builder = ir.IRBuilder(blocks["entry"])
         
-        # Map initial inputs
-        variables = {"raw_buffer": func.args[0], "buffer_len": func.args[1]}
+        # Variable Registry
+        variables = {}
+        if arg_count == 0 and any(m.name == "raw_buffer" for m in mlir_data.memory_allocations):
+            variables["raw_buffer"] = func.args[0]
+            variables["buffer_len"] = func.args[1]
+        else:
+            for i in range(arg_count):
+                variables[f"arg{i}"] = func.args[i]
         
         # Allocate local memory arrays
         for alloc in mlir_data.memory_allocations:
-            var_type = ir.ArrayType(ir.DoubleType(), alloc.size)
-            variables[alloc.name] = builder.alloca(var_type, name=alloc.name)
+            if alloc.name != "raw_buffer":
+                var_type = ir.ArrayType(ir.DoubleType(), alloc.size)
+                variables[alloc.name] = builder.alloca(var_type, name=alloc.name)
 
         def resolve_arg(arg_str):
             if arg_str in variables: return variables[arg_str]
-            if arg_str in blocks: return blocks[arg_str] # Return block for branches
+            if arg_str in blocks: return blocks[arg_str]
             try: return ir.Constant(ir.DoubleType(), float(arg_str))
             except ValueError: return ir.Constant(ir.DoubleType(), 0.0)
 
@@ -53,28 +66,19 @@ class PolyKernelJIT:
             op = instruction.op
             args = instruction.args
             
-            # Robust Argument Extraction
             def get_arg(idx, default="0.0"):
                 return args[idx] if len(args) > idx else default
 
             if op == "label":
-                # Switch builder focus to the new block
                 builder.position_at_end(blocks[args[0]])
                 continue
             
             elif op == "br":
-                # Handle Branching
                 if len(args) == 1:
-                    # Unconditional branch: br label
                     builder.branch(resolve_arg(args[0]))
                 elif len(args) == 3:
-                    # Conditional branch: br cond, true_label, false_label
-                    # cond might be stored as double (1.0/0.0), cast to i1
                     val = resolve_arg(args[0])
-                    if val.type == ir.DoubleType():
-                        cond = builder.fcmp_ordered('>', val, ir.Constant(ir.DoubleType(), 0.5))
-                    else:
-                        cond = builder.trunc(val, ir.IntType(1))
+                    cond = builder.fcmp_ordered('>', val, ir.Constant(ir.DoubleType(), 0.5)) if val.type == ir.DoubleType() else builder.trunc(val, ir.IntType(1))
                     builder.cbranch(cond, resolve_arg(args[1]), resolve_arg(args[2]))
                 last_res = None
                 
@@ -104,27 +108,22 @@ class PolyKernelJIT:
                 last_res = None
             elif op == "gep":
                 base = resolve_arg(get_arg(0))
-                idx = builder.fptosi(resolve_arg(get_arg(1)), ir.IntType(32))
-                # Handle both array pointers and raw byte pointers
+                idx_val = builder.fptosi(resolve_arg(get_arg(1)), ir.IntType(32))
                 if isinstance(base.type.pointee, ir.ArrayType):
-                    last_res = builder.gep(base, [ir.Constant(ir.IntType(32), 0), idx], name=instruction.target_var)
+                    last_res = builder.gep(base, [ir.Constant(ir.IntType(32), 0), idx_val], name=instruction.target_var)
                 else:
-                    last_res = builder.gep(base, [idx], name=instruction.target_var)
+                    last_res = builder.gep(base, [idx_val], name=instruction.target_var)
             elif op == "icmp":
                 cmp_op = get_arg(0)
-                lhs = get_arg(1)
-                rhs = get_arg(2)
+                lhs, rhs = get_arg(1), get_arg(2)
                 if cmp_op not in ['==', '!=', '<', '<=', '>', '>=']:
-                    rhs = lhs
-                    lhs = cmp_op
-                    cmp_op = '=='
+                    rhs, lhs, cmp_op = lhs, cmp_op, '=='
                 cmp = builder.fcmp_ordered(cmp_op, resolve_arg(lhs), resolve_arg(rhs), name=instruction.target_var)
                 last_res = builder.uitofp(cmp, ir.DoubleType())
             
             if instruction.target_var and last_res:
                 variables[instruction.target_var] = last_res
             
-        # Ensure block has a terminator
         if not builder.block.is_terminated:
             if last_res is None or isinstance(last_res.type, ir.VoidType):
                 last_res = ir.Constant(ir.DoubleType(), 0.0)
@@ -133,9 +132,9 @@ class PolyKernelJIT:
                 except: last_res = ir.Constant(ir.DoubleType(), 0.0)
             builder.ret(last_res)
         
+        # print(f"   [JIT DEBUG] Generated IR for {func_name}:\n{str(module)}")
         llmod = llvm.parse_assembly(str(module))
         self.engine.add_module(llmod)
         self.engine.finalize_object()
-        
         func_ptr = self.engine.get_function_address(func_name)
         return ctypes_signature(func_ptr)

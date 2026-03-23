@@ -58,6 +58,9 @@ def send_mail(u_id, subj):
     print("------------------------------------------------")
     return True
 
+def dynamic_pricing(distance, surge):
+    return distance * surge if surge > 1.0 else distance
+
 # Dave: I use this for debugging sometimes
 if __name__ == "__main__":
     h = Helper()
