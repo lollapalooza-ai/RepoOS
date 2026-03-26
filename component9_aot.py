@@ -150,15 +150,46 @@ async def aot_compile_all(target_module: str = "legacy_shop"):
             print(f"   ⚡ Cache hit! '{func_name}' is already compiled. Skipping.")
             continue
             
+        # [FIX] Define arg_desc for non-FSM functions
+        arg_desc = f"takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'" if arg_count > 0 else "takes 0 inputs"
+
         # MILESTONE 3.0.1: Cognitive Forcing Prompt
-        intent = (
-            f"You are an expert LLVM FSM Generator. You are receiving a raw TCP JSON payload.\n"
-            f"Target logic to optimize:\n```python\n{func_code}\n```\n"
-            f"INPUTS: arg0 is a raw char pointer ('raw_buffer'), arg1 is int32 ('buffer_len').\n"
-            f"TASK: Generate a Zero-Copy Finite State Machine.\n"
-            f"CRITICAL: You must use the 'thinking_process' field FIRST. In this field, explicitly write out the exact ASCII byte sequence you are searching for (e.g., 't', 'o', 't', 'a', 'l'). Calculate the exact byte offsets you need to jump before extracting the float.\n"
-            f"After your thinking process, write the operations using `gep`, `load`, `icmp`, and `br`."
-        )
+        # [REFACTORED] Use different prompts for FSM vs Scalar Math
+        if func_name == "vectorized_vip_sum":
+            intent = (
+                f"You are an expert LLVM FSM Generator. You are receiving a raw TCP JSON payload.\n"
+                f"TASK: Generate a Zero-Copy Finite State Machine.\n"
+                f"CRITICAL: You must use the 'thinking_process' field FIRST. In this field, explicitly write out the exact ASCII byte sequence you are searching for. Calculate the exact byte offsets you need to jump before extracting the float.\n"
+                f"After your thinking process, write the operations using `gep`, `load`, `icmp`, and `br`."
+            )
+        else:
+            intent = f"""
+You are an expert compiler frontend. Convert this Python logic into a DOD MLIR JSON execution graph.
+You MUST use the `thinking_process` field first to trace the variables before writing the operations.
+
+EXAMPLE:
+Python: 
+def calc(arg0, arg1): return arg0 * 0.2 if arg1 > 10 else arg0
+
+Expected JSON Structure:
+{{
+  "thinking_process": "1. The function takes two args. 2. I need to multiply arg0 by 0.2 and store in t1. 3. I need to compare arg1 > 10 and store in cond. 4. I need to select t1 or arg0 based on cond.",
+  "memory_allocations": [],
+  "loop_limit": 0,
+  "operations": [
+    {{"op": "mul", "args": ["arg0", "0.2"], "target_var": "t1"}},
+    {{"op": "icmp", "args": [">", "arg1", "10"], "target_var": "cond"}},
+    {{"op": "select", "args": ["cond", "t1", "arg0"], "target_var": "final_result"}}
+  ]
+}}
+
+Now, compile this target:
+```python
+{func_code}
+```
+The function {arg_desc}.
+Only use allowed opcodes. Store the final calculated result in the target_var of the last operation.
+"""
         
         try:
             # MILESTONE 3.0: Pass func_code and arg_count down the pipeline
