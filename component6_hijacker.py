@@ -2,6 +2,7 @@ import sys
 import os
 import ast
 import ctypes
+import inspect
 from importlib.abc import MetaPathFinder, Loader
 from importlib.machinery import ModuleSpec
 
@@ -15,37 +16,36 @@ class PolyKernelLoader(Loader):
         self.orchestrator = orchestrator
 
     def create_module(self, spec):
-        # Returning None tells Python to create a standard empty module object for us
         return None 
 
     def exec_module(self, module):
         print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
-        print(f"[Hijacker] 1. Ingesting {self.file_path} directly to Semantic Graph (Neo4j)...")
+        print(f"[Hijacker] 1. Ingesting {self.file_path} to Semantic Graph...")
         
-        # 1. On-the-fly Neo4j Ingestion (Guarantees the AI can see it when the Trampoline trips)
+        # 1. On-the-fly Neo4j Ingestion
         process_file(self.file_path)
 
-        # 2. Extract function signatures via AST
+        # 2. Execute the module to get the objects
         with open(self.file_path, 'r', encoding='utf-8') as f:
-            source_code = f.read()
+            code = compile(f.read(), self.file_path, 'exec')
+            exec(code, module.__dict__)
 
-        tree = ast.parse(source_code)
+        # 3. UPGRADED: Class-Level Hijacking
         func_count = 0
-        
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                func_name = node.name
-                arg_count = len(node.args.args)
-                
-                # 3. Register with the JIT Orchestrator (Creates the Trampoline)
-                arg_types = [ctypes.c_double] * arg_count
-                self.orchestrator.register_lazy_function(func_name, arg_types, ctypes.c_double)
-                
-                # 4. The Magic: Bind the C-level Trampoline to the Python Module
-                setattr(module, func_name, self.orchestrator.registry[func_name])
+        for name, obj in inspect.getmembers(module):
+            if inspect.isclass(obj) and obj.__module__ == module.__name__:
+                for method_name, method_obj in inspect.getmembers(obj, predicate=inspect.isfunction):
+                    fqn = f"{module.__name__}.{name}.{method_name}"
+                    trampoline = self.orchestrator.register_lazy_function(method_name, method_obj, fqn)
+                    setattr(obj, method_name, trampoline) # Patch the class directly
+                    func_count += 1
+            elif inspect.isfunction(obj) and obj.__module__ == module.__name__:
+                fqn = f"{module.__name__}.{name}"
+                trampoline = self.orchestrator.register_lazy_function(name, obj, fqn)
+                setattr(module, name, trampoline)
                 func_count += 1
                 
-        print(f"[Hijacker] 2. Attached {func_count} JIT Trampolines to '{module.__name__}'.\n")
+        print(f"[Hijacker] 2. Attached {func_count} SHADOW JIT Trampolines to '{module.__name__}'.\n")
 
 class PolyKernelFinder(MetaPathFinder):
     def __init__(self, target_package: str, orchestrator: LazyCallManager):
@@ -53,21 +53,21 @@ class PolyKernelFinder(MetaPathFinder):
         self.orchestrator = orchestrator
 
     def find_spec(self, fullname, path, target=None):
-        # Only hijack imports that belong to our target application
         if fullname.startswith(self.target_package):
+            # Resolve module name to file path
+            parts = fullname.split('.')
+            # Check if it's a package or a module
+            base_path = os.path.join(*parts)
             
-            # Resolve the module name to a physical file path
-            # e.g., 'legacy_shop.tax' -> './legacy_shop/tax.py'
-            file_path = f"./{fullname.replace('.', '/')}.py"
+            potential_paths = [
+                f"./{base_path}.py",
+                f"./{base_path}/__init__.py"
+            ]
             
-            # Handle package directories (__init__.py)
-            if os.path.isdir(file_path.replace('.py', '')):
-                file_path = f"./{fullname.replace('.', '/')}/__init__.py"
-
-            if os.path.exists(file_path):
-                return ModuleSpec(fullname, PolyKernelLoader(file_path, self.orchestrator))
+            for file_path in potential_paths:
+                if os.path.exists(file_path):
+                    return ModuleSpec(fullname, PolyKernelLoader(file_path, self.orchestrator), is_package=file_path.endswith('__init__.py'))
         
-        # Return None lets Python fall back to normal importing for things like 'json' or 'os'
         return None 
 
 def boot_poly_kernel(target_package="legacy_shop"):
@@ -77,7 +77,6 @@ def boot_poly_kernel(target_package="legacy_shop"):
     print(f"--- 🚀 Booting Poly-Kernel OS Hijacker for '{target_package}' ---")
     orchestrator = LazyCallManager()
     
-    # Inject our Finder at index 0 to guarantee we intercept before standard Python
     finder = PolyKernelFinder(target_package, orchestrator)
     sys.meta_path.insert(0, finder)
     

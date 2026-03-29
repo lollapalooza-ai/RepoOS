@@ -1,6 +1,7 @@
 import os
 import sys
 import ast
+import json
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
@@ -14,66 +15,156 @@ PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
-def get_arg_count(source_code: str) -> int:
+def get_arg_info(source_code: str):
     try:
-        # We need to wrap the body if it's not a full function definition 
-        # but in our case func_body is the whole 'def ...' block
         tree = ast.parse(source_code)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                # Count standard arguments (ignoring *args, **kwargs for MVP)
-                return len(node.args.args)
+                arg_count = len(node.args.args)
+                hints = {}
+                for arg in node.args.args:
+                    if arg.annotation:
+                        if isinstance(arg.annotation, ast.Name):
+                            hints[arg.arg] = arg.annotation.id
+                        elif isinstance(arg.annotation, ast.Constant):
+                            hints[arg.arg] = str(arg.annotation.value)
+                        elif isinstance(arg.annotation, ast.Subscript):
+                            # Handle Optional[str], etc.
+                            hints[arg.arg] = ast.unparse(arg.annotation)
+                    else:
+                        # HEURISTIC: Guess type from variable name if no hint
+                        if arg.arg in ['amt', 'amount', 'price', 'surge', 'distance']:
+                            hints[arg.arg] = 'float'
+                        elif arg.arg in ['region', 'name', 'api_key', 'subj', 'u_id']:
+                            hints[arg.arg] = 'str'
+                return arg_count, hints
     except Exception:
         pass
-    return 0
+    return 0, {}
+
+def extract_data_intents(source_code: str):
+    """AST pass to find what JSON keys the business logic actually uses."""
+    try:
+        tree = ast.parse(source_code)
+        intents = []
+        for node in ast.walk(tree):
+            # Find payload["target_key"]
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+                val = node.slice.value
+                if isinstance(val, (str, int)):
+                    intents.append(str(val))
+            # Find object.attribute
+            elif isinstance(node, ast.Attribute):
+                intents.append(str(node.attr))
+        return list(set(intents))
+    except Exception:
+        return []
 
 def process_file(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         source_code = f.read()
     
+    # 1. NEW: Extract data keys to feed to the AOT Compiler
+    data_keys = extract_data_intents(source_code)
+    
+    # 2. UPGRADED: Tree-Sitter queries for Classes AND Functions
     tree = parser.parse(bytes(source_code, "utf8"))
-    func_query = PY_LANGUAGE.query("(function_definition name: (identifier) @func.name)")
-    call_query = PY_LANGUAGE.query("(call function: (identifier) @call.name)")
+    class_query = PY_LANGUAGE.query("(class_definition name: (identifier) @class.name) @class.node")
+    func_query = PY_LANGUAGE.query("(function_definition name: (identifier) @func.name) @func.node")
+    
+    # Update Neo4j to use FQNs (Module.Class.Method)
+    module_name = file_path.replace('./', '').replace('/', '.').replace('.py', '')
+    if module_name.startswith('.'): module_name = module_name[1:]
     
     with driver.session() as session:
-        session.run("MERGE (file:File {path: $path})", path=file_path)
-        
-        # 1. Map Functions & Code
-        func_captures = func_query.captures(tree.root_node)
-        for capture_name, nodes in func_captures.items():
-            if capture_name == "func.name":
-                for node in nodes:
-                    func_name = node.text.decode('utf8')
-                    func_node = node.parent
-                    func_body = source_code[func_node.start_byte:func_node.end_byte]
-                    arg_count = get_arg_count(func_body) # <--- NEW DYNAMIC EXTRACTION
-                    
-                    session.run("""
-                        MATCH (file:File {path: $path})
-                        MERGE (f:Function {name: $name, file: $path})
-                        SET f.code = $code, f.arg_count = $arg_count
-                        MERGE (file)-[:CONTAINS]->(f)
-                    """, name=func_name, path=file_path, code=func_body, arg_count=arg_count)
-                
-        # 2. Map Dependencies
-        call_captures = call_query.captures(tree.root_node)
-        for capture_name, nodes in call_captures.items():
-            if capture_name == "call.name":
-                for node in nodes:
-                    callee_name = node.text.decode('utf8')
-                    parent = node.parent
-                    while parent and parent.type != 'function_definition':
-                        parent = parent.parent
-                    
-                    if parent:
-                        name_node = parent.child_by_field_name('name')
+        # Push file, module, classes, and extracted JSON keys to the Graph
+        session.run("""
+            MERGE (m:Module {name: $module})
+            SET m.path = $path, m.extracted_keys = $keys
+        """, module=module_name, path=file_path, keys=data_keys)
+
+        # Map Classes and Methods
+        class_captures = class_query.captures(tree.root_node)
+        classes = {}
+        if isinstance(class_captures, dict):
+            class_names = class_captures.get("class.name", [])
+            class_nodes = class_captures.get("class.node", [])
+            for i in range(len(class_names)):
+                name = class_names[i].text.decode('utf8')
+                node = class_nodes[i]
+                classes[node.id] = {"name": name, "node": node}
+        else:
+            for node, name in class_captures:
+                if name == "class.node":
+                    name_node = node.child_by_field_name('name')
+                    if name_node:
+                        classes[node.id] = {"name": name_node.text.decode('utf8'), "node": node}
+
+        for class_id, class_info in classes.items():
+            class_name = class_info["name"]
+            class_fqn = f"{module_name}.{class_name}"
+            session.run("""
+                MATCH (m:Module {name: $module})
+                MERGE (c:Class {fqn: $fqn})
+                SET c.name = $name
+                MERGE (m)-[:CONTAINS]->(c)
+            """, module=module_name, fqn=class_fqn, name=class_name)
+            
+            # Find methods in this class
+            def find_methods(node):
+                for child in node.children:
+                    if child.type == "function_definition":
+                        name_node = child.child_by_field_name('name')
                         if name_node:
-                            caller_name = name_node.text.decode('utf8')
+                            method_name = name_node.text.decode('utf8')
+                            method_fqn = f"{class_fqn}.{method_name}"
+                            method_body = source_code[child.start_byte:child.end_byte]
+                            arg_count, hints = get_arg_info(method_body)
                             session.run("""
-                                MERGE (caller:Function {name: $caller})
-                                MERGE (callee:Function {name: $callee})
-                                MERGE (caller)-[:CALLS]->(callee)
-                            """, caller=caller_name, callee=callee_name)
+                                MATCH (c:Class {fqn: $class_fqn})
+                                MERGE (f:Function {fqn: $fqn})
+                                SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints
+                                MERGE (c)-[:HAS_METHOD]->(f)
+                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints))
+                    elif child.type == "block":
+                        find_methods(child)
+            
+            find_methods(class_info["node"])
+
+        # Handle Global Functions
+        func_captures = func_query.captures(tree.root_node)
+        functions = []
+        if isinstance(func_captures, dict):
+            func_nodes = func_captures.get("func.node", [])
+            for node in func_nodes:
+                functions.append(node)
+        else:
+            for node, name in func_captures:
+                if name == "func.node":
+                    functions.append(node)
+
+        for func_node in functions:
+            is_method = False
+            parent = func_node.parent
+            while parent:
+                if parent.type == 'class_definition':
+                    is_method = True
+                    break
+                parent = parent.parent
+            
+            if not is_method:
+                name_node = func_node.child_by_field_name('name')
+                if name_node:
+                    func_name = name_node.text.decode('utf8')
+                    fqn = f"{module_name}.{func_name}"
+                    func_body = source_code[func_node.start_byte:func_node.end_byte]
+                    arg_count, hints = get_arg_info(func_body)
+                    session.run("""
+                        MATCH (m:Module {name: $module})
+                        MERGE (f:Function {fqn: $fqn})
+                        SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints
+                        MERGE (m)-[:CONTAINS]->(f)
+                    """, module=module_name, fqn=fqn, name=func_name, code=func_body, arg_count=arg_count, hints=json.dumps(hints))
 
 def ingest_folder(folder_path):
     print(f"🚀 Starting Deep Ingestion: {folder_path}")
