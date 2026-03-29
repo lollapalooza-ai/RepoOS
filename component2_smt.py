@@ -1,10 +1,20 @@
 import json
 import asyncio
+import os
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 from z3 import *
-import ollama
 import ast
+import ollama # RE-IMPORT OLLAMA
+
+# NEW: Import the Google GenAI SDK
+from google import genai
+from google.genai import types
+
+# Initialize the Gemini Client only if API key is present
+gemini_client = None
+if os.environ.get("GEMINI_API_KEY"):
+    gemini_client = genai.Client()
 
 # --- 1. The Strict Pydantic Schema ---
 class MemoryAllocation(BaseModel):
@@ -192,21 +202,75 @@ def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
         last_val = val
     return last_val
 
-# --- 4. Generative Feedback Loop ---
-async def generate_execution_graph(intent: str, error_context: str = "") -> str:
-    client = ollama.AsyncClient()
-    prompt = (
-        "You are an expert compiler frontend. Convert Python logic into a DOD MLIR execution graph.\n"
-        "STRICT ISA RULES:\n"
-        "1. Every operation MUST be a flat object. NO nested logic like 'arg0 * 0.5'.\n"
-        "2. Use 'mul' for multiplication, 'add' for addition, 'sub' for subtraction, and 'div' for division.\n"
-        "3. The 'args' list must ONLY contain variable names or literal numbers/strings.\n"
-        "4. Output ONLY raw JSON matching the schema.\n\n"
-        f"INTENT: {intent}\n"
+# --- 4. Dual-Backend Generative Feedback Loop ---
+async def generate_execution_graph(intent: str, error_context: str = "", last_failed_mlir: str = "") -> str:
+    """Generates the MLIR JSON graph using either Gemini or Ollama (fallback)."""
+    
+    api_key = os.environ.get("GEMINI_API_KEY")
+    
+    # --- PREPARE THE PROMPT ---
+    base_instructions = """
+SYSTEM INSTRUCTIONS:
+You are an expert compiler frontend. Convert Python logic into a DOD MLIR execution graph.
+
+STRICT ISA RULES:
+1. Every operation MUST be a flat object. NO nested logic like 'arg0 * 0.5'.
+   WRONG: {"op": "select", "args": ["cond", "arg0 * 0.5", "arg0"], "target_var": "res"}
+   CORRECT:
+     {"op": "mul", "args": ["arg0", "0.5"], "target_var": "temp1"},
+     {"op": "select", "args": ["cond", "temp1", "arg0"], "target_var": "res"}
+2. The `store` operation takes [value, pointer]. You CANNOT store into a literal or a variable name that is not a pointer.
+3. If you need to return a value, the LAST operation's `target_var` will be the return value.
+4. For STRING COMPARISON: Use `strcmp`, which takes [pointer, pointer_or_literal] and returns 1.0 (float) if equal, else 0.0.
+5. For STRING VIEWS: Use `string_view_ptr`, which MUST take exactly 3 arguments: [buffer_name, offset, length].
+   Example: {"op": "string_view_ptr", "args": ["raw_buffer", "0", "10"], "target_var": "my_str"}
+"""
+
+    prompt = f"{base_instructions}\n\nTARGET INTENT:\n{intent}\n"
+    
+    if error_context:
+        prompt += f"""
+---
+[CRITICAL] CORRECTION REQUIRED FROM PREVIOUS ATTEMPT:
+The last graph you generated was REJECTED.
+FAILED CODE:
+{last_failed_mlir}
+
+ERROR: {error_context}
+
+ANALYSIS TASK:
+1. Identify exactly which operation in the FAILED CODE caused the ERROR above.
+2. In your next 'thinking_process', explain how you will avoid this specific mistake.
+3. Generate a NEW graph that follows all ISA rules. Do NOT repeat the failed logic.
+---
+"""
+
+    # --- ROUTE TO BACKEND ---
+    if api_key and api_key.strip():
+        # USE GEMINI
+        await asyncio.sleep(60) # Rate limit mitigation
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=VerifiedMLIR,
+                    temperature=0.1,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            print(f"   [Gemini API Error] {e} - Falling back to Ollama...")
+            # Fall through to Ollama if API fails
+    
+    # USE OLLAMA (Fallback)
+    local_client = ollama.AsyncClient()
+    response = await local_client.chat(
+        model="deepseek-coder-v2:latest", 
+        messages=[{'role': 'user', 'content': prompt}], 
+        format=VerifiedMLIR.model_json_schema()
     )
-    if error_context: 
-        prompt = f"### CRITICAL: FIX THE FOLLOWING VALIDATION ERROR ###\n{error_context}\n\n" + prompt
-    response = await client.chat(model="deepseek-coder-v2:latest", messages=[{'role': 'user', 'content': prompt}], format=VerifiedMLIR.model_json_schema())
     return response['message']['content']
 
 
@@ -229,9 +293,12 @@ def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, arg_cou
 
 async def verified_generation_loop(intent: str, func_code: str, arg_count: int, external_memory: dict = None) -> VerifiedMLIR:
     error_msg = ""
+    last_failed_mlir = ""
     for attempt in range(3):
         print(f"   [AI] Generating Graph (Attempt {attempt + 1})...")
-        mlir_json = await generate_execution_graph(intent, error_msg)
+        mlir_json = await generate_execution_graph(intent, error_msg, last_failed_mlir)
+        print(f"   [DEBUG] Gemini/Ollama Response: {mlir_json}")
+        last_failed_mlir = mlir_json
         try: mlir_data = VerifiedMLIR.model_validate_json(mlir_json)
         except Exception as e:
             print(f"   [DEBUG] LLM JSON/Validation Error: {e}")

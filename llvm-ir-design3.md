@@ -224,3 +224,85 @@ class Operation(BaseModel):
 2. Ensure `verify_llm_safety()` returns `True`.
 3. Feed it a malicious MLIR JSON where `string_view_ptr` length is set to `999999` (simulating an out-of-bounds read). 
 4. Ensure the Z3 verifier catches the memory violation and returns `False`.
+
+# Milestone 4.1: Gemini Upgrade
+## Step 1: Update component2_smt.py
+We will rip out the ollama imports and replace the generate_execution_graph function with Gemini's asynchronous client (client.aio).
+
+Replace the LLM section of component2_smt.py with this exact code:
+
+Python
+import json
+import asyncio
+import os
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
+from z3 import *
+import ast
+
+# NEW: Import the Google GenAI SDK
+from google import genai
+from google.genai import types
+
+# Initialize the Gemini Client (It automatically picks up the GEMINI_API_KEY env variable)
+gemini_client = genai.Client()
+
+# --- 1. The Strict Pydantic Schema (Keep your existing schemas!) ---
+class MemoryAllocation(BaseModel):
+    name: str = Field(..., description="Name of the array, struct, or raw byte buffer.")
+    size: int = Field(..., description="Exact allocated size in elements or bytes.")
+
+class Operation(BaseModel):
+    op: Literal[
+        "add", "sub", "mul", "div", "cmp_eq", "select", 
+        "load", "store", "gep", "icmp", "br", "label",
+        "alloc_struct", "string_view_ptr", "ffi_call"
+    ] = Field(..., description="The mathematical, memory, or control opcode.")
+    args: List[str] = Field(..., description="Variables, pointers, literal numbers, or block labels.")
+    target_var: Optional[str] = Field(None, description="The variable to store the result in, if applicable.")
+
+class VerifiedMLIR(BaseModel):
+    thinking_process: str = Field(..., description="Step-by-step mathematical reasoning BEFORE writing the memory_allocations or operations.")
+    memory_allocations: List[MemoryAllocation] = Field(..., description="Memory constraints")
+    loop_limit: int = Field(..., description="Absolute maximum iterations")
+    operations: List[Operation] = Field(..., description="The flat execution graph")
+
+# --- 2. The Gemini API Integration ---
+async def generate_execution_graph(intent: str, error_msg: str = "") -> str:
+    """Calls Gemini 1.5 Pro to generate the MLIR JSON graph."""
+    
+    prompt = intent
+    if error_msg:
+        # Self-Correction Loop: If Z3 failed, we feed the error back to Gemini
+        prompt += f"\n\n[CRITICAL ERROR FROM PREVIOUS ATTEMPT]: {error_msg}\nRewrite the graph to fix this formal verification error."
+
+    try:
+        # Use the Async client for non-blocking enterprise performance
+        response = await gemini_client.aio.models.generate_content(
+            model='gemini-1.5-pro', # Use 'gemini-1.5-flash' for faster/cheaper testing
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=VerifiedMLIR, # Forces Gemini to output perfect Pydantic JSON
+                temperature=0.1, # Extremely low temp for deterministic code generation
+            ),
+        )
+        return response.text
+    except Exception as e:
+        print(f"   [Gemini API Error] {e}")
+        raise
+
+# --- 3. The Verification Loop (Keep your existing loop!) ---
+# async def verified_generation_loop(intent: str, func_code: str, arg_count: int) -> VerifiedMLIR:
+# ... (Leave the rest of your file exactly as is) ...
+
+## Step 2: Test the Integration
+To verify that Gemini has successfully taken over the brain of Repo OS:
+
+Delete your old .poly_cache directory to force a recompilation:
+rm -rf ./.poly_cache/*
+
+Run your Ahead-of-Time compiler:
+python component9_aot.py
+
+Watch the terminal. You should see it hit the Gemini API, successfully validate the schema, and output the .ll cache file significantly faster and with fewer hallucinations than the local Ollama instance.

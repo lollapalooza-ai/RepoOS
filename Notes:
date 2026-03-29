@@ -50,3 +50,8 @@ Your report must follow the rules for writing report in template file refactor-t
 LLVM IR : 
 end to end test:
 ./venv/bin/python3 user_script.py
+
+
+export GEMINI_API_KEY="AIzaSyDMJk8OPQ25BdPscaT23sYZ-B1s97GeDZE" && source venv/bin/activate && python3 component9_aot.py legacy_shop
+
+export GEMINI_API_KEY="AIzaSyD-snhr_uNBrQwpmGCiY5C4oZ2otv5Gqzw" && source venv/bin/activate && python3 component9_aot.py legacy_shop

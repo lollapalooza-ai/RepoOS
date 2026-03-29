@@ -7,7 +7,7 @@ from neo4j import GraphDatabase
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
-CACHE_DIR = "./.poly_cache"
+CACHE_DIR = "./.poly_cache2"
 
 async def generate_dynamic_fsm_prompt(fqn: str, arg_count: int = 0):
     """
@@ -114,6 +114,10 @@ Store the final calculated result in the target_var of the last operation.
             print(f"   💾 SUCCESS: Saved verified MLIR to {cache_file}")
         except Exception as e:
             print(f"   ❌ FAILED to compile '{fqn}': {e}")
+            # TODO: Remove this quota-check kill switch once daily limits are increased
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                print("🛑 Quota exceeded. Killing run as requested.")
+                sys.exit(1)
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "legacy_shop"
