@@ -131,9 +131,18 @@ class PythonSymbolicEngine(ast.NodeVisitor):
         return self.visit_suite(node.body)
 
     def visit_suite(self, nodes):
+        final_res = None
         for node in nodes:
             res = self.visit(node)
-            if res is not None: return res
+            if res is not None: final_res = res
+        return final_res
+
+    def visit_Assign(self, node):
+        # We only handle simple assignments: x = expression
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            val = self.visit(node.value)
+            mapped_name = self.arg_map.get(node.targets[0].id, node.targets[0].id)
+            self.env[mapped_name] = val
         return None
 
     def visit_If(self, node):
@@ -251,8 +260,9 @@ ANALYSIS TASK:
         await asyncio.sleep(60) # Rate limit mitigation
         try:
             response = await gemini_client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-2.5-pro',
                 contents=prompt,
+
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=VerifiedMLIR,

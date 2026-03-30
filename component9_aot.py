@@ -80,10 +80,30 @@ async def aot_compile_all(target_module: str = "legacy_shop"):
             print(f"   ⚡ Cache hit! '{fqn}' is already compiled. Skipping.")
             continue
             
+        # UPGRADED: Detect if this is a method and find its required keys
+        is_method = "." in fqn and fqn.split('.')[-2][0].isupper()
+        module_name = ".".join(fqn.split('.')[:-1])
+        
+        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+        with driver.session() as session:
+            res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.extracted_keys", mod=module_name, fqn=fqn)
+            rec = res.single()
+            keys = rec[0] if rec else []
+        driver.close()
+
+        external_memory = {}
+        real_arg_count = arg_count - 1 if is_method else arg_count
+        arg_info = [f"arg{i}" for i in range(real_arg_count)]
+        
+        if keys and real_arg_count > 0:
+            ptr_name = f"arg{real_arg_count-1}"
+            arg_info[-1] = f"{ptr_name} (Pointer to Struct: {keys})"
+            external_memory[ptr_name] = len(keys)
+
         # Decision: Is this a generic function or does it need a custom FSM?
         intent = await generate_dynamic_fsm_prompt(fqn, arg_count)
         if not intent:
-             arg_desc = f"takes {arg_count} float inputs: named 'arg0' through 'arg{arg_count - 1}'" if arg_count > 0 else "takes 0 inputs"
+             arg_desc = f"takes {real_arg_count} inputs: {', '.join(arg_info)}" if real_arg_count > 0 else "takes 0 inputs"
              intent = f"""
 You are an expert compiler frontend. Convert this Python logic into a DOD MLIR JSON execution graph.
 You MUST use the `thinking_process` field first to trace the variables before writing the operations.
@@ -91,6 +111,10 @@ You MUST use the `thinking_process` field first to trace the variables before wr
 STRICT FLATNESS RULE:
 You CANNOT use math symbols (+, -, *, /) or nested logic in the `args` list.
 The arguments MUST be simple strings: variable names (e.g., "arg0", "temp1") or numbers (e.g., "1.5", "0.08").
+
+IMPORTANT: If an argument is a Pointer to a Struct, use `gep` and `load` to access its fields.
+Use NUMERICAL indices for `gep` offsets based on the field order.
+Field order (0-indexed): {keys}
 
 WRONG: {{"op": "select", "args": ["cond", "arg0 * 1.5", "arg0"], "target_var": "res"}}
 CORRECT (Break it down):
@@ -108,7 +132,7 @@ Store the final calculated result in the target_var of the last operation.
 """
 
         try:
-            verified_mlir = await verified_generation_loop(intent, func_code, arg_count)
+            verified_mlir = await verified_generation_loop(intent, func_code, real_arg_count, external_memory=external_memory)
             with open(cache_file, 'w', encoding='utf-8') as f:
                 f.write(verified_mlir.model_dump_json(indent=2))
             print(f"   💾 SUCCESS: Saved verified MLIR to {cache_file}")
