@@ -1,0 +1,27 @@
+{
+  "thinking_process": "The user wants to generate an execution graph for a Python function `legacy_shop.app.get_all_users`. Based on the function name and the provided keywords like `run_raw_sql`, `connect`, `cursor`, `execute`, and `fetchall`, the core logic is to execute a SQL query to retrieve all user records from a database. The most direct way to model this with the given ISA is to use a Foreign Function Interface (FFI) call. I will model a call to a high-level helper function `run_raw_sql`, which encapsulates the database connection and query execution details. The argument to this function will be the SQL query string `SELECT id, username, email FROM users`. The result of the FFI call will be a handle to the fetched data, which I will store in the `users_result` variable. No complex control flow like loops or branches is needed for this high-level representation. A symbolic buffer `result_buffer` is allocated to represent the memory where the database driver might place the results.",
+  "memory_allocations": [
+    {
+      "name": "result_buffer",
+      "size": 4096
+    }
+  ],
+  "loop_limit": 1,
+  "operations": [
+    {
+      "op": "label",
+      "args": [
+        "entry"
+      ],
+      "target_var": null
+    },
+    {
+      "op": "ffi_call",
+      "args": [
+        "run_raw_sql",
+        "SELECT id, username, email FROM users"
+      ],
+      "target_var": "users_result"
+    }
+  ]
+}

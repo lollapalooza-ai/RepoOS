@@ -3,6 +3,9 @@ import llvmlite.binding as llvm
 import ctypes
 from component2_smt import VerifiedMLIR
 
+# Global registry to keep LLVM objects alive and avoid GC-related segfaults
+_KEEP_ALIVE = []
+
 llvm.initialize()
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -32,28 +35,33 @@ def map_python_signature_to_llvm(type_hints: dict):
 
 class PolyKernelJIT:
     def __init__(self):
-        self.target_machine = llvm.Target.from_default_triple().create_target_machine()
-        self.empty_mod = llvm.parse_assembly("")
-        self.engine = llvm.create_mcjit_compiler(self.empty_mod, self.target_machine)
+        # We'll create target machines per-compilation for maximum isolation
+        pass
 
     def incremental_compile(self, func_name: str, mlir_data: VerifiedMLIR, ctypes_signature, arg_count: int, ir_arg_types=None):
         module = ir.Module(name=f"module_{func_name}")
+        target = llvm.Target.from_default_triple()
+        target_machine = target.create_target_machine()
+        module.triple = target_machine.triple
         
-        # Declare external strcmp (C standard library)
-        strcmp_t = ir.FunctionType(ir.IntType(32), [ir.PointerType(ir.IntType(8)), ir.PointerType(ir.IntType(8))])
-        strcmp_f = ir.Function(module, strcmp_t, name="strcmp")
+        # Determine function signature
         if ir_arg_types:
             func_type = ir.FunctionType(ir.DoubleType(), ir_arg_types)
         elif arg_count == 0 and any(m.name == "raw_buffer" for m in mlir_data.memory_allocations):
-            # Special case for Zero-Copy FSM Scanner
             byte_ptr_type = ir.PointerType(ir.IntType(8))
             func_type = ir.FunctionType(ir.DoubleType(), [byte_ptr_type, ir.IntType(32)])
         else:
-            # Fallback to all doubles
             arg_types = [ir.DoubleType()] * arg_count
             func_type = ir.FunctionType(ir.DoubleType(), arg_types)
             
         func = ir.Function(module, func_type, name=func_name)
+        
+        # Define external functions only if they are likely to be used
+        # (Simplified for compute_gravity benchmark)
+        strcmp_f = None
+        if any(op.op == "strcmp" for op in mlir_data.operations):
+            strcmp_t = ir.FunctionType(ir.IntType(32), [ir.PointerType(ir.IntType(8)), ir.PointerType(ir.IntType(8))])
+            strcmp_f = ir.Function(module, strcmp_t, name="strcmp")
         
         # Two-Pass Block Allocation
         blocks = {"entry": func.append_basic_block(name="entry")}
@@ -73,10 +81,8 @@ class PolyKernelJIT:
             for i in range(len(func.args)):
                 variables[f"arg{i}"] = func.args[i]
         
-        # Allocate local memory arrays
         for alloc in mlir_data.memory_allocations:
             if alloc.name != "raw_buffer":
-                # Assume double arrays for now, or match type if we expand ISA
                 var_type = ir.ArrayType(ir.DoubleType(), alloc.size)
                 variables[alloc.name] = builder.alloca(var_type, name=alloc.name)
 
@@ -99,20 +105,14 @@ class PolyKernelJIT:
             if op == "label":
                 builder.position_at_end(blocks[args[0]])
                 continue
-            
             elif op == "br":
                 if len(args) == 1:
                     builder.branch(resolve_arg(args[0]))
                 elif len(args) == 3:
                     val = resolve_arg(args[0])
-                    # Handle i1 or double condition
-                    if val.type == ir.IntType(1):
-                        cond = val
-                    else:
-                        cond = builder.fcmp_ordered('>', val, ir.Constant(ir.DoubleType(), 0.5))
+                    cond = val if val.type == ir.IntType(1) else builder.fcmp_ordered('>', val, ir.Constant(ir.DoubleType(), 0.5))
                     builder.cbranch(cond, resolve_arg(args[1]), resolve_arg(args[2]))
                 last_res = None
-                
             elif op == "add":
                 last_res = builder.fadd(resolve_arg(get_arg(0)), resolve_arg(get_arg(1)), name=instruction.target_var)
             elif op == "sub":
@@ -130,7 +130,6 @@ class PolyKernelJIT:
                 last_res = builder.select(cond_i1, resolve_arg(get_arg(1)), resolve_arg(get_arg(2)), name=instruction.target_var)
             elif op == "load":
                 base = resolve_arg(get_arg(0))
-                # Handle different pointer types
                 if isinstance(base.type, ir.PointerType):
                     if isinstance(base.type.pointee, ir.ArrayType):
                         ptr = builder.gep(base, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
@@ -138,7 +137,7 @@ class PolyKernelJIT:
                     else:
                         last_res = builder.load(base, name=instruction.target_var)
                 else:
-                    last_res = base # Fallback
+                    last_res = base
             elif op == "store":
                 builder.store(resolve_arg(get_arg(0)), resolve_arg(get_arg(1)))
                 last_res = None
@@ -152,42 +151,30 @@ class PolyKernelJIT:
             elif op == "icmp":
                 cmp_op = get_arg(0)
                 lhs, rhs = resolve_arg(get_arg(1)), resolve_arg(get_arg(2))
-                # Handle integer vs float comparison
                 if lhs.type == ir.IntType(8) or lhs.type == ir.IntType(32):
                     cmp = builder.icmp_unsigned(cmp_op if cmp_op != '==' else '==', lhs, rhs, name=instruction.target_var)
                 else:
                     cmp = builder.fcmp_ordered(cmp_op, lhs, rhs, name=instruction.target_var)
                 last_res = builder.uitofp(cmp, ir.DoubleType())
-            
             elif op == "alloc_struct":
-                # args: [name, size]
                 size = int(float(get_arg(1, "8")))
                 var_type = ir.ArrayType(ir.IntType(8), size)
                 variables[get_arg(0)] = builder.alloca(var_type, name=get_arg(0))
                 last_res = variables[get_arg(0)]
-            
             elif op == "string_view_ptr":
-                # args: [buffer, offset, length]
                 base = resolve_arg(get_arg(0))
                 offset = resolve_arg(get_arg(1))
                 if offset.type == ir.DoubleType():
                     offset = builder.fptosi(offset, ir.IntType(32))
-                # Ensure base is a pointer
                 if not isinstance(base.type, ir.PointerType):
                     last_res = ir.Constant(ir.DoubleType(), 0.0)
                 else:
                     last_res = builder.gep(base, [offset], name=instruction.target_var)
-            
             elif op == "ffi_call":
-                # placeholder: return 0.0 for now
                 last_res = ir.Constant(ir.DoubleType(), 0.0)
-            
-            elif op == "strcmp":
-                # args: [ptr1, ptr2_or_literal]
+            elif op == "strcmp" and strcmp_f:
                 p1 = resolve_arg(get_arg(0))
                 p2_raw = get_arg(1)
-                
-                # If p2 is a literal, create a global string constant
                 if not p2_raw in variables and not p2_raw.replace('.','').isdigit():
                     s_val = bytes(p2_raw, "utf8") + b"\0"
                     s_type = ir.ArrayType(ir.IntType(8), len(s_val))
@@ -197,14 +184,10 @@ class PolyKernelJIT:
                     p2 = builder.gep(global_s, [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), 0)])
                 else:
                     p2 = resolve_arg(p2_raw)
-                
-                # Ensure we have i8* pointers
                 if not isinstance(p1.type, ir.PointerType):
-                     # Maybe it's a double that the AI thinks is a pointer
                      last_res = ir.Constant(ir.DoubleType(), 0.0)
                 else:
                     res_i32 = builder.call(strcmp_f, [p1, p2])
-                    # 0 means equal. Convert to float 1.0 (True) if 0, else 0.0
                     is_eq = builder.icmp_unsigned('==', res_i32, ir.Constant(ir.IntType(32), 0))
                     last_res = builder.uitofp(is_eq, ir.DoubleType(), name=instruction.target_var)
 
@@ -219,8 +202,22 @@ class PolyKernelJIT:
                 except: last_res = ir.Constant(ir.DoubleType(), 0.0)
             builder.ret(last_res)
         
+        # Compile and Execute
         llmod = llvm.parse_assembly(str(module))
-        self.engine.add_module(llmod)
-        self.engine.finalize_object()
-        func_ptr = self.engine.get_function_address(func_name)
+        
+        # Optimize
+        pmb = llvm.PassManagerBuilder()
+        pmb.opt_level = 3
+        mpm = llvm.ModulePassManager()
+        pmb.populate(mpm)
+        mpm.run(llmod)
+        
+        engine = llvm.create_mcjit_compiler(llvm.parse_assembly(""), target_machine)
+        engine.add_module(llmod)
+        engine.finalize_object()
+        func_ptr = engine.get_function_address(func_name)
+        
+        # Keep engine and module alive
+        _KEEP_ALIVE.append((engine, llmod, target_machine))
+        
         return ctypes_signature(func_ptr)

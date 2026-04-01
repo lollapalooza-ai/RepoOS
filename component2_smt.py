@@ -50,75 +50,145 @@ class VerifiedMLIR(BaseModel):
     loop_limit: int = Field(..., description="Max loop iterations (for safety bounding).")
     operations: List[Operation] = Field(..., description="The Execution Graph.")
 
-# --- 2. The Dynamic Z3 Memory Bounds Checker ---
+# --- 2. The Flow-Sensitive Z3 Memory Bounds Checker ---
 def verify_llm_safety(mlir_data: VerifiedMLIR, arg_count: int = 0, external_memory: dict = None):
+    """
+    UPGRADED: Path-Constraint Analyzer (Flow-Sensitive).
+    Tracks constraints across basic blocks to eliminate off-by-one false positives.
+    """
+    # 1. Setup Global Context
     solver = Solver()
+    # Symbolic environment for variables
+    env = {}
+    # Maps labels to constraints inherited from branches
+    block_constraints = {}
+    
+    # Initialize arguments and allocations
     memory_sizes = {mem.name: IntVal(mem.size) for mem in mlir_data.memory_allocations}
     if external_memory:
         for name, size in external_memory.items():
             memory_sizes[name] = IntVal(size)
     
+    # Implicit FSM arguments
+    buffer_len = Int('buffer_len')
     if 'raw_buffer' not in memory_sizes:
-        # We assume 'raw_buffer' size is passed as an argument if it's an FSM
-        # For safety check, we'll use a symbolic 'buffer_len' variable
-        buffer_len = Int('buffer_len')
         solver.add(buffer_len > 0)
         memory_sizes['raw_buffer'] = buffer_len
     
-    if mlir_data.loop_limit > 0:
-        loop_limit = IntVal(mlir_data.loop_limit)
-        idx = Int('idx')
-        i = Int('i')
-        solver.add(And(idx >= 0, idx < loop_limit))
-        solver.add(And(i >= 0, i < loop_limit))
+    env['buffer_len'] = buffer_len
+    for i in range(arg_count):
+        env[f"arg{i}"] = Real(f"arg{i}")
 
+    def resolve_z3_val(v):
+        if v in env: return env[v]
+        if v.startswith('"') and v.endswith('"') and len(v) == 3:
+            return IntVal(ord(v[1]))
+        if v.replace('.', '').replace('-', '').isdigit():
+            # Z3 Int for offsets, Real for scalar math
+            return IntVal(int(float(v)))
+        return Int(v)
+
+    # 2. Pre-process Pass: Basic Block Context
+    # We track which labels are reached via which branch conditions
+    current_block_constraints = []
+    
+    # 3. Main Verification Pass
     for op in mlir_data.operations:
-        if op.op == "gep":
+        # --- Control Flow Tracking ---
+        if op.op == "label":
+            label_name = op.args[0]
+            # Inherit constraints assigned to this label
+            if label_name in block_constraints:
+                current_block_constraints = block_constraints[label_name]
+            continue
+
+        elif op.op == "br":
+            if len(op.args) == 3: # Conditional branch [cond, true_label, false_label]
+                cond_var, t_label, f_label = op.args[0], op.args[1], op.args[2]
+                cond_expr = env.get(cond_var)
+                if cond_expr is not None:
+                    # Assign constraints to target labels
+                    block_constraints[t_label] = current_block_constraints + [cond_expr == 1]
+                    block_constraints[f_label] = current_block_constraints + [cond_expr == 0]
+            continue
+
+        # --- Symbolic State Tracking ---
+        elif op.op in ["add", "sub", "mul", "div"]:
+            if op.target_var:
+                l, r = resolve_z3_val(op.args[0]), resolve_z3_val(op.args[1])
+                # We use Int arithmetic for offsets
+                if op.op == "add": env[op.target_var] = l + r
+                elif op.op == "sub": env[op.target_var] = l - r
+                elif op.op == "mul": env[op.target_var] = l * r
+                elif op.op == "div": env[op.target_var] = l / r
+
+        elif op.op == "icmp":
+            if op.target_var:
+                c_op, l, r = op.args[0], resolve_z3_val(op.args[1]), resolve_z3_val(op.args[2])
+                cond = (l == r)
+                if c_op == "gt": cond = (l > r)
+                elif c_op == "lt": cond = (l < r)
+                elif c_op == "ge": cond = (l >= r)
+                elif c_op == "le": cond = (l <= r)
+                elif c_op == "ne": cond = (l != r)
+                env[op.target_var] = If(cond, IntVal(1), IntVal(0))
+
+        # --- Memory Safety Checks ---
+        elif op.op == "gep":
             if len(op.args) < 2: return False, f"MALFORMED GEP: {op.args}"
             base_ptr, offset_var = op.args[0], op.args[1]
-            if base_ptr not in memory_sizes: return False, f"SEGFAULT RISK: {base_ptr}"
-            buffer_size = memory_sizes[base_ptr]
             
-            def resolve_z3(v):
-                if v.replace('.', '').replace('-', '').isdigit(): return IntVal(int(float(v)))
-                return Int(v)
+            if base_ptr not in memory_sizes:
+                if arg_count == 0: return False, f"SEGFAULT RISK: '{base_ptr}'. Use 'raw_buffer'."
+                return False, f"SEGFAULT RISK: {base_ptr}"
             
-            z3_offset = resolve_z3(offset_var)
+            z3_offset = resolve_z3_val(offset_var)
+            z3_buf_size = memory_sizes[base_ptr]
             
-            bounds_violation = Or(z3_offset < 0, z3_offset >= buffer_size)
-            check_solver = Solver()
-            check_solver.add(solver.assertions())
-            check_solver.add(bounds_violation)
-            if check_solver.check() == sat:
-                model = check_solver.model()
-                return False, f"BUFFER OVERFLOW RISK: {offset_var} can equal {model[z3_offset]}"
-        
-        # MILESTONE 4: string_view_ptr bounds check
+            # Create a path-aware solver
+            path_solver = Solver()
+            path_solver.add(solver.assertions())
+            for c in current_block_constraints: path_solver.add(c)
+            
+            # Check violation: offset < 0 OR offset >= size
+            violation = Or(z3_offset < 0, z3_offset >= z3_buf_size)
+            path_solver.add(violation)
+            
+            if path_solver.check() == sat:
+                m = path_solver.model()
+                # USE m.eval() for complex expressions
+                eval_offset = m.eval(z3_offset, model_completion=True)
+                eval_size = m.eval(z3_buf_size, model_completion=True)
+                return False, f"BUFFER OVERFLOW RISK: '{offset_var}' can be {eval_offset} when buffer size is {eval_size}"
+            
+            # If safe, record the pointer derivation
+            if op.target_var:
+                env[op.target_var] = z3_offset # Track the offset for nested GEPs
+
         elif op.op == "string_view_ptr":
-            # args: [buffer, offset, length]
             if len(op.args) < 3: return False, f"MALFORMED string_view_ptr: {op.args}"
-            buffer_ptr, offset_var, length_var = op.args[0], op.args[1], op.args[2]
-            if buffer_ptr not in memory_sizes: return False, f"SEGFAULT RISK: {buffer_ptr}"
-            buffer_size = memory_sizes[buffer_ptr]
+            buf, off, length = op.args[0], op.args[1], op.args[2]
             
-            def resolve_z3(v):
-                if v.replace('.', '').replace('-', '').isdigit(): return IntVal(int(float(v)))
-                return Int(v)
+            if buf not in memory_sizes: return False, f"SEGFAULT RISK: {buf}"
             
-            z3_offset = resolve_z3(offset_var)
-            z3_length = resolve_z3(length_var)
+            z3_off = resolve_z3_val(off)
+            z3_len = resolve_z3_val(length)
+            z3_buf_size = memory_sizes[buf]
             
-            # Violation: offset < 0 OR offset + length > buffer_size
-            bounds_violation = Or(z3_offset < 0, z3_offset + z3_length > buffer_size)
-            check_solver = Solver()
-            check_solver.add(solver.assertions())
-            check_solver.add(bounds_violation)
-            if check_solver.check() == sat:
-                return False, f"STRING VIEW OUT-OF-BOUNDS: {offset_var}+{length_var} can exceed buffer"
-        
-        elif op.op == "store":
-            if len(op.args) < 2: return False, f"MALFORMED STORE: {op.args}"
-                
+            path_solver = Solver()
+            path_solver.add(solver.assertions())
+            for c in current_block_constraints: path_solver.add(c)
+            
+            # Violation: off < 0 OR off + length > size
+            violation = Or(z3_off < 0, z3_off + z3_len > z3_buf_size)
+            path_solver.add(violation)
+            if path_solver.check() == sat:
+                m = path_solver.model()
+                eval_off = m.eval(z3_off, model_completion=True)
+                eval_len = m.eval(z3_len, model_completion=True)
+                eval_size = m.eval(z3_buf_size, model_completion=True)
+                return False, f"STRING VIEW OUT-OF-BOUNDS: {off}({eval_off})+{length}({eval_len}) can exceed buffer({eval_size})"
+
     return True, "PROVEN MEMORY SAFE"
 
 # --- 3. The AST Symbolic Engine (Milestone 3.0) ---
@@ -211,7 +281,7 @@ def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
         last_val = val
     return last_val
 
-# --- 4. Dual-Backend Generative Feedback Loop ---
+# --- 4. Gemini Generative Feedback Loop ---
 async def generate_execution_graph(intent: str, error_context: str = "", last_failed_mlir: str = "") -> str:
     """Generates the MLIR JSON graph using either Gemini or Ollama (fallback)."""
     
@@ -224,15 +294,15 @@ You are an expert compiler frontend. Convert Python logic into a DOD MLIR execut
 
 STRICT ISA RULES:
 1. Every operation MUST be a flat object. NO nested logic like 'arg0 * 0.5'.
-   WRONG: {"op": "select", "args": ["cond", "arg0 * 0.5", "arg0"], "target_var": "res"}
-   CORRECT:
-     {"op": "mul", "args": ["arg0", "0.5"], "target_var": "temp1"},
-     {"op": "select", "args": ["cond", "temp1", "arg0"], "target_var": "res"}
-2. The `store` operation takes [value, pointer]. You CANNOT store into a literal or a variable name that is not a pointer.
-3. If you need to return a value, the LAST operation's `target_var` will be the return value.
-4. For STRING COMPARISON: Use `strcmp`, which takes [pointer, pointer_or_literal] and returns 1.0 (float) if equal, else 0.0.
-5. For STRING VIEWS: Use `string_view_ptr`, which MUST take exactly 3 arguments: [buffer_name, offset, length].
-   Example: {"op": "string_view_ptr", "args": ["raw_buffer", "0", "10"], "target_var": "my_str"}
+2. The `store` operation takes [value, pointer]. You CANNOT store into a literal.
+3. The `icmp` operation takes [operator, lhs, rhs]. Operator must be 'eq', 'ne', 'gt', 'lt'.
+4. For STRING COMPARISON: Use `strcmp`, which takes [pointer, pointer_or_literal].
+5. For STRING VIEWS: Use `string_view_ptr`, which MUST take [buffer_name, offset, length].
+
+MANDATORY NAMES FOR FSM (0-argument functions):
+- You MUST use 'raw_buffer' as the base pointer for the input data.
+- You MUST use 'buffer_len' as the size of the input data.
+- Do NOT invent names like 'json_bytes' or 'size'. Use 'raw_buffer' and 'buffer_len' only.
 """
 
     prompt = f"{base_instructions}\n\nTARGET INTENT:\n{intent}\n"
@@ -257,11 +327,12 @@ ANALYSIS TASK:
     # --- ROUTE TO BACKEND ---
     if api_key and api_key.strip():
         # USE GEMINI
-        await asyncio.sleep(60) # Rate limit mitigation
+        await asyncio.sleep(1) # Rate limit mitigation
         try:
             response = await gemini_client.aio.models.generate_content(
                 model='gemini-2.5-pro',
                 contents=prompt,
+
 
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",

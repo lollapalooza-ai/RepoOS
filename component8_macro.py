@@ -1,126 +1,104 @@
 import time
 import ctypes
-import requests
+import json
+import os
+import llvmlite.ir as ir
 import llvmlite.binding as llvm
 from rich.console import Console
 from rich.table import Table
 
-from legacy_shop.ecommerce import calculate_vip_revenue
+from component2_smt import VerifiedMLIR
+from component4_jit import PolyKernelJIT
+from legacy_shop.heavy_math import compute_gravity
 
 console = Console()
-API_URL = "http://127.0.0.1:8080/api/v1/orders"
-CACHE_FILE = "./.poly_cache/vectorized_vip_sum.ll"
+CACHE_FILE = "./.poly_cache2/legacy_shop_heavy_math_compute_gravity.json"
 
-def load_cached_kernel():
+def load_compiled_kernel():
     """
-    Bypasses the LLM entirely. Reads the Boot-Time generated LLVM IR from disk.
+    Loads the MLIR JSON and compiles it via PolyKernelJIT.
     """
-    import os
     if not os.path.exists(CACHE_FILE):
-        raise FileNotFoundError(f"AOT Cache missing! Run component9_aot.py first.")
+        raise FileNotFoundError(f"MLIR Cache missing! {CACHE_FILE}")
         
     with open(CACHE_FILE, 'r') as f:
-        llvm_ir = f.read()
-
-    llvm.initialize()
-    llvm.initialize_native_target()
-    llvm.initialize_native_asmprinter()
+        mlir_dict = json.load(f)
     
-    target_machine = llvm.Target.from_default_triple().create_target_machine()
-    jit = llvm.create_mcjit_compiler(llvm.parse_assembly(llvm_ir), target_machine)
-    jit.finalize_object()
+    mlir_data = VerifiedMLIR.model_validate(mlir_dict)
     
-    func_ptr = jit.get_function_address("vectorized_vip_sum")
-    cfunc = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_char_p, ctypes.c_int32)(func_ptr)
-    return cfunc, jit
-
-def run_macro_benchmark():
-    console.print(f"\n[bold cyan]🌐 Fetching 500k Orders from API ({API_URL})...[/bold cyan]")
+    jit = PolyKernelJIT()
     
-    # --- The Network & Deserialization Tax ---
-    try:
-        net_start = time.perf_counter()
-        response = requests.get(API_URL)
-        # Standard Python baseline still uses json.loads()
-        orders = response.json() 
-        net_time = time.perf_counter() - net_start
-        
-        # Intercept raw bytes for Poly-Kernel
-        raw_bytes = response.content
-        buffer_length = len(raw_bytes)
-    except Exception as e:
-        console.print(f"[bold red]❌ Failed to connect to API server: {e}[/bold red]")
-        console.print("[yellow]Ensure you run 'python3 -m legacy_shop.api_server' in a separate terminal.[/yellow]")
-        return
+    # Signature for compute_gravity(mass1, mass2)
+    arg_count = 2
+    ir_arg_types = [ir.DoubleType(), ir.DoubleType()]
+    CFuncType = ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_double, ctypes.c_double)
     
-    console.print(f"[dim]Network + json.loads() Time: {net_time:.4f}s[/dim]")
-    console.print(f"[dim]Intercepted {buffer_length} bytes from network.[/dim]\n")
-    
-    # --- PHASE 1: Native CPython ---
-    console.print("[yellow]🏃 Racing Standard CPython (Pointer Chasing)...[/yellow]")
-    start_py = time.perf_counter()
-    py_result = calculate_vip_revenue(orders)
-    py_time = time.perf_counter() - start_py
-    
-    # --- PHASE 2: Poly-Kernel Zero-Copy (AOT Cached) ---
-    console.print("[yellow]⚡ Racing Poly-Kernel (Zero-Copy Byte Scanner)...[/yellow]")
-    
-    # Lock the raw bytes in memory so C can read it without Python interfering
-    c_byte_buffer = ctypes.create_string_buffer(raw_bytes, buffer_length)
-    
-    try:
-        # Load the newly compiled FSM parser
-        jit_func, _engine = load_cached_kernel() 
-        
-        # Define the ctypes signature
-        jit_func.argtypes = [ctypes.c_char_p, ctypes.c_int32]
-        jit_func.restype = ctypes.c_double
-        
-    except Exception as e:
-        console.print(f"[bold red]❌ Failed to load FSM kernel: {e}[/bold red]")
-        return
-    
-    start_jit_exec = time.perf_counter()
-    
-    # We pass the memory address directly. No dictionaries. No translation loops.
-    jit_result = jit_func(c_byte_buffer, buffer_length)
-    
-    jit_exec_time = time.perf_counter() - start_jit_exec
-    marshall_time = 0.0000 
-    
-    # --- 3. Render Dashboard ---
-    table = Table(title="End-to-End API Benchmark: Python vs AOT Poly-Kernel", style="magenta")
-    table.add_column("Architecture", style="dim")
-    table.add_column("Result", justify="right")
-    table.add_column("Data Marshalling", justify="right")
-    table.add_column("Execution Time", justify="right")
-    table.add_column("Total Latency", justify="right")
-
-    # The real cost of CPython is Marshalling (json.loads) + Calculation
-    total_py_latency = net_time + py_time
-    table.add_row(
-        "CPython", 
-        f"${py_result:,.2f}", 
-        f"{net_time:.4f}s (json.loads)", 
-        f"{py_time:.4f}s", 
-        f"[red]{total_py_latency:.4f}s[/red]"
+    compiled_func = jit.incremental_compile(
+        "compute_gravity", 
+        mlir_data, 
+        CFuncType, 
+        arg_count, 
+        ir_arg_types=ir_arg_types
     )
     
-    # The real cost of Poly-Kernel is strictly the Core Execution
-    total_jit_latency = jit_exec_time
-    speedup = total_py_latency / total_jit_latency if total_jit_latency > 0 else float('inf')
+    return compiled_func
+
+def run_macro_benchmark():
+    console.print(f"\n[bold cyan]🚀 Benchmarking Heavy Math: compute_gravity[/bold cyan]")
+    
+    # Test Data
+    m1, m2 = 5000.0, 1200.0
+    iterations = 10000000 # 10 Million iterations
+    
+    console.print(f"[dim]Iterations: {iterations:,}[/dim]\n")
+    
+    # --- PHASE 1: Native CPython ---
+    console.print("[yellow]跑🏃 Racing Standard CPython (Bytecode Interpreter)...[/yellow]")
+    start_py = time.perf_counter()
+    for _ in range(iterations):
+        py_result = compute_gravity(m1, m2)
+    py_time = time.perf_counter() - start_py
+    
+    # --- PHASE 2: Poly-Kernel JIT ---
+    console.print("[yellow]⚡ Racing Poly-Kernel JIT (Bare-Metal LLVM)...[/yellow]")
+    
+    try:
+        jit_func = load_compiled_kernel() 
+    except Exception as e:
+        console.print(f"[bold red]❌ Failed to compile kernel: {e}[/bold red]")
+        return
+    
+    start_jit = time.perf_counter()
+    for _ in range(iterations):
+        jit_result = jit_func(m1, m2)
+    jit_time = time.perf_counter() - start_jit
+    
+    # --- 3. Render Dashboard ---
+    table = Table(title="Performance Benchmark: Python vs Poly-Kernel JIT", style="magenta")
+    table.add_column("Architecture", style="dim")
+    table.add_column("Result", justify="right")
+    table.add_column("Execution Time (1M calls)", justify="right")
+    table.add_column("Avg Latency", justify="right")
+
+    table.add_row(
+        "CPython", 
+        f"{py_result:.4f}", 
+        f"{py_time:.4f}s", 
+        f"[red]{(py_time/iterations)*1e6:.4f} µs[/red]"
+    )
+    
+    speedup = py_time / jit_time if jit_time > 0 else float('inf')
     
     table.add_row(
-        "Poly-Kernel", 
-        f"${jit_result:,.2f}", 
-        "0.0000s (Zero-Copy)", 
-        f"{jit_exec_time:.4f}s", 
-        f"[bold green]{total_jit_latency:.4f}s[/bold green] ({speedup:.1f}x Faster)"
+        "Poly-Kernel JIT", 
+        f"{jit_result:.4f}", 
+        f"{jit_time:.4f}s", 
+        f"[bold green]{(jit_time/iterations)*1e6:.4f} µs[/bold green] ({speedup:.1f}x Faster)"
     )
     
     console.print("\n")
     console.print(table)
-    console.print("\n[bold cyan]Architect's Note:[/bold cyan] By bypassing object allocation and scanning raw bytes directly in RAM, the Poly-Kernel has completely eliminated the Data Marshalling tax.")
+    console.print(f"\n[bold cyan]Architect's Note:[/bold cyan] By compiling Python logic directly to LLVM IR, the Poly-Kernel eliminates the overhead of the Python stack, frame evaluation, and bytecode dispatch.")
 
 if __name__ == "__main__":
     run_macro_benchmark()
