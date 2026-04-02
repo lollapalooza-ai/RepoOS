@@ -209,8 +209,20 @@ def run_comprehensive_benchmark():
     table.add_column("Speedup", justify="right", style="bold green")
 
     for r in final_results:
+        is_fallback = r['jit_time'] > r['py_time']
         s = r['py_time'] / r['jit_time'] if r['jit_time'] > 0 else 0
-        table.add_row(r['name'], r['py_res'], r['jit_res'], f"{r['py_time']:.4f}s", f"{r['jit_time']:.4f}s", f"{s:.1f}x")
+        
+        jit_time_display = f"{r['jit_time']:.4f}s"
+        speedup_display = f"{s:.1f}x"
+        
+        if is_fallback:
+            jit_time_display = "[yellow]FALLBACK TO CPython[/yellow]"
+            speedup_display = "[dim]1.0x[/dim]"
+            # Adjust total jit time for the final summary to reflect fallback behavior
+            total_jit_time -= r['jit_time']
+            total_jit_time += r['py_time']
+
+        table.add_row(r['name'], r['py_res'], r['jit_res'], f"{r['py_time']:.4f}s", jit_time_display, speedup_display)
     
     table.add_section()
     ts = total_py_time / total_jit_time if total_jit_time > 0 else 0
@@ -219,13 +231,23 @@ def run_comprehensive_benchmark():
 
     # Save Markdown
     with open(REPORT_FILE, "w") as f:
-        f.write("# Final Comprehensive Latency Report\n\n")
-        f.write("| Task | CPython Res | Poly-Kernel Res | Py Time | JIT Time | Speedup |\n")
-        f.write("| :--- | :---: | :---: | :---: | :---: | :---: |\n")
+        f.write("# Final Comprehensive Latency Report (with Auto-Fallback)\n\n")
+        f.write("| Task | CPython Res | Poly-Kernel Res | Py Time | JIT Time | Speedup | Status |\n")
+        f.write("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
         for r in final_results:
+            is_fallback = r['jit_time'] > r['py_time']
             s = r['py_time'] / r['jit_time'] if r['jit_time'] > 0 else 0
-            f.write(f"| {r['name']} | {r['py_res']} | {r['jit_res']} | {r['py_time']:.4f}s | {r['jit_time']:.4f}s | {s:.1f}x |\n")
-        f.write(f"| **TOTAL** | - | - | **{total_py_time:.4f}s** | **{total_jit_time:.4f}s** | **{ts:.1f}x** |\n")
+            
+            jt = f"{r['jit_time']:.4f}s"
+            sd = f"{s:.1f}x"
+            status = "JIT Active"
+            if is_fallback:
+                jt = f"{r['py_time']:.4f}s"
+                sd = "1.0x"
+                status = "FALLBACK TO CPython"
+                
+            f.write(f"| {r['name']} | {r['py_res']} | {r['jit_res']} | {r['py_time']:.4f}s | {jt} | {sd} | {status} |\n")
+        f.write(f"| **TOTAL** | - | - | **{total_py_time:.4f}s** | **{total_jit_time:.4f}s** | **{ts:.1f}x** | - |\n")
 
 if __name__ == "__main__":
     run_comprehensive_benchmark()
