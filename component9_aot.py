@@ -101,7 +101,9 @@ async def aot_compile_all(target_module: str = "legacy_shop"):
             external_memory["arg0"] = 500000
             arg_info[0] = "arg0 (Pointer to Array: 500,000 Orders)"
 
-        if keys and real_arg_count > 0:
+        # Only apply struct projection to METHODS (where arg0 is self)
+        # OR if it's a specific scanner target
+        if keys and real_arg_count > 0 and is_method:
             ptr_name = f"arg{real_arg_count-1}"
             arg_info[-1] = f"{ptr_name} (Pointer to Struct: {keys})"
             external_memory[ptr_name] = len(keys)

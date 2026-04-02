@@ -1,12 +1,12 @@
 {
-  "thinking_process": "The user wants to generate an execution graph for a Python function `legacy_shop.app.get_all_users`. Based on the function name and the provided keywords like `run_raw_sql`, `connect`, `cursor`, `execute`, and `fetchall`, the core logic is to execute a SQL query to retrieve all user records from a database. The most direct way to model this with the given ISA is to use a Foreign Function Interface (FFI) call. I will model a call to a high-level helper function `run_raw_sql`, which encapsulates the database connection and query execution details. The argument to this function will be the SQL query string `SELECT id, username, email FROM users`. The result of the FFI call will be a handle to the fetched data, which I will store in the `users_result` variable. No complex control flow like loops or branches is needed for this high-level representation. A symbolic buffer `result_buffer` is allocated to represent the memory where the database driver might place the results.",
+  "thinking_process": "The user wants to generate an execution graph for a Python function `legacy_shop.app.get_all_users`. The provided keywords, especially `run_raw_sql`, `fetchall`, and `cursor`, strongly suggest a database query operation. The most direct interpretation of `get_all_users` is to execute a SQL query like `SELECT * FROM users`. I will model this by defining the SQL query as a string constant and then using a Foreign Function Interface (`ffi_call`) to represent the `run_raw_sql` function, which abstracts the database connection, execution, and fetching. The program flow will be linear: define the query string, call the external function with the query, and store the result. No complex control flow like loops or branches is necessary for this task. A memory buffer `sql_query_buffer` will be allocated to hold the SQL string literal.",
   "memory_allocations": [
     {
-      "name": "result_buffer",
-      "size": 4096
+      "name": "sql_query_buffer",
+      "size": 19
     }
   ],
-  "loop_limit": 1,
+  "loop_limit": 10,
   "operations": [
     {
       "op": "label",
@@ -16,12 +16,21 @@
       "target_var": null
     },
     {
+      "op": "string_view_ptr",
+      "args": [
+        "sql_query_buffer",
+        "0",
+        "19"
+      ],
+      "target_var": "query_string_ptr"
+    },
+    {
       "op": "ffi_call",
       "args": [
         "run_raw_sql",
-        "SELECT id, username, email FROM users"
+        "query_string_ptr"
       ],
-      "target_var": "users_result"
+      "target_var": "all_users_result"
     }
   ]
 }

@@ -255,29 +255,52 @@ class PythonSymbolicEngine(ast.NodeVisitor):
 
 
 def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
+    # Standardize on REAL for all math logic
     env = {f"arg{i}": Real(f"arg{i}") for i in range(arg_count)}
-    last_val = None
+    last_val = RealVal(0.0)
+
     def resolve(s):
-        if str(s) in env: return env[str(s)]
-        try: return RealVal(float(s))
-        except: return RealVal(0.0)
+        s_str = str(s)
+        if s_str in env: return env[s_str]
+        try:
+            # Force conversion to RealVal
+            return RealVal(float(s_str.strip('"')))
+        except: 
+            return Real(s_str)
+
 
     for op in mlir_data.operations:
+        # Ignore memory-only ops for semantic check
         if op.op in ["load", "store", "gep", "br", "label", "alloc_struct", "string_view_ptr", "ffi_call"]: continue 
+        
+        # Initialize default val to last_val to prevent None propagation
+        val = last_val
+        
         if op.op == "add": val = resolve(op.args[0]) + resolve(op.args[1])
         elif op.op == "sub": val = resolve(op.args[0]) - resolve(op.args[1])
         elif op.op == "mul": val = resolve(op.args[0]) * resolve(op.args[1])
         elif op.op == "div": val = resolve(op.args[0]) / resolve(op.args[1])
-        elif op.op == "cmp_eq": val = If(resolve(op.args[0]) == resolve(op.args[1]), RealVal(1.0), RealVal(0.0))
+        elif op.op == "strcmp":
+            # Model strcmp as a symbolic real
+            val = Real(f"{op.target_var}_sym")
+        elif op.op == "cmp_eq": 
+            val = If(resolve(op.args[0]) == resolve(op.args[1]), RealVal(1.0), RealVal(0.0))
         elif op.op == "icmp":
             c_op, l, r = op.args[0], resolve(op.args[1]), resolve(op.args[2])
-            cond = l == r
-            if c_op == ">": cond = l > r
-            elif c_op == "<": cond = l < r
+            if c_op == "eq": cond = (l == r)
+            elif c_op == "ne": cond = (l != r)
+            elif c_op == "gt": cond = (l > r)
+            elif c_op == "lt": cond = (l < r)
+            elif c_op == "ge": cond = (l >= r)
+            elif c_op == "le": cond = (l <= r)
+            else: cond = (l == r)
             val = If(cond, RealVal(1.0), RealVal(0.0))
-        elif op.op == "select": val = If(resolve(op.args[0]) > 0.5, resolve(op.args[1]), resolve(op.args[2]))
-        else: val = last_val
-        if op.target_var: env[op.target_var] = val
+        elif op.op == "select": 
+            cond_expr = resolve(op.args[0])
+            val = If(cond_expr > 0.5, resolve(op.args[1]), resolve(op.args[2]))
+        
+        if op.target_var: 
+            env[op.target_var] = val
         last_val = val
     return last_val
 
@@ -299,10 +322,10 @@ STRICT ISA RULES:
 4. For STRING COMPARISON: Use `strcmp`, which takes [pointer, pointer_or_literal].
 5. For STRING VIEWS: Use `string_view_ptr`, which MUST take [buffer_name, offset, length].
 
-MANDATORY NAMES FOR FSM (0-argument functions):
-- You MUST use 'raw_buffer' as the base pointer for the input data.
-- You MUST use 'buffer_len' as the size of the input data.
-- Do NOT invent names like 'json_bytes' or 'size'. Use 'raw_buffer' and 'buffer_len' only.
+ARGUMENT TYPES:
+- If 'argX' is a 'float' or 'int', it is a SCALAR value. Use it directly.
+- If 'argX' is a 'Pointer to Struct', you MUST use `gep` and `load`.
+- If 'argX' is a 'str', it is a POINTER to characters. Use it with `strcmp`.
 """
 
     prompt = f"{base_instructions}\n\nTARGET INTENT:\n{intent}\n"

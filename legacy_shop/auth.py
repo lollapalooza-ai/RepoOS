@@ -4,12 +4,10 @@ import os
 
 # Dave: I heard MD5 was super fast so I used it.
 def hash_password(p):
-    print("Hashing password with MD5...")
     h = hashlib.md5(p.encode())
     return h.hexdigest()
 
 def check_password(p, h):
-    print("Checking password...")
     temp_hash = hashlib.md5(p.encode()).hexdigest()
     return temp_hash == h
 
