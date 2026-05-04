@@ -1,156 +1,120 @@
 import os
 import sys
 import asyncio
-import llvmlite.ir as ir
-from component2_smt import verified_generation_loop
+import json
+import mlir.ir as ir
+from mlir.ir import Context, Module, Location, InsertionPoint, F64Type, FloatAttr, StringAttr, UnitAttr
+from mlir.dialects import arith, func, builtin, memref
+from mlir.passmanager import PassManager
+from component2_smt import verified_generation_loop, VerifiedMLIR
 from neo4j import GraphDatabase
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
-CACHE_DIR = "./.poly_cache2"
+CACHE_DIR = "./.poly_cache3"
+MANUAL_CACHE_DIR = "./.poly_cache_manual"
 
-async def generate_dynamic_fsm_prompt(fqn: str, arg_count: int = 0):
+def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
     """
-    MILESTONE 3.0: Queries Neo4j for extracted JSON keys and builds a custom FSM prompt.
+    Translates AI's optimized JSON into formal MLIR.
     """
+    os.makedirs(os.path.dirname(cache_filepath), exist_ok=True)
+    with Context() as ctx:
+        ctx.attach_diagnostic_handler(lambda d: True)
+        with Location.unknown():
+            module = Module.create()
+            try:
+                with InsertionPoint(module.body):
+                    f64 = F64Type.get()
+                    
+                    # 1. Signature
+                    input_types = []
+                    arg_names = []
+                    for arg_name, arg_type in verified_mlir_data.signature.items():
+                        if arg_name == "return": continue
+                        input_types.append(f64) # Currently all math is f64
+                        arg_names.append(arg_name)
+                    
+                    func_type = builtin.FunctionType.get(inputs=input_types, results=[f64])
+                    mlir_func = func.FuncOp(name=verified_mlir_data.function_name, type=func_type)
+                    mlir_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+                    mlir_func.add_entry_block()
+                    
+                    with InsertionPoint(mlir_func.entry_block):
+                        ssa_map = {}
+                        for i, name in enumerate(arg_names):
+                            ssa_map[name] = mlir_func.entry_block.arguments[i]
+                            ssa_map[f"%{name}"] = mlir_func.entry_block.arguments[i]
+                        
+                        # 2. Ops
+                        for op_data in verified_mlir_data.operations:
+                            def resolve(s):
+                                if s in ssa_map: return ssa_map[s]
+                                try: return arith.ConstantOp(f64, FloatAttr.get(f64, float(s))).result
+                                except: return arith.ConstantOp(f64, FloatAttr.get(f64, 0.0)).result
+                            
+                            if op_data.op == "constant":
+                                res = arith.ConstantOp(f64, FloatAttr.get(f64, float(op_data.args[0]))).result
+                            elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                            elif op_data.op == "subf": res = arith.SubFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                            elif op_data.op == "mulf": res = arith.MulFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                            elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                            elif op_data.op == "return":
+                                func.ReturnOp([resolve(op_data.args[0])])
+                                continue
+                            else: continue
+                            if op_data.target_var: ssa_map[op_data.target_var] = res
+
+                # 3. Verify & Lower
+                module.operation.verify()
+                pm = PassManager.parse("builtin.module(convert-scf-to-cf, convert-cf-to-llvm, convert-arith-to-llvm, func.func(llvm-request-c-wrappers), convert-func-to-llvm, reconcile-unrealized-casts)")
+                pm.run(module.operation)
+                
+                cache_filepath = cache_filepath.replace('.json', '.mlir')
+                with open(cache_filepath, "w") as f: f.write(str(module))
+                print(f"   [OK] Compiled MLIR: {cache_filepath}")
+
+                # 4. AOT Compilation to .dylib
+                ll_path = cache_filepath.replace('.mlir', '.ll')
+                dylib_path = cache_filepath.replace('.mlir', '.dylib')
+                
+                # Step A: MLIR -> LLVM IR
+                translate_bin = "/Users/yeshr/Applications/Program1/llvm-project/build/bin/mlir-translate"
+                os.system(f"{translate_bin} --mlir-to-llvmir {cache_filepath} -o {ll_path}")
+                
+                # Step B: LLVM IR -> .dylib (using system clang)
+                os.system(f"clang -shared -O3 {ll_path} -o {dylib_path}")
+                print(f"   [OK] Compiled AOT: {dylib_path}")
+
+            except Exception as e: print(f"   [ERROR] build failed: {e}")
+
+async def aot_compile_all(module_filter: str = ""):
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-    module_name = ".".join(fqn.split('.')[:-1])
-    if not module_name: module_name = fqn # Fallback
-    
+    print(f"\n--- 🚀 Starting Unified AI-Optimization Loop ---")
     with driver.session() as session:
-        # Find the module and its extracted keys
-        result = session.run("""
-            MATCH (m:Module) 
-            WHERE m.name = $module OR $fqn STARTS WITH m.name
-            RETURN m.extracted_keys as keys
-            LIMIT 1
-        """, module=module_name, fqn=fqn)
-        record = result.single()
-        required_keys = record["keys"] if record else []
-
-    # If it has arguments, it's likely a standard Python function, NOT a raw buffer scanner.
-    if arg_count > 0:
-        return "" # Signal to use standard scalar prompt
-    
-    intent = (
-        f"You are an expert LLVM FSM Generator.\n"
-        f"TARGET LOGIC: {fqn}\n"
-        f"REQUIRED JSON KEYS: {required_keys}\n"
-        f"TASK: Generate a Zero-Copy Finite State Machine using our expanded ISA.\n"
-        f"Do not parse the whole JSON. ONLY search for the exact bytes for the required keys.\n"
-        f"Project them into a contiguous memory struct (memory_allocations) and return the calculated result.\n"
-        f"Use `gep`, `load`, `icmp`, and `br` for the scanner logic."
-    )
-    driver.close()
-    return intent
-
-async def aot_compile_all(target_module: str = "legacy_shop"):
-    if not os.path.exists(CACHE_DIR): os.makedirs(CACHE_DIR)
-    
-    print(f"\n--- 🚀 Scanning Neo4j for module: '{target_module}' ---")
-    driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-    with driver.session() as session:
-        query = "MATCH (f:Function) WHERE f.arg_count IS NOT NULL"
-        if target_module != "all" and target_module != ".":
-            query += " AND (f.file CONTAINS $path OR f.fqn STARTS WITH $path)"
-        query += " RETURN f.fqn, f.name, f.code, f.arg_count"
-        
-        result = session.run(query, path=target_module)
-        records = [r for r in result]
-    
-    driver.close()
-        
-    for record in records:
-        fqn = record["f.fqn"]
-        func_name = record["f.name"]
-        func_code = record["f.code"]
-        arg_count = record["f.arg_count"]
-        
-        print(f"\n[AOT] Targeting: {fqn} (Args: {arg_count})")
-        
-        # HEURISTIC SKIP: Some functions are too complex for our current ISA (SQL, IO, etc.)
-        skip_keywords = ["sql", "db", "connect", "cursor", "execute", "date", "time", "setUp", "tearDown", "test_", "print", "log", "mail", "jsonify", "flask"]
-        if any(kw in fqn.lower() or kw in func_name.lower() for kw in skip_keywords):
-            print(f"   ⏩ Skipping {fqn}: Heuristic identifies it as too complex (IO/SQL/Test).")
-            continue
-
-        cache_file = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.json")
-        
-        if os.path.exists(cache_file):
-            print(f"   ⚡ Cache hit! '{fqn}' is already compiled. Skipping.")
-            continue
+        query = "MATCH (f:Function) WHERE f.fqn STARTS WITH $mod RETURN f.fqn, f.code, f.arg_count"
+        results = session.run(query, mod=module_filter)
+        for record in results:
+            fqn, func_code, arg_count = record["f.fqn"], record["f.code"], record["f.arg_count"]
+            if "math" not in fqn and "calculate" not in fqn and "pricing" not in fqn: continue
             
-        # UPGRADED: Detect if this is a method and find its required keys
-        is_method = "." in fqn and fqn.split('.')[-2][0].isupper()
-        module_name = ".".join(fqn.split('.')[:-1])
-        
-        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-        with driver.session() as session:
-            res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.extracted_keys", mod=module_name, fqn=fqn)
-            rec = res.single()
-            keys = rec[0] if rec else []
-        driver.close()
+            print(f"\n[OPTIMIZING] {fqn}...")
+            
+            # Anchor Logic
+            base_json_path = os.path.join(MANUAL_CACHE_DIR, f"{fqn.replace('.', '_')}.json")
+            base_json = ""
+            if os.path.exists(base_json_path):
+                with open(base_json_path, 'r') as f: base_json = f.read()
+                print(f"   [PRIMING] Anchoring to {base_json_path}")
 
-        external_memory = {}
-        real_arg_count = arg_count - 1 if is_method else arg_count
-        arg_info = [f"arg{i}" for i in range(real_arg_count)]
-        
-        # SPECIAL CASE: Macro Benchmark Constraint Injection
-        if "calculate_vip_revenue" in fqn:
-            # Tell the verifier that arg0 is a safe buffer of 500k orders
-            external_memory["arg0"] = 500000
-            arg_info[0] = "arg0 (Pointer to Array: 500,000 Orders)"
-
-        # Only apply struct projection to METHODS (where arg0 is self)
-        # OR if it's a specific scanner target
-        if keys and real_arg_count > 0 and is_method:
-            ptr_name = f"arg{real_arg_count-1}"
-            arg_info[-1] = f"{ptr_name} (Pointer to Struct: {keys})"
-            external_memory[ptr_name] = len(keys)
-
-        # Decision: Is this a generic function or does it need a custom FSM?
-        intent = await generate_dynamic_fsm_prompt(fqn, arg_count)
-        if not intent:
-             arg_desc = f"takes {real_arg_count} inputs: {', '.join(arg_info)}" if real_arg_count > 0 else "takes 0 inputs"
-             intent = f"""
-You are an expert compiler frontend. Convert this Python logic into a DOD MLIR JSON execution graph.
-You MUST use the `thinking_process` field first to trace the variables before writing the operations.
-
-STRICT FLATNESS RULE:
-You CANNOT use math symbols (+, -, *, /) or nested logic in the `args` list.
-The arguments MUST be simple strings: variable names (e.g., "arg0", "temp1") or numbers (e.g., "1.5", "0.08").
-
-MEMORY DECLARATION RULE:
-If you use a pointer argument (like 'arg0') in a `gep` instruction, you MUST declare its size in the `memory_allocations` section using that EXACT name ('arg0').
-Example: If 'arg0' is an array of 500,000 elements, include: {{"name": "arg0", "size": 500000}} in 'memory_allocations'.
-
-IMPORTANT: If an argument is a Pointer to a Struct, use `gep` and `load` to access its fields.
-Use NUMERICAL indices for `gep` offsets based on the field order.
-Field order (0-indexed): {keys}
-
-WRONG: {{"op": "select", "args": ["cond", "arg0 * 1.5", "arg0"], "target_var": "res"}}
-CORRECT (Break it down):
-  {{"op": "mul", "args": ["arg0", "1.5"], "target_var": "temp1"}},
-  {{"op": "select", "args": ["cond", "temp1", "arg0"], "target_var": "res"}}
-
-ISA OPCODES: add, sub, mul, div, cmp_eq, select, load, store, gep, icmp, br, label, alloc_struct, string_view_ptr, ffi_call, strcmp
-
-Now, compile this target:
-```python
-{func_code}
-```
-The function {arg_desc}.
-Store the final calculated result in the target_var of the last operation.
-"""
-
-        try:
-            verified_mlir = await verified_generation_loop(intent, func_code, real_arg_count, external_memory=external_memory)
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                f.write(verified_mlir.model_dump_json(indent=2))
-            print(f"   💾 SUCCESS: Saved verified MLIR to {cache_file}")
-        except Exception as e:
-            print(f"   ❌ FAILED to compile '{fqn}': {e}")
-            continue
+            intent = f"Optimize mathematical function: \n```python\n{func_code}\n```"
+            try:
+                verified_mlir = await verified_generation_loop(intent, func_code, arg_count, base_mlir_json=base_json)
+                verified_mlir.function_name = fqn.split('.')[-1]
+                cache_path = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.json")
+                build_and_cache_mlir(verified_mlir, cache_path)
+            except Exception as e: print(f"   ❌ FAILED: {e}")
+    driver.close()
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "legacy_shop"

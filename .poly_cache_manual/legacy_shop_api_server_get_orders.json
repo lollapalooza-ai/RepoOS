@@ -1,0 +1,27 @@
+{
+  "function_name": "get_orders",
+  "thinking_process": "Triple-pointer ABI translation.",
+  "signature": {
+    "return": "f64"
+  },
+  "operations": [
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c0"
+    },
+    {
+      "dialect": "func",
+      "op": "return",
+      "args": [
+        "%MASSIVE_PAYLOAD"
+      ],
+      "attributes": {},
+      "target_var": null
+    }
+  ]
+}

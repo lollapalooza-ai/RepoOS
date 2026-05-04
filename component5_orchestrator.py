@@ -4,17 +4,17 @@ import sys
 import os
 import inspect
 import json
-import llvmlite.ir as ir
 from neo4j import GraphDatabase
 from component2_smt import verified_generation_loop
-from component4_jit import PolyKernelJIT, map_python_signature_to_llvm
+from component4_jit import PolyKernelMLIRJIT, map_python_signature_to_llvm
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
+CACHE_DIR = "./.poly_cache3"
 
 class LazyCallManager:
     def __init__(self):
-        self.kernel = PolyKernelJIT()
+        self.kernel = PolyKernelMLIRJIT()
         self.registry = {} # Fast Path: FQN -> Compiled C Function
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._compiling_flags = set()
@@ -71,7 +71,7 @@ class LazyCallManager:
         return trampoline_trap
 
     async def background_compile(self, fqn, original_func):
-        print(f"   [AI] Generating C-Kernel for {fqn} in background...")
+        print(f"   [AI] Generating MLIR-Kernel for {fqn} in background...")
         
         try:
             with self.driver.session() as session:
@@ -91,89 +91,51 @@ class LazyCallManager:
                 type_hints = json.loads(type_hints_json) if type_hints_json else {}
 
             # UPGRADED: Dynamic ABI Mapping (Milestone 3)
-            # Find what keys we need from Neo4j
             module_name = ".".join(fqn.split('.')[:-1])
             with self.driver.session() as session:
                 res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.extracted_keys", mod=module_name, fqn=fqn)
                 rec = res.single()
                 keys = rec[0] if rec else []
 
-            # Remove 'self' from type hints if it's a method
             is_method = "." in fqn and fqn.split('.')[-2][0].isupper()
-            if is_method and 'self' in type_hints:
-                type_hints.pop('self')
-            
-            # Map type hints to LLVM/ctypes
-            ir_arg_types, ctypes_arg_types = map_python_signature_to_llvm(type_hints)
-            
-            # If hints are incomplete, pad with doubles
             real_arg_count = arg_count - 1 if is_method else arg_count
-            while len(ir_arg_types) < real_arg_count:
-                from component4_jit import TYPE_MAP
-                ir_t, c_t = TYPE_MAP['double']
-                ir_arg_types.append(ir_t)
-                ctypes_arg_types.append(c_t)
 
-            # If we have keys, it means we expect a dict which will be projected to a struct
-            # For simplicity, if we have keys, we assume the LAST argument is the projected struct
-            # (This is a heuristic for OOP generic repo support)
-            arg_info = [f"arg{i}" for i in range(real_arg_count)]
-            external_memory = {}
-            if keys and real_arg_count > 0:
-                # Override the last arg to be a pointer to the struct
-                ir_arg_types[-1] = ir.PointerType(ir.ArrayType(ir.DoubleType(), len(keys)))
-                
-                class DynamicStruct(ctypes.Structure):
-                    _fields_ = [(k, ctypes.c_double) for k in keys]
-                ctypes_arg_types[-1] = ctypes.POINTER(DynamicStruct)
-                ptr_name = f"arg{real_arg_count-1}"
-                arg_info[-1] = f"{ptr_name} (Pointer to Struct: {keys})"
-                external_memory[ptr_name] = len(keys)
-
-            cache_file = f"./.poly_cache/{fqn.replace('.', '_')}.json"
-            if os.path.exists(cache_file):
-                from component2_smt import VerifiedMLIR
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    mlir_json = f.read()
-                verified_mlir = VerifiedMLIR.model_validate_json(mlir_json)
+            cache_file_mlir = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.mlir")
+            if os.path.exists(cache_file_mlir):
+                compiled_func = self.kernel.load_and_compile(cache_file_mlir, fqn.split('.')[-1])
             else:
-                from component9_aot import generate_dynamic_fsm_prompt
+                from component9_aot import generate_dynamic_fsm_prompt, build_and_cache_mlir
                 intent = await generate_dynamic_fsm_prompt(fqn, real_arg_count)
-                # If no keys were found or it's a standard function, use scalar prompt
                 if not intent:
-                    arg_desc = f"takes {real_arg_count} inputs: {', '.join(arg_info)}" if real_arg_count > 0 else "takes 0 inputs"
                     intent = f"""
-You are an expert compiler frontend. Convert this Python logic into a DOD MLIR JSON execution graph.
-You MUST use the `thinking_process` field first to trace the variables before writing the operations.
+You are an expert compiler frontend. Convert this Python logic into a formal MLIR execution graph in JSON format.
+You MUST use the 'thinking_process' field first to trace the variables before writing the operations.
 
-IMPORTANT: If an argument is a Pointer to a Struct, use `gep` and `load` to access its fields.
-Use NUMERICAL indices for `gep` offsets based on the field order.
-Field order (0-indexed): {keys}
+DIALECT RULES:
+1. 'arith': Use for all math (addf, subf, mulf, divf).
+2. 'func': Use for 'return'.
+3. 'scf': Use for structured control flow ('if', 'for', 'yield').
 
-STRICT ISA RULES:
-1. Every operation MUST be a flat object. NO nested logic like 'arg0 * 0.5'.
-   WRONG: {{"op": "select", "args": ["cond", "arg0 * 0.5", "arg0"], "target_var": "res"}}
-   CORRECT:
-     {{"op": "mul", "args": ["arg0", "0.5"], "target_var": "temp1"}},
-     {{"op": "select", "args": ["cond", "temp1", "arg0"], "target_var": "res"}}
-2. The `store` operation takes [value, pointer]. You CANNOT store into a literal or a variable name that is not a pointer.
-3. If you need to return a value, the LAST operation's `target_var` will be the return value.
-4. For STRING COMPARISON: Use `strcmp`, which takes [pointer, pointer_or_literal] and returns 1.0 (float) if equal, else 0.0.
+STRICT FLATNESS RULE:
+You CANNOT use math symbols (+, -, *, /) or nested logic in the 'args' list.
+Use SSA naming for 'target_var' (e.g., '%0', '%1').
 
 Now, compile this target:
 ```python
 {func_code}
 ```
-The function {arg_desc}.
-Only use allowed opcodes. Store the final calculated result in the target_var of the last operation.
+The function takes {real_arg_count} inputs.
+Store the final calculated result in the target_var of the last operation.
 """
-                verified_mlir = await verified_generation_loop(intent, func_code, real_arg_count, external_memory=external_memory)
+                verified_mlir = await verified_generation_loop(intent, func_code, real_arg_count, external_memory={})
+                verified_mlir.function_name = fqn.split('.')[-1]
+                
+                temp_json_cache = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.json")
+                build_and_cache_mlir(verified_mlir, temp_json_cache)
+                compiled_func = self.kernel.load_and_compile(cache_file_mlir, verified_mlir.function_name)
             
-            CFuncType = ctypes.CFUNCTYPE(ctypes.c_double, *ctypes_arg_types)
-            compiled_func = self.kernel.incremental_compile(fqn, verified_mlir, CFuncType, real_arg_count, ir_arg_types=ir_arg_types)
             self.registry[fqn] = compiled_func
-            
-            print(f"   [AI] ✅ Hot-swapped {fqn} to bare-metal.")
+            print(f"   [AI] ✅ Hot-swapped {fqn} to bare-metal (MLIR).")
         except Exception as e:
             print(f"   [AI] ❌ Background compilation failed for {fqn}: {e}")
             import traceback
@@ -186,7 +148,7 @@ if __name__ == "__main__":
     orchestrator = LazyCallManager()
     
     async def main_loop():
-        print("--- Booting Poly-Kernel OS ---")
+        print("--- Booting Poly-Kernel OS (MLIR) ---")
         with orchestrator.driver.session() as session:
             result = session.run("MATCH (f:Function) WHERE f.arg_count IS NOT NULL RETURN f.fqn, f.name, f.arg_count, f.code")
             count = 0
@@ -198,4 +160,3 @@ if __name__ == "__main__":
                 orchestrator.registry[name] = trampoline 
                 count += 1
         print(f"✅ Boot Complete. {count} functions registered.")
-        # ... (rest of REPL)

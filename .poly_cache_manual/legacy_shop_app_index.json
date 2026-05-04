@@ -1,0 +1,36 @@
+{
+  "function_name": "index",
+  "thinking_process": "Triple-pointer ABI translation.",
+  "signature": {
+    "return": "f64"
+  },
+  "operations": [
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call0"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c1"
+    },
+    {
+      "dialect": "func",
+      "op": "return",
+      "args": [
+        "%c1"
+      ],
+      "attributes": {},
+      "target_var": null
+    }
+  ]
+}

@@ -1,0 +1,298 @@
+{
+  "function_name": "test_05_checkout_success_and_inventory_update",
+  "thinking_process": "Triple-pointer ABI translation.",
+  "signature": {
+    "arg0": "f64",
+    "return": "f64"
+  },
+  "operations": [
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call0"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c1"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c2"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c3"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1.0"
+      ],
+      "attributes": {},
+      "target_var": "%c4"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1200.0"
+      ],
+      "attributes": {},
+      "target_var": "%c5"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1.0"
+      ],
+      "attributes": {},
+      "target_var": "%c6"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c7"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c8"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c9"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "2.0"
+      ],
+      "attributes": {},
+      "target_var": "%c10"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "150.0"
+      ],
+      "attributes": {},
+      "target_var": "%c11"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "2.0"
+      ],
+      "attributes": {},
+      "target_var": "%c12"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c13"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c14"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%c15"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call16"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call17"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call18"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call19"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call20"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call21"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call22"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call23"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%sub24"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call25"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%sub26"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call27"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call28"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call29"
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "attributes": {},
+      "target_var": "%call30"
+    },
+    {
+      "dialect": "func",
+      "op": "return",
+      "args": [
+        "%call30"
+      ],
+      "attributes": {},
+      "target_var": null
+    }
+  ]
+}
