@@ -4,7 +4,7 @@ import asyncio
 import json
 import mlir.ir as ir
 from mlir.ir import Context, Module, Location, InsertionPoint, F64Type, FloatAttr, StringAttr, UnitAttr
-from mlir.dialects import arith, func, builtin, memref
+from mlir.dialects import arith, func, builtin, memref, scf
 from mlir.passmanager import PassManager
 from component2_smt import verified_generation_loop, VerifiedMLIR
 from neo4j import GraphDatabase
@@ -17,6 +17,7 @@ MANUAL_CACHE_DIR = "./.poly_cache_manual"
 def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
     """
     Translates AI's optimized JSON into formal MLIR.
+    Upgraded for Milestone 3: Supports scf.for and memref.
     """
     os.makedirs(os.path.dirname(cache_filepath), exist_ok=True)
     with Context() as ctx:
@@ -26,48 +27,144 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
             try:
                 with InsertionPoint(module.body):
                     f64 = F64Type.get()
-                    
+                    i32 = ir.IntegerType.get_signless(32)
+                    index_t = ir.IndexType.get()
+
+                    def get_type(t_str):
+                        t_str = t_str.lower()
+                        if t_str == "f64": return f64
+                        if t_str == "i32": return i32
+                        if t_str == "index": return index_t
+                        if t_str.startswith("memref"):
+                            if "f64" in t_str: inner = f64
+                            elif "i32" in t_str: inner = i32
+                            else: inner = f64
+                            # Use get_dynamic_size() for better compatibility
+                            return ir.MemRefType.get([ir.ShapedType.get_dynamic_size()], inner)
+                        return f64
+
                     # 1. Signature
                     input_types = []
                     arg_names = []
+                    # Signature keys might be arg0, arg1 or names like arg_len
                     for arg_name, arg_type in verified_mlir_data.signature.items():
                         if arg_name == "return": continue
-                        input_types.append(f64) # Currently all math is f64
+                        input_types.append(get_type(arg_type))
                         arg_names.append(arg_name)
                     
-                    func_type = builtin.FunctionType.get(inputs=input_types, results=[f64])
+                    res_type = get_type(verified_mlir_data.return_type)
+                    func_type = builtin.FunctionType.get(inputs=input_types, results=[res_type])
                     mlir_func = func.FuncOp(name=verified_mlir_data.function_name, type=func_type)
                     mlir_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
                     mlir_func.add_entry_block()
                     
-                    with InsertionPoint(mlir_func.entry_block):
-                        ssa_map = {}
-                        for i, name in enumerate(arg_names):
-                            ssa_map[name] = mlir_func.entry_block.arguments[i]
-                            ssa_map[f"%{name}"] = mlir_func.entry_block.arguments[i]
-                        
-                        # 2. Ops
-                        for op_data in verified_mlir_data.operations:
-                            def resolve(s):
-                                if s in ssa_map: return ssa_map[s]
-                                try: return arith.ConstantOp(f64, FloatAttr.get(f64, float(s))).result
-                                except: return arith.ConstantOp(f64, FloatAttr.get(f64, 0.0)).result
-                            
-                            if op_data.op == "constant":
-                                res = arith.ConstantOp(f64, FloatAttr.get(f64, float(op_data.args[0]))).result
-                            elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                            elif op_data.op == "subf": res = arith.SubFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                            elif op_data.op == "mulf": res = arith.MulFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                            elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                            elif op_data.op == "return":
-                                func.ReturnOp([resolve(op_data.args[0])])
-                                continue
-                            else: continue
-                            if op_data.target_var: ssa_map[op_data.target_var] = res
+                    ssa_map = {}
+
+                    def process_ops(ops, ip):
+                        with ip:
+                            for op_data in ops:
+                                def resolve(s):
+                                    if s in ssa_map: return ssa_map[s]
+                                    if s.startswith("%arg") and s[4:].isdigit():
+                                        idx = int(s[4:])
+                                        if idx < len(mlir_func.entry_block.arguments):
+                                            return mlir_func.entry_block.arguments[idx]
+                                    try:
+                                        val = float(s)
+                                        if val.is_integer():
+                                            return arith.ConstantOp(i32, ir.IntegerAttr.get(i32, int(val))).result
+                                        return arith.ConstantOp(f64, ir.FloatAttr.get(f64, val)).result
+                                    except:
+                                        return arith.ConstantOp(f64, ir.FloatAttr.get(f64, 0.0)).result
+
+                                res = None
+                                if op_data.op == "constant":
+                                    t = get_type(op_data.attributes.get("type", "f64"))
+                                    if t == index_t:
+                                        res = arith.ConstantOp(index_t, ir.IntegerAttr.get(index_t, int(op_data.args[0]))).result
+                                    elif t == i32:
+                                        res = arith.ConstantOp(i32, ir.IntegerAttr.get(i32, int(op_data.args[0]))).result
+                                    else:
+                                        res = arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(op_data.args[0]))).result
+                                
+                                elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "subf": res = arith.SubFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "mulf": res = arith.MulFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "cmpi" or op_data.op == "cmp_eq":
+                                    # Handle cmpi with predicate (default to eq/0)
+                                    pred_map = {"eq": 0, "ne": 1, "slt": 2, "sle": 3, "sgt": 4, "sge": 5}
+                                    p_str = op_data.attributes.get("predicate", "eq")
+                                    p_val = pred_map.get(p_str, 0)
+                                    res = arith.CmpIOp(p_val, resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "select":
+                                    res = arith.SelectOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2])).result
+                                
+                                elif op_data.op == "load":
+                                    mem = resolve(op_data.args[0])
+                                    idx = resolve(op_data.args[1])
+                                    res = memref.LoadOp(mem, [idx]).result
+                                
+                                elif op_data.op == "for":
+                                    lb = resolve(op_data.args[0])
+                                    ub = resolve(op_data.args[1])
+                                    step = resolve(op_data.args[2])
+                                    init_args = [resolve(a) for a in op_data.attributes.get("init_args", [])]
+                                    
+                                    for_op = scf.ForOp(lb, ub, step, init_args)
+                                    
+                                    # Map induction variable and body arguments based on AI attributes
+                                    body_args = op_data.attributes.get("body_args", [])
+                                    if body_args:
+                                        ssa_map[body_args[0]] = for_op.induction_variable
+                                        for j in range(1, len(body_args)):
+                                            iter_arg_name = op_data.attributes.get("init_args", [])[j-1]
+                                            ssa_map[body_args[j]] = for_op.inner_iter_args[j-1]
+                                            ssa_map[iter_arg_name] = for_op.inner_iter_args[j-1]
+                                    else:
+                                        ssa_map["%index"] = for_op.induction_variable
+                                        for j, arg_name in enumerate(op_data.attributes.get("init_args", [])):
+                                            ssa_map[arg_name] = for_op.inner_iter_args[j]
+                                    
+                                    process_ops(op_data.body, InsertionPoint(for_op.body))
+                                    res = for_op.results[0] if for_op.results else None
+
+                                elif op_data.op == "yield":
+                                    scf.YieldOp([resolve(a) for a in op_data.args])
+                                    continue
+
+                                elif op_data.op == "return":
+                                    func.ReturnOp([resolve(op_data.args[0])])
+                                    continue
+                                
+                                if op_data.target_var: ssa_map[op_data.target_var] = res
+
+                    # Initial SSA map with function arguments
+                    for i, name in enumerate(arg_names):
+                        ssa_map[name] = mlir_func.entry_block.arguments[i]
+                        ssa_map[f"%{name}"] = mlir_func.entry_block.arguments[i]
+
+                    process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block))
 
                 # 3. Verify & Lower
                 module.operation.verify()
-                pm = PassManager.parse("builtin.module(convert-scf-to-cf, convert-cf-to-llvm, convert-arith-to-llvm, func.func(llvm-request-c-wrappers), convert-func-to-llvm, reconcile-unrealized-casts)")
+                # Unified lowering pipeline: SCF -> CF -> LLVM, plus Arith, MemRef, and Index
+                # We use a single string to ensure passes run in the correct order for type reconciliation
+                pipeline = (
+                    "builtin.module("
+                        "convert-scf-to-cf,"
+                        "convert-cf-to-llvm,"
+                        "expand-strided-metadata,"
+                        "finalize-memref-to-llvm,"
+                        "convert-arith-to-llvm,"
+                        "convert-index-to-llvm,"
+                        "func.func(llvm-request-c-wrappers),"
+                        "convert-func-to-llvm,"
+                        "reconcile-unrealized-casts,"
+                        "canonicalize"
+                    ")"
+                )
+                pm = PassManager.parse(pipeline)
                 pm.run(module.operation)
                 
                 cache_filepath = cache_filepath.replace('.json', '.mlir')

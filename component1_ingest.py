@@ -15,6 +15,36 @@ PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
+class AccessPathVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.paths = []
+
+    def visit_Subscript(self, node):
+        path = self._build_path(node)
+        if path: self.paths.append(path)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        path = self._build_path(node)
+        if path: self.paths.append(path)
+        self.generic_visit(node)
+
+    def _build_path(self, node):
+        parts = []
+        curr = node
+        while isinstance(curr, (ast.Subscript, ast.Attribute)):
+            if isinstance(curr, ast.Subscript):
+                if isinstance(curr.slice, ast.Constant) and isinstance(curr.slice.value, (str, int)):
+                    parts.append(str(curr.slice.value))
+                else: return None # Dynamic index
+                curr = curr.value
+            elif isinstance(curr, ast.Attribute):
+                parts.append(curr.attr)
+                curr = curr.value
+        if isinstance(curr, ast.Name):
+            return parts[::-1] # Return from root to leaf
+        return None
+
 def get_arg_info(source_code: str):
     try:
         tree = ast.parse(source_code)
@@ -43,20 +73,14 @@ def get_arg_info(source_code: str):
     return 0, {}
 
 def extract_data_intents(source_code: str):
-    """AST pass to find what JSON keys the business logic actually uses."""
+    """AST pass to find what JSON access paths the business logic actually uses."""
     try:
         tree = ast.parse(source_code)
-        intents = []
-        for node in ast.walk(tree):
-            # Find payload["target_key"]
-            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
-                val = node.slice.value
-                if isinstance(val, (str, int)):
-                    intents.append(str(val))
-            # Find object.attribute
-            elif isinstance(node, ast.Attribute):
-                intents.append(str(node.attr))
-        return list(set(intents))
+        visitor = AccessPathVisitor()
+        visitor.visit(tree)
+        # Deduplicate paths (convert list to tuple for set)
+        unique_paths = list(set(tuple(p) for p in visitor.paths))
+        return [list(p) for p in unique_paths]
     except Exception:
         return []
 
@@ -64,8 +88,8 @@ def process_file(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         source_code = f.read()
     
-    # 1. NEW: Extract data keys to feed to the AOT Compiler
-    data_keys = extract_data_intents(source_code)
+    # 1. NEW: Extract data paths to feed to the AOT Compiler
+    data_paths = extract_data_intents(source_code)
     
     # 2. UPGRADED: Tree-Sitter queries for Classes AND Functions
     tree = parser.parse(bytes(source_code, "utf8"))
@@ -80,8 +104,8 @@ def process_file(file_path):
         # Push file, module, classes, and extracted JSON keys to the Graph
         session.run("""
             MERGE (m:Module {name: $module})
-            SET m.path = $path, m.extracted_keys = $keys
-        """, module=module_name, path=file_path, keys=data_keys)
+            SET m.path = $path, m.access_paths = $paths
+        """, module=module_name, path=file_path, paths=[json.dumps(p) for p in data_paths])
 
         # Map Classes and Methods
         class_captures = class_query.captures(tree.root_node)

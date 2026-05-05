@@ -27,10 +27,46 @@ class LazyCallManager:
                 if inspect.ismethod(original_func) or (args and hasattr(args[0], '__class__') and fqn.split('.')[-2] == args[0].__class__.__name__):
                     call_args = args[1:]
                 
-                # UPGRADED: Struct Projection (Milestone 2/3)
+                # UPGRADED: Generic SoA Projection (Milestone 3 Final)
                 final_args = []
                 for i, arg in enumerate(call_args):
-                    if isinstance(arg, dict):
+                    if isinstance(arg, list) and arg and isinstance(arg[0], dict):
+                        # Data Devirtualization: Project List[Dict] to SoA
+                        length = len(arg)
+                        final_args.append(ctypes.c_int64(length)) # arg_len
+
+                        module_name = ".".join(fqn.split('.')[:-1])
+                        with self.driver.session() as session:
+                            res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.access_paths", mod=module_name, fqn=fqn)
+                            rec = res.single()
+                            paths_json = rec[0] if rec else []
+                            access_paths = [json.loads(p) for p in paths_json]
+                        
+                        def get_nested(d, path):
+                            curr = d
+                            for k in path:
+                                if isinstance(curr, dict) and k in curr: curr = curr[k]
+                                else: return None
+                            return curr
+
+                        # Map each extracted path to a flat C-array
+                        # Note: We need a heuristic to decide if it's float or int
+                        for path in sorted(access_paths):
+                            # Skip paths that don't belong to the current object in the list
+                            # (In a real system, we'd use semantic mapping to tie paths to arguments)
+                            sample_val = get_nested(arg[0], path)
+                            if sample_val is None: continue
+                            
+                            if isinstance(sample_val, bool) or (isinstance(sample_val, int) and "is_" in path[-1]):
+                                # Boolean/Flag array
+                                arr = (ctypes.c_int32 * length)(*[1 if get_nested(o, path) else 0 for o in arg])
+                                final_args.append(ctypes.cast(arr, ctypes.c_void_p))
+                            else:
+                                # Float/Numeric array
+                                arr = (ctypes.c_double * length)(*[float(get_nested(o, path) or 0.0) for o in arg])
+                                final_args.append(ctypes.cast(arr, ctypes.c_void_p))
+
+                    elif isinstance(arg, dict):
                         # Find what keys we need from Neo4j
                         module_name = ".".join(fqn.split('.')[:-1])
                         with self.driver.session() as session:
@@ -55,6 +91,8 @@ class LazyCallManager:
                     return self.registry[fqn](*final_args)
                 except Exception as e:
                     print(f"⚡ [FAST PATH ERROR] {fqn}: {e}. Falling back to Python.")
+                    import traceback
+                    traceback.print_exc()
                     return original_func(*args, **kwargs)
             
             if fqn not in self._compiling_flags:

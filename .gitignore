@@ -2,3 +2,9 @@ venv/
 .venv/venv/
 .venv/
 .poly_cache/
+.env
+build_venv/
+__pycache__/
+*.pyc
+requirements_temp.txt
+.DS_Store
