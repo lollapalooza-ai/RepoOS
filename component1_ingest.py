@@ -52,6 +52,18 @@ def get_arg_info(source_code: str):
             if isinstance(node, ast.FunctionDef):
                 arg_count = len(node.args.args)
                 hints = {}
+                # NEW: Find string literals for Enum Devirtualization
+                enums = []
+                for subnode in ast.walk(node):
+                    if isinstance(subnode, ast.Compare):
+                        for comparator in subnode.comparators:
+                            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+                                enums.append(comparator.value)
+                    elif isinstance(subnode, ast.Constant) and isinstance(subnode.value, str):
+                        enums.append(subnode.value)
+                
+                enum_map = {val: i+1 for i, val in enumerate(sorted(list(set(enums))))}
+
                 for arg in node.args.args:
                     if arg.annotation:
                         if isinstance(arg.annotation, ast.Name):
@@ -67,10 +79,10 @@ def get_arg_info(source_code: str):
                             hints[arg.arg] = 'float'
                         elif arg.arg in ['region', 'name', 'api_key', 'subj', 'u_id']:
                             hints[arg.arg] = 'str'
-                return arg_count, hints
+                return arg_count, hints, enum_map
     except Exception:
         pass
-    return 0, {}
+    return 0, {}, {}
 
 def extract_data_intents(source_code: str):
     """AST pass to find what JSON access paths the business logic actually uses."""
@@ -143,13 +155,13 @@ def process_file(file_path):
                             method_name = name_node.text.decode('utf8')
                             method_fqn = f"{class_fqn}.{method_name}"
                             method_body = source_code[child.start_byte:child.end_byte]
-                            arg_count, hints = get_arg_info(method_body)
+                            arg_count, hints, enum_map = get_arg_info(method_body)
                             session.run("""
                                 MATCH (c:Class {fqn: $class_fqn})
                                 MERGE (f:Function {fqn: $fqn})
-                                SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints
+                                SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints, f.enum_map = $enums
                                 MERGE (c)-[:HAS_METHOD]->(f)
-                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints))
+                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map))
                     elif child.type == "block":
                         find_methods(child)
             
@@ -182,13 +194,13 @@ def process_file(file_path):
                     func_name = name_node.text.decode('utf8')
                     fqn = f"{module_name}.{func_name}"
                     func_body = source_code[func_node.start_byte:func_node.end_byte]
-                    arg_count, hints = get_arg_info(func_body)
+                    arg_count, hints, enum_map = get_arg_info(func_body)
                     session.run("""
                         MATCH (m:Module {name: $module})
                         MERGE (f:Function {fqn: $fqn})
-                        SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints
+                        SET f.name = $name, f.code = $code, f.arg_count = $arg_count, f.type_hints = $hints, f.enum_map = $enums
                         MERGE (m)-[:CONTAINS]->(f)
-                    """, module=module_name, fqn=fqn, name=func_name, code=func_body, arg_count=arg_count, hints=json.dumps(hints))
+                    """, module=module_name, fqn=fqn, name=func_name, code=func_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map))
 
 def ingest_folder(folder_path):
     print(f"🚀 Starting Deep Ingestion: {folder_path}")

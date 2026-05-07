@@ -26,22 +26,27 @@ class LazyCallManager:
                 call_args = args
                 if inspect.ismethod(original_func) or (args and hasattr(args[0], '__class__') and fqn.split('.')[-2] == args[0].__class__.__name__):
                     call_args = args[1:]
-                
-                # UPGRADED: Generic SoA Projection (Milestone 3 Final)
+                # UPGRADED: Generic SoA Projection + Enum Devirtualization (Milestone 3 Final)
                 final_args = []
+                # 1. Fetch metadata (access_paths, enum_map, arg_mapping)
+                with self.driver.session() as session:
+                    res = session.run("MATCH (f:Function {fqn: $fqn}) RETURN f.enum_map, f.arg_mapping", fqn=fqn)
+                    rec = res.single()
+                    enum_map_json = rec[0] if rec and rec[0] else "{}"
+                    arg_mapping_json = rec[1] if rec and rec[1] else "[]"
+                    enum_map = json.loads(enum_map_json)
+                    arg_mapping = json.loads(arg_mapping_json)
+
                 for i, arg in enumerate(call_args):
-                    if isinstance(arg, list) and arg and isinstance(arg[0], dict):
+                    if isinstance(arg, str) and arg in enum_map:
+                        # String-to-Enum Devirtualization
+                        final_args.append(ctypes.c_int32(enum_map[arg]))
+
+                    elif isinstance(arg, list) and arg and isinstance(arg[0], dict):
                         # Data Devirtualization: Project List[Dict] to SoA
                         length = len(arg)
                         final_args.append(ctypes.c_int64(length)) # arg_len
 
-                        module_name = ".".join(fqn.split('.')[:-1])
-                        with self.driver.session() as session:
-                            res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.access_paths", mod=module_name, fqn=fqn)
-                            rec = res.single()
-                            paths_json = rec[0] if rec else []
-                            access_paths = [json.loads(p) for p in paths_json]
-                        
                         def get_nested(d, path):
                             curr = d
                             for k in path:
@@ -49,20 +54,16 @@ class LazyCallManager:
                                 else: return None
                             return curr
 
-                        # Map each extracted path to a flat C-array
-                        # Note: We need a heuristic to decide if it's float or int
-                        for path in sorted(access_paths):
-                            # Skip paths that don't belong to the current object in the list
-                            # (In a real system, we'd use semantic mapping to tie paths to arguments)
+                        # Map each path from the AI's arg_mapping to a flat C-array
+                        for path in arg_mapping:
                             sample_val = get_nested(arg[0], path)
-                            if sample_val is None: continue
                             
-                            if isinstance(sample_val, bool) or (isinstance(sample_val, int) and "is_" in path[-1]):
-                                # Boolean/Flag array
+                            if isinstance(sample_val, bool) or (isinstance(sample_val, (int, float)) and any(k in path[-1] for k in ["is_", "flag", "bool"])):
+                                # Boolean/Flag array (i32)
                                 arr = (ctypes.c_int32 * length)(*[1 if get_nested(o, path) else 0 for o in arg])
                                 final_args.append(ctypes.cast(arr, ctypes.c_void_p))
                             else:
-                                # Float/Numeric array
+                                # Numeric array (f64)
                                 arr = (ctypes.c_double * length)(*[float(get_nested(o, path) or 0.0) for o in arg])
                                 final_args.append(ctypes.cast(arr, ctypes.c_void_p))
 

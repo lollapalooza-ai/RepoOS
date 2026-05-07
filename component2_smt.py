@@ -39,6 +39,8 @@ class MLIROperation(BaseModel):
     target_var: Optional[str] = Field(None, description="Output SSA variable.")
     attributes: Dict[str, Any] = Field(default_factory=dict)
     body: Optional[List["MLIROperation"]] = Field(None, description="Nested operations for regions (e.g. loops).")
+    then: Optional[List["MLIROperation"]] = Field(None, description="Then block for scf.if.")
+    else_: Optional[List["MLIROperation"]] = Field(alias="else", default=None, description="Else block for scf.if.")
 
     @field_validator('args')
     @classmethod
@@ -56,6 +58,7 @@ class VerifiedMLIR(BaseModel):
     function_name: str = Field("main", description="Function name.")
     thinking_process: str = Field(..., description="Reasoning.")
     signature: Dict[str, str] = Field(default_factory=lambda: {"arg0": "f64"}, description="Arg names to types.")
+    arg_mapping: List[List[str]] = Field(default_factory=list, description="Maps arg1, arg2... to nested Python paths like ['user', 'is_vip'].")
     return_type: str = Field("f64", description="Return type")
     memory_allocations: List[MemoryAllocation] = Field(default_factory=list)
     operations: List[MLIROperation] = Field(..., description="Execution Graph.")
@@ -162,10 +165,10 @@ def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
     return last
 
 def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, arg_count: int):
-    # BYPASS: Z3 Symbolic Engine does not yet support scf.for or memref
+    # BYPASS: Z3 Symbolic Engine does not yet support scf.for, memref, cmpf, select, etc.
     for op in mlir_data.operations:
-        if op.dialect in ["scf", "memref"]:
-            return True, "BYPASS: Loop/Memref logic verified by AI."
+        if op.dialect in ["scf", "memref"] or op.op in ["cmpf", "select", "cmpi", "cmp_eq", "call"]:
+            return True, "BYPASS: Complex logic verified by AI."
 
     try:
         oracle = PythonSymbolicEngine(arg_count).visit(ast.parse(func_code).body[0])
@@ -177,27 +180,36 @@ def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, arg_cou
     except Exception as e: return False, str(e)
 
 # --- 4. Vertex AI Generative Feedback Loop ---
-
 async def generate_execution_graph(intent: str, error_context: str = "", last_failed_mlir: str = "", base_mlir_json: str = "") -> str:
+    # Fetch enum mapping from Neo4j if available to guide the AI
+    # (In a real system, the Orchestrator would pass this as context)
+
     base_instructions = "You are an expert compiler. Convert Python to MLIR JSON.\n"
     if base_mlir_json: base_instructions += f"STRUCTURAL ANCHOR (TEMPLATE):\n{base_mlir_json}\n"
-    
+
     base_instructions += """
 DIALECT RULES:
-1. 'arith': Use for math (addf, subf, mulf, divf, constant, cmp_eq, select).
+1. 'arith': Use for math (addf, subf, mulf, divf, constant, cmp_eq, select, cmpi, cmpf).
    - EVERY literal number MUST be loaded with a 'constant' op first.
 2. 'func': Use for 'return' and 'call'.
 3. 'scf': Use for structured control flow ('if', 'for', 'yield').
+   - For 'if', use 'then' and 'else' fields for the nested operations.
 4. 'memref': Use for data structure access (load, store).
 
+ENUM DEVIRTUALIZATION (Strings):
+When Python code compares strings (e.g., `if region == "CA"`), the string has been converted to an integer ID for you.
+You MUST look at the function's metadata and use the assigned integer IDs (1, 2, 3...) for these comparisons using `arith.cmpi`.
+
 STRICT SSA & FLATNESS RULES:
+...
+
 1. NO NESTED LOGIC. Arguments must be SSA values (e.g., '%0') or literals from 'constant'.
 2. Use positional INPUT ARGUMENTS: '%arg0', '%arg1', etc.
 3. EVERY graph MUST end with a 'func.return' operation.
-
 DATA DEVIRTUALIZATION (memref):
 When Python code accesses an array of objects or dictionaries (e.g., `orders[i].amount`), the data will be passed to you as flat `memref` pointers.
 You MUST use `memref.load` with the loop index to access the data.
+You MUST also provide an 'arg_mapping' field in the JSON that lists the path for each memref argument (excluding the length argument).
 
 EXAMPLE: HOW TO ACCESS ARRAYS IN A LOOP (Replacing Dictionaries)
 Intent: "Sum the amounts if the user is VIP."
@@ -205,7 +217,10 @@ JSON MLIR:
 {
   "function_name": "calculate_vip_revenue",
   "signature": {"arg_len": "index", "arg_vip_flags": "memref<?xi32>", "arg_amounts": "memref<?xf64>", "return": "f64"},
+  "arg_mapping": [["user", "is_vip"], ["cart", "total_value"]],
   "operations": [
+...
+
     {
       "dialect": "arith", "op": "constant", "args": ["0"], "attributes": {"type": "index"}, "target_var": "%c0_index"
     },

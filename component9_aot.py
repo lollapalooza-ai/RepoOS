@@ -28,16 +28,21 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                 with InsertionPoint(module.body):
                     f64 = F64Type.get()
                     i32 = ir.IntegerType.get_signless(32)
+                    i8 = ir.IntegerType.get_signless(8)
+                    i1 = ir.IntegerType.get_signless(1)
                     index_t = ir.IndexType.get()
 
                     def get_type(t_str):
                         t_str = t_str.lower()
                         if t_str == "f64": return f64
                         if t_str == "i32": return i32
+                        if t_str == "i8": return i8
+                        if t_str == "i1": return i1
                         if t_str == "index": return index_t
                         if t_str.startswith("memref"):
                             if "f64" in t_str: inner = f64
                             elif "i32" in t_str: inner = i32
+                            elif "i8" in t_str: inner = i8
                             else: inner = f64
                             # Use get_dynamic_size() for better compatibility
                             return ir.MemRefType.get([ir.ShapedType.get_dynamic_size()], inner)
@@ -52,7 +57,8 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                         input_types.append(get_type(arg_type))
                         arg_names.append(arg_name)
                     
-                    res_type = get_type(verified_mlir_data.return_type)
+                    res_type_str = verified_mlir_data.signature.get("return", verified_mlir_data.return_type)
+                    res_type = get_type(res_type_str)
                     func_type = builtin.FunctionType.get(inputs=input_types, results=[res_type])
                     mlir_func = func.FuncOp(name=verified_mlir_data.function_name, type=func_type)
                     mlir_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
@@ -93,10 +99,22 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
                                 elif op_data.op == "cmpi" or op_data.op == "cmp_eq":
                                     # Handle cmpi with predicate (default to eq/0)
-                                    pred_map = {"eq": 0, "ne": 1, "slt": 2, "sle": 3, "sgt": 4, "sge": 5}
+                                    pred_map = {"eq": 0, "ne": 1, "slt": 2, "sle": 3, "sgt": 4, "sge": 5, "ult": 6, "ule": 7, "ugt": 8, "uge": 9}
                                     p_str = op_data.attributes.get("predicate", "eq")
                                     p_val = pred_map.get(p_str, 0)
                                     res = arith.CmpIOp(p_val, resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                
+                                elif op_data.op == "cmpf":
+                                    # Handle cmpf with predicate (default to ueq/1)
+                                    # Predicates: false, oeq, ogt, oge, olt, ole, one, ord, ueq, ugt, uge, ult, ule, une, uno, true
+                                    pred_map = {
+                                        "false": 0, "oeq": 1, "ogt": 2, "oge": 3, "olt": 4, "ole": 5, "one": 6, "ord": 7,
+                                        "ueq": 8, "ugt": 9, "uge": 10, "ult": 11, "ule": 12, "une": 13, "uno": 14, "true": 15
+                                    }
+                                    p_str = op_data.attributes.get("predicate", "oeq")
+                                    p_val = pred_map.get(p_str, 1)
+                                    res = arith.CmpFOp(p_val, resolve(op_data.args[0]), resolve(op_data.args[1])).result
+
                                 elif op_data.op == "select":
                                     res = arith.SelectOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2])).result
                                 
@@ -105,6 +123,35 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                     idx = resolve(op_data.args[1])
                                     res = memref.LoadOp(mem, [idx]).result
                                 
+                                elif op_data.op == "call":
+                                    callee = op_data.args[0].replace("@", "")
+                                    args = [resolve(a) for a in op_data.args[1:]]
+                                    # Heuristic: if target_var suggests boolean, use i1
+                                    res_types = [f64]
+                                    if op_data.target_var:
+                                        if any(k in op_data.target_var for k in ["is_", "result", "bool", "cmp"]):
+                                            res_types = [i1]
+                                    
+                                    # Declarations are tricky in the Python bindings without a SymbolTable
+                                    # For now, we'll try to just emit the call and hope it resolves
+                                    res = func.CallOp(res_types, ir.FlatSymbolRefAttr.get(callee), args).results[0]
+
+                                elif op_data.op == "if":
+                                    cond = resolve(op_data.args[0])
+                                    # Heuristic: if target_var is present, assume f64 result
+                                    # In a real system, we'd look up the type from the context
+                                    res_types = [f64] if op_data.target_var else []
+                                    has_else = op_data.else_ is not None or op_data.body is not None # fallback
+                                    if_op = scf.IfOp(cond, res_types, has_else=has_else)
+                                    
+                                    if op_data.then:
+                                        process_ops(op_data.then, InsertionPoint(if_op.then_block))
+                                    
+                                    if op_data.else_:
+                                        process_ops(op_data.else_, InsertionPoint(if_op.else_block))
+                                    
+                                    res = if_op.results[0] if if_op.results else None
+
                                 elif op_data.op == "for":
                                     lb = resolve(op_data.args[0])
                                     ub = resolve(op_data.args[1])
@@ -189,15 +236,17 @@ async def aot_compile_all(module_filter: str = ""):
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
     print(f"\n--- 🚀 Starting Unified AI-Optimization Loop ---")
     with driver.session() as session:
-        query = "MATCH (f:Function) WHERE f.fqn STARTS WITH $mod RETURN f.fqn, f.code, f.arg_count"
+        query = "MATCH (f:Function) WHERE f.fqn STARTS WITH $mod RETURN f.fqn, f.code, f.arg_count, f.enum_map"
         results = session.run(query, mod=module_filter)
         for record in results:
-            fqn, func_code, arg_count = record["f.fqn"], record["f.code"], record["f.arg_count"]
-            if "math" not in fqn and "calculate" not in fqn and "pricing" not in fqn: continue
-            
+            fqn, func_code, arg_count, enum_map_json = record["f.fqn"], record["f.code"], record["f.arg_count"], record["f.enum_map"]
+
             print(f"\n[OPTIMIZING] {fqn}...")
-            
-            # Anchor Logic
+
+            intent = f"Function: {fqn}\nCode:\n{func_code}\n"
+            if enum_map_json:
+                intent += f"ENUM MAPPING FOR STRINGS: {enum_map_json}\n"
+
             base_json_path = os.path.join(MANUAL_CACHE_DIR, f"{fqn.replace('.', '_')}.json")
             base_json = ""
             if os.path.exists(base_json_path):
@@ -208,6 +257,11 @@ async def aot_compile_all(module_filter: str = ""):
             try:
                 verified_mlir = await verified_generation_loop(intent, func_code, arg_count, base_mlir_json=base_json)
                 verified_mlir.function_name = fqn.split('.')[-1]
+                
+                # NEW: Store arg_mapping in Neo4j so Orchestrator knows what columns to project
+                with driver.session() as session:
+                    session.run("MATCH (f:Function {fqn: $fqn}) SET f.arg_mapping = $mapping", fqn=fqn, mapping=json.dumps(verified_mlir.arg_mapping))
+
                 cache_path = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.json")
                 build_and_cache_mlir(verified_mlir, cache_path)
             except Exception as e: print(f"   ❌ FAILED: {e}")
