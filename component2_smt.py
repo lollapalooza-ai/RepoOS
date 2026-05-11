@@ -27,12 +27,14 @@ class MemoryAllocation(BaseModel):
 
 class MLIROperation(BaseModel):
     model_config = {"extra": "ignore"}
-    dialect: Literal["arith", "func", "scf", "memref"] = Field(..., description="The MLIR Dialect.")
+    dialect: Literal["arith", "func", "scf", "memref", "llvm"] = Field(..., description="The MLIR Dialect.")
     op: Literal[
         "addf", "subf", "mulf", "divf", "cmpf", "cmpi", "constant", "cmp_eq", "select", # arith
+        "addi", "subi", "muli", "divi",                    # arith (integers/index)
         "call", "return",                                  # func
         "for", "if", "yield",                              # scf
-        "load", "store", "alloc", "gep"                    # memref
+        "load", "store", "alloc", "gep",                   # memref
+        "getelementptr"                                    # llvm
     ] = Field(..., description="The opcode.")
     
     args: List[str] = Field(..., description="SSA values or literals.")
@@ -56,7 +58,7 @@ class MLIROperation(BaseModel):
 class VerifiedMLIR(BaseModel):
     model_config = {"extra": "ignore"}
     function_name: str = Field("main", description="Function name.")
-    thinking_process: str = Field(..., description="Reasoning.")
+    thinking_process: str = Field("Autonomous transformation.", description="Reasoning.")
     signature: Dict[str, str] = Field(default_factory=lambda: {"arg0": "f64"}, description="Arg names to types.")
     arg_mapping: List[List[str]] = Field(default_factory=list, description="Maps arg1, arg2... to nested Python paths like ['user', 'is_vip'].")
     return_type: str = Field("f64", description="Return type")

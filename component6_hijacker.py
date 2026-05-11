@@ -3,6 +3,7 @@ import os
 import ast
 import ctypes
 import inspect
+import importlib.util
 from importlib.abc import MetaPathFinder, Loader
 from importlib.machinery import ModuleSpec
 
@@ -22,8 +23,8 @@ class PolyKernelLoader(Loader):
         print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
         print(f"[Hijacker] 1. Ingesting {self.file_path} to Semantic Graph...")
         
-        # 1. On-the-fly Neo4j Ingestion
-        process_file(self.file_path)
+        # 1. On-the-fly Neo4j Ingestion (Pass the actual module name)
+        process_file(self.file_path, forced_module_name=module.__name__)
 
         # 2. Execute the module to get the objects
         with open(self.file_path, 'r', encoding='utf-8') as f:
@@ -51,22 +52,27 @@ class PolyKernelFinder(MetaPathFinder):
     def __init__(self, target_package: str, orchestrator: LazyCallManager):
         self.target_package = target_package
         self.orchestrator = orchestrator
+        self._disabled = False
 
     def find_spec(self, fullname, path, target=None):
+        if self._disabled:
+            return None
+
         if fullname.startswith(self.target_package):
-            # Resolve module name to file path
-            parts = fullname.split('.')
-            # Check if it's a package or a module
-            base_path = os.path.join(*parts)
-            
-            potential_paths = [
-                f"./{base_path}.py",
-                f"./{base_path}/__init__.py"
-            ]
-            
-            for file_path in potential_paths:
-                if os.path.exists(file_path):
-                    return ModuleSpec(fullname, PolyKernelLoader(file_path, self.orchestrator), is_package=file_path.endswith('__init__.py'))
+            # Avoid infinite recursion by temporarily disabling the finder
+            self._disabled = True
+            try:
+                # Use standard import machinery to find where the module actually is
+                spec = importlib.util.find_spec(fullname)
+                if spec and spec.origin and spec.origin.endswith('.py'):
+                    # Return our custom spec with our loader
+                    is_package = spec.submodule_search_locations is not None
+                    new_spec = ModuleSpec(fullname, PolyKernelLoader(spec.origin, self.orchestrator), is_package=is_package)
+                    if is_package:
+                        new_spec.submodule_search_locations = spec.submodule_search_locations
+                    return new_spec
+            finally:
+                self._disabled = False
         
         return None 
 

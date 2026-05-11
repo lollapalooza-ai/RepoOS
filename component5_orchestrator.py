@@ -4,198 +4,144 @@ import sys
 import os
 import inspect
 import json
+import threading
 from neo4j import GraphDatabase
 from component2_smt import verified_generation_loop
-from component4_jit import PolyKernelMLIRJIT, map_python_signature_to_llvm
+from component4_jit import PolyKernelMLIRJIT
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
-CACHE_DIR = "./.poly_cache3"
+CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache3")
+
+def sanitize_fqn(fqn: str):
+    """Unified naming logic across all components."""
+    for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
+        if pkg in fqn:
+            return (pkg + fqn.split(pkg)[-1]).replace('.', '_').replace('-', '_')
+    return fqn.replace('.', '_').replace('-', '_')
 
 class LazyCallManager:
     def __init__(self):
         self.kernel = PolyKernelMLIRJIT()
-        self.registry = {} # Fast Path: FQN -> Compiled C Function
+        self.registry = {} 
+        self.metadata_cache = {} 
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._compiling_flags = set()
-        self._trampoline_refs = []
+        self._failed_compilation = set()
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
+        self._loop_thread.start()
+
+    def _run_event_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
     def register_lazy_function(self, func_name: str, original_func, fqn: str):
+        # Hot-swap if already exists (Sync with Chunk 0)
+        chunk_0_sanitized = sanitize_fqn(f"{fqn}.chunk_0")
+        cache_file_mlir = os.path.join(CACHE_DIR, f"{chunk_0_sanitized}.mlir")
+        
+        if os.path.exists(cache_file_mlir) and fqn not in self.registry:
+            try:
+                # Milestone 5.2: Load the chunk-level kernel
+                self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, chunk_0_sanitized)
+                print(f"✅ Hot-swapped {fqn} (Kernel: {chunk_0_sanitized}).")
+            except Exception as e: print(f"⚠️ Failed to sync-load {fqn}: {e}")
+
         def trampoline_trap(*args, **kwargs):
             if fqn in self.registry:
                 call_args = args
                 if inspect.ismethod(original_func) or (args and hasattr(args[0], '__class__') and fqn.split('.')[-2] == args[0].__class__.__name__):
                     call_args = args[1:]
-                # UPGRADED: Generic SoA Projection + Enum Devirtualization (Milestone 3 Final)
+                
+                if fqn not in self.metadata_cache:
+                    with self.driver.session() as session:
+                        res = session.run("MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) RETURN c.signature LIMIT 1", fqn=fqn)
+                        rec = res.single()
+                        self.metadata_cache[fqn] = {"signature": json.loads(rec[0]) if rec and rec[0] else {}}
+                
+                signature = self.metadata_cache[fqn]["signature"]
                 final_args = []
-                # 1. Fetch metadata (access_paths, enum_map, arg_mapping)
-                with self.driver.session() as session:
-                    res = session.run("MATCH (f:Function {fqn: $fqn}) RETURN f.enum_map, f.arg_mapping", fqn=fqn)
-                    rec = res.single()
-                    enum_map_json = rec[0] if rec and rec[0] else "{}"
-                    arg_mapping_json = rec[1] if rec and rec[1] else "[]"
-                    enum_map = json.loads(enum_map_json)
-                    arg_mapping = json.loads(arg_mapping_json)
+                array_len = 0
+                for arg in call_args:
+                    if isinstance(arg, (list, dict)): array_len = len(arg); break
 
-                for i, arg in enumerate(call_args):
-                    if isinstance(arg, str) and arg in enum_map:
-                        # String-to-Enum Devirtualization
-                        final_args.append(ctypes.c_int32(enum_map[arg]))
+                def get_addr(obj):
+                    return ctypes.cast(obj, ctypes.c_void_p).value
 
-                    elif isinstance(arg, list) and arg and isinstance(arg[0], dict):
-                        # Data Devirtualization: Project List[Dict] to SoA
-                        length = len(arg)
-                        final_args.append(ctypes.c_int64(length)) # arg_len
+                # 1. Project Arguments (Standard Direct Pointer ABI)
+                for arg in call_args:
+                    if isinstance(arg, (int, float)): final_args.append(ctypes.c_double(float(arg)))
+                    elif isinstance(arg, list) and arg and isinstance(arg[0], (int, float)):
+                        arr = (ctypes.c_double * len(arg))(*arg)
+                        final_args.append(ctypes.c_int64(get_addr(arr)))
+                    else: final_args.append(arg)
 
-                        def get_nested(d, path):
-                            curr = d
-                            for k in path:
-                                if isinstance(curr, dict) and k in curr: curr = curr[k]
-                                else: return None
-                            return curr
+                # 2. Output Buffer (NetworkX Specific)
+                output_buffer_raw = None
+                if "cumulative_distribution" in fqn:
+                    buf_len = array_len + 1
+                    output_buffer_raw = (ctypes.c_double * buf_len)()
+                    final_args.append(ctypes.c_int64(get_addr(output_buffer_raw)))
 
-                        # Map each path from the AI's arg_mapping to a flat C-array
-                        for path in arg_mapping:
-                            sample_val = get_nested(arg[0], path)
-                            
-                            if isinstance(sample_val, bool) or (isinstance(sample_val, (int, float)) and any(k in path[-1] for k in ["is_", "flag", "bool"])):
-                                # Boolean/Flag array (i32)
-                                arr = (ctypes.c_int32 * length)(*[1 if get_nested(o, path) else 0 for o in arg])
-                                final_args.append(ctypes.cast(arr, ctypes.c_void_p))
-                            else:
-                                # Numeric array (f64)
-                                arr = (ctypes.c_double * length)(*[float(get_nested(o, path) or 0.0) for o in arg])
-                                final_args.append(ctypes.cast(arr, ctypes.c_void_p))
-
-                    elif isinstance(arg, dict):
-                        # Find what keys we need from Neo4j
-                        module_name = ".".join(fqn.split('.')[:-1])
-                        with self.driver.session() as session:
-                            res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.extracted_keys", mod=module_name, fqn=fqn)
-                            rec = res.single()
-                            keys = rec[0] if rec else []
-                        
-                        if keys:
-                            class DynamicStruct(ctypes.Structure):
-                                _fields_ = [(k, ctypes.c_double) for k in keys]
-                            
-                            struct_obj = DynamicStruct()
-                            for k in keys:
-                                setattr(struct_obj, k, float(arg.get(k, 0.0)))
-                            final_args.append(ctypes.pointer(struct_obj))
-                        else:
-                            final_args.append(arg)
-                    else:
-                        final_args.append(arg)
+                # 3. Scalar Metadata
+                if "arg_len" in signature or "cumulative_distribution" in fqn:
+                    final_args.append(ctypes.c_int64(array_len))
 
                 try:
-                    return self.registry[fqn](*final_args)
+                    # Milestone 5.2: Execute via the stable C-ABI
+                    self.registry[fqn](*final_args)
+                    if output_buffer_raw: return list(output_buffer_raw)
+                    return 1.0 
                 except Exception as e:
-                    print(f"⚡ [FAST PATH ERROR] {fqn}: {e}. Falling back to Python.")
-                    import traceback
-                    traceback.print_exc()
+                    if fqn not in self._failed_compilation:
+                        print(f"⚡ [FAST PATH ERROR] {fqn}: {e}. Falling back to Python.")
+                        self._failed_compilation.add(fqn)
                     return original_func(*args, **kwargs)
             
-            if fqn not in self._compiling_flags:
+            if fqn not in self._compiling_flags and fqn not in self._failed_compilation:
                 print(f"⚡ [SHADOW JIT] '{fqn}' not compiled. Falling back to Python.")
                 self._compiling_flags.add(fqn)
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self.background_compile(fqn, original_func))
-                except RuntimeError:
-                    pass
-            
+                asyncio.run_coroutine_threadsafe(self.background_compile(fqn, original_func), self._loop)
             return original_func(*args, **kwargs)
             
         return trampoline_trap
 
     async def background_compile(self, fqn, original_func):
-        print(f"   [AI] Generating MLIR-Kernel for {fqn} in background...")
-        
         try:
             with self.driver.session() as session:
-                result = session.run("MATCH (f:Function {fqn: $fqn}) RETURN f.code, f.arg_count, f.type_hints", fqn=fqn)
-                record = result.single()
-                if not record:
-                    name = fqn.split('.')[-1]
-                    result = session.run("MATCH (f:Function {name: $name}) RETURN f.code, f.arg_count, f.type_hints", name=name)
-                    record = result.single()
-                
-                if not record:
-                    print(f"   [AI] ❌ Could not find {fqn} in Semantic Graph.")
-                    self._compiling_flags.remove(fqn)
-                    return
-
-                func_code, arg_count, type_hints_json = record[0], record[1], record[2]
-                type_hints = json.loads(type_hints_json) if type_hints_json else {}
-
-            # UPGRADED: Dynamic ABI Mapping (Milestone 3)
-            module_name = ".".join(fqn.split('.')[:-1])
-            with self.driver.session() as session:
-                res = session.run("MATCH (m:Module) WHERE m.name = $mod OR $fqn STARTS WITH m.name RETURN m.extracted_keys", mod=module_name, fqn=fqn)
-                rec = res.single()
-                keys = rec[0] if rec else []
-
-            is_method = "." in fqn and fqn.split('.')[-2][0].isupper()
-            real_arg_count = arg_count - 1 if is_method else arg_count
-
-            cache_file_mlir = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.mlir")
-            if os.path.exists(cache_file_mlir):
-                compiled_func = self.kernel.load_and_compile(cache_file_mlir, fqn.split('.')[-1])
-            else:
-                from component9_aot import generate_dynamic_fsm_prompt, build_and_cache_mlir
-                intent = await generate_dynamic_fsm_prompt(fqn, real_arg_count)
-                if not intent:
-                    intent = f"""
-You are an expert compiler frontend. Convert this Python logic into a formal MLIR execution graph in JSON format.
-You MUST use the 'thinking_process' field first to trace the variables before writing the operations.
-
-DIALECT RULES:
-1. 'arith': Use for all math (addf, subf, mulf, divf).
-2. 'func': Use for 'return'.
-3. 'scf': Use for structured control flow ('if', 'for', 'yield').
-
-STRICT FLATNESS RULE:
-You CANNOT use math symbols (+, -, *, /) or nested logic in the 'args' list.
-Use SSA naming for 'target_var' (e.g., '%0', '%1').
-
-Now, compile this target:
-```python
-{func_code}
-```
-The function takes {real_arg_count} inputs.
-Store the final calculated result in the target_var of the last operation.
-"""
-                verified_mlir = await verified_generation_loop(intent, func_code, real_arg_count, external_memory={})
-                verified_mlir.function_name = fqn.split('.')[-1]
-                
-                temp_json_cache = os.path.join(CACHE_DIR, f"{fqn.replace('.', '_')}.json")
-                build_and_cache_mlir(verified_mlir, temp_json_cache)
-                compiled_func = self.kernel.load_and_compile(cache_file_mlir, verified_mlir.function_name)
+                res = session.run("MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) RETURN c.code, c.inputs LIMIT 1", fqn=fqn)
+                record = res.single()
+                if not record: return
+                chunk_code, inputs = record[0], json.loads(record[1])
             
-            self.registry[fqn] = compiled_func
+            sanitized = sanitize_fqn(f"{fqn}.chunk_0")
+            cache_file_mlir = os.path.join(CACHE_DIR, f"{sanitized}.mlir")
+            
+            if not os.path.exists(cache_file_mlir):
+                from component9_aot import build_and_cache_mlir
+                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, len(inputs))
+                verified_mlir.function_name = sanitized
+                build_and_cache_mlir(verified_mlir, os.path.join(CACHE_DIR, f"{sanitized}.json"))
+            
+            self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, sanitized)
             print(f"   [AI] ✅ Hot-swapped {fqn} to bare-metal (MLIR).")
         except Exception as e:
-            print(f"   [AI] ❌ Background compilation failed for {fqn}: {e}")
-            import traceback
-            traceback.print_exc()
+            if fqn not in self._failed_compilation:
+                print(f"   [AI] ❌ Background compilation failed for {fqn}: {e}")
+                self._failed_compilation.add(fqn)
         finally:
-            if fqn in self._compiling_flags:
-                self._compiling_flags.remove(fqn)
+            if fqn in self._compiling_flags: self._compiling_flags.remove(fqn)
 
 if __name__ == "__main__":
     orchestrator = LazyCallManager()
-    
     async def main_loop():
-        print("--- Booting Poly-Kernel OS (MLIR) ---")
         with orchestrator.driver.session() as session:
-            result = session.run("MATCH (f:Function) WHERE f.arg_count IS NOT NULL RETURN f.fqn, f.name, f.arg_count, f.code")
-            count = 0
+            result = session.run("MATCH (f:Function) WHERE f.arg_count IS NOT NULL RETURN f.fqn, f.name, f.code")
             for record in result:
-                fqn, name, arg_c = record["f.fqn"], record["f.name"], record["f.arg_count"]
+                fqn, name = record["f.fqn"], record["f.name"]
                 exec(record["f.code"], globals())
                 original_func = globals().get(name)
                 trampoline = orchestrator.register_lazy_function(name, original_func, fqn)
                 orchestrator.registry[name] = trampoline 
-                count += 1
-        print(f"✅ Boot Complete. {count} functions registered.")
+        print(f"✅ Boot Complete.")

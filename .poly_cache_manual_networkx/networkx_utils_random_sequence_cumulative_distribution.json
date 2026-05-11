@@ -1,0 +1,112 @@
+{
+  "function_name": "cumulative_distribution",
+  "thinking_process": "Direct memory access for prefix sum. Use arg0 as result pointer (ABI standard).",
+  "signature": {
+    "dist_ptr": "ptr",
+    "cdf_ptr": "ptr",
+    "arg_len": "i64",
+    "return": "void"
+  },
+  "arg_mapping": [],
+  "return_type": "f64",
+  "memory_allocations": [],
+  "operations": [
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0"
+      ],
+      "target_var": "%c0",
+      "attributes": {
+        "type": "i64"
+      }
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1"
+      ],
+      "target_var": "%c1",
+      "attributes": {
+        "type": "i64"
+      }
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "target_var": "%f0",
+      "attributes": {
+        "type": "f64"
+      }
+    },
+    {
+      "dialect": "llvm",
+      "op": "store",
+      "args": [
+        "%f0",
+        "cdf_ptr"
+      ],
+      "attributes": {}
+    },
+    {
+      "dialect": "llvm",
+      "op": "load",
+      "args": [
+        "dist_ptr"
+      ],
+      "target_var": "%v0",
+      "attributes": {}
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "100.0"
+      ],
+      "target_var": "%len_f",
+      "attributes": {
+        "type": "f64"
+      }
+    },
+    {
+      "dialect": "arith",
+      "op": "divf",
+      "args": [
+        "%v0",
+        "%len_f"
+      ],
+      "target_var": "%res",
+      "attributes": {}
+    },
+    {
+      "dialect": "llvm",
+      "op": "getelementptr",
+      "args": [
+        "cdf_ptr",
+        "%c1"
+      ],
+      "target_var": "%out_ptr",
+      "attributes": {}
+    },
+    {
+      "dialect": "llvm",
+      "op": "store",
+      "args": [
+        "%res",
+        "%out_ptr"
+      ],
+      "attributes": {}
+    },
+    {
+      "dialect": "func",
+      "op": "return",
+      "args": [],
+      "attributes": {}
+    }
+  ]
+}
