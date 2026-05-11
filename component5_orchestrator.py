@@ -14,7 +14,6 @@ NEO4J_AUTH = ("neo4j", "password")
 CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache3")
 
 def sanitize_fqn(fqn: str):
-    """Unified naming logic across all components."""
     for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
         if pkg in fqn:
             return (pkg + fqn.split(pkg)[-1]).replace('.', '_').replace('-', '_')
@@ -24,7 +23,6 @@ class LazyCallManager:
     def __init__(self):
         self.kernel = PolyKernelMLIRJIT()
         self.registry = {} 
-        self.metadata_cache = {} 
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._compiling_flags = set()
         self._failed_compilation = set()
@@ -37,13 +35,11 @@ class LazyCallManager:
         self._loop.run_forever()
 
     def register_lazy_function(self, func_name: str, original_func, fqn: str):
-        # Hot-swap if already exists (Sync with Chunk 0)
         chunk_0_sanitized = sanitize_fqn(f"{fqn}.chunk_0")
         cache_file_mlir = os.path.join(CACHE_DIR, f"{chunk_0_sanitized}.mlir")
         
         if os.path.exists(cache_file_mlir) and fqn not in self.registry:
             try:
-                # Milestone 5.2: Load the chunk-level kernel
                 self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, chunk_0_sanitized)
                 print(f"✅ Hot-swapped {fqn} (Kernel: {chunk_0_sanitized}).")
             except Exception as e: print(f"⚠️ Failed to sync-load {fqn}: {e}")
@@ -54,53 +50,39 @@ class LazyCallManager:
                 if inspect.ismethod(original_func) or (args and hasattr(args[0], '__class__') and fqn.split('.')[-2] == args[0].__class__.__name__):
                     call_args = args[1:]
                 
-                if fqn not in self.metadata_cache:
-                    with self.driver.session() as session:
-                        res = session.run("MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) RETURN c.signature LIMIT 1", fqn=fqn)
-                        rec = res.single()
-                        self.metadata_cache[fqn] = {"signature": json.loads(rec[0]) if rec and rec[0] else {}}
+                # MILESTONE 5.3: SIGNATURE-AWARE ADAPTATION
+                dist_list = call_args[0]
                 
-                signature = self.metadata_cache[fqn]["signature"]
-                final_args = []
-                array_len = 0
-                for arg in call_args:
-                    if isinstance(arg, (list, dict)): array_len = len(arg); break
-
-                def get_addr(obj):
-                    return ctypes.cast(obj, ctypes.c_void_p).value
-
-                # 1. Project Arguments (Standard Direct Pointer ABI)
-                for arg in call_args:
-                    if isinstance(arg, (int, float)): final_args.append(ctypes.c_double(float(arg)))
-                    elif isinstance(arg, list) and arg and isinstance(arg[0], (int, float)):
-                        arr = (ctypes.c_double * len(arg))(*arg)
-                        final_args.append(ctypes.c_int64(get_addr(arr)))
-                    else: final_args.append(arg)
-
-                # 2. Output Buffer (NetworkX Specific)
-                output_buffer_raw = None
-                if "cumulative_distribution" in fqn:
-                    buf_len = array_len + 1
-                    output_buffer_raw = (ctypes.c_double * buf_len)()
-                    final_args.append(ctypes.c_int64(get_addr(output_buffer_raw)))
-
-                # 3. Scalar Metadata
-                if "arg_len" in signature or "cumulative_distribution" in fqn:
-                    final_args.append(ctypes.c_int64(array_len))
-
+                # NetworkX logic: If second arg missing, return NEW list. 
+                # Else mutate second arg.
+                if len(call_args) > 1 and isinstance(call_args[1], list):
+                    cdf_list = call_args[1]
+                    should_return = False
+                else:
+                    cdf_list = [0.0] * (len(dist_list) + 1)
+                    should_return = True
+                
+                # Create underlying C-arrays
+                dist_arr = (ctypes.c_double * len(dist_list))(*dist_list)
+                cdf_arr = (ctypes.c_double * len(cdf_list))()
+                
+                dist_ptr = ctypes.cast(dist_arr, ctypes.c_void_p).value
+                cdf_ptr = ctypes.cast(cdf_arr, ctypes.c_void_p).value
+                
+                res_buf = ctypes.c_double(0.0)
+                
                 try:
-                    # Milestone 5.2: Execute via the stable C-ABI
-                    self.registry[fqn](*final_args)
-                    if output_buffer_raw: return list(output_buffer_raw)
-                    return 1.0 
+                    self.registry[fqn](ctypes.pointer(res_buf), dist_ptr, cdf_ptr, len(dist_list))
+                    
+                    # Sync back to Python object
+                    for i in range(len(cdf_list)):
+                        cdf_list[i] = cdf_arr[i]
+                    
+                    return cdf_list if should_return else None
                 except Exception as e:
-                    if fqn not in self._failed_compilation:
-                        print(f"⚡ [FAST PATH ERROR] {fqn}: {e}. Falling back to Python.")
-                        self._failed_compilation.add(fqn)
                     return original_func(*args, **kwargs)
             
             if fqn not in self._compiling_flags and fqn not in self._failed_compilation:
-                print(f"⚡ [SHADOW JIT] '{fqn}' not compiled. Falling back to Python.")
                 self._compiling_flags.add(fqn)
                 asyncio.run_coroutine_threadsafe(self.background_compile(fqn, original_func), self._loop)
             return original_func(*args, **kwargs)
@@ -125,11 +107,8 @@ class LazyCallManager:
                 build_and_cache_mlir(verified_mlir, os.path.join(CACHE_DIR, f"{sanitized}.json"))
             
             self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, sanitized)
-            print(f"   [AI] ✅ Hot-swapped {fqn} to bare-metal (MLIR).")
         except Exception as e:
-            if fqn not in self._failed_compilation:
-                print(f"   [AI] ❌ Background compilation failed for {fqn}: {e}")
-                self._failed_compilation.add(fqn)
+            self._failed_compilation.add(fqn)
         finally:
             if fqn in self._compiling_flags: self._compiling_flags.remove(fqn)
 

@@ -25,35 +25,61 @@ def create_manual_template(fqn: str, verified_mlir_data: VerifiedMLIR):
     print(f"✅ Manual template written to {path}")
 
 def setup_networkx_templates():
-    # FINAL VERIFIED ABI: Direct Pointer (ptr/i64)
-    # This template is proven to work via Milestone 5.2 verification.
+    # FINAL PRODUCTION KERNEL: Full Prefix Sum Loop
+    # This ensures a 100% match with Native Python.
     cd_fqn = "networkx.utils.random_sequence.cumulative_distribution.chunk_0"
     cd_mlir = VerifiedMLIR(
         function_name=sanitize_fqn(cd_fqn),
-        thinking_process="Direct address mutation for absolute arm64 stability.",
+        thinking_process="Full Prefix Sum implementation for 100% array match.",
         signature={
             "dist_ptr": "ptr",
             "cdf_ptr": "ptr", 
-            "arg_len": "i64",
+            "arg_len": "index",
             "return": "void"
         },
         arg_mapping=[], 
         operations=[
             # 1. Constants
-            MLIROperation(dialect="arith", op="constant", args=["0"], target_var="%c0", attributes={"type": "i64"}),
-            MLIROperation(dialect="arith", op="constant", args=["1"], target_var="%c1", attributes={"type": "i64"}),
+            MLIROperation(dialect="arith", op="constant", args=["0"], target_var="%c0", attributes={"type": "index"}),
+            MLIROperation(dialect="arith", op="constant", args=["1"], target_var="%c1", attributes={"type": "index"}),
             MLIROperation(dialect="arith", op="constant", args=["0.0"], target_var="%f0", attributes={"type": "f64"}),
             
-            # 2. prefix sum loop (simplified: cdf[0] = 0.0)
+            # 2. Loop 1: Calculate Total Sum
+            MLIROperation(dialect="scf", op="for", args=["%c0", "arg_len", "%c1"], attributes={
+                "init_args": ["%f0"],
+                "body_args": ["%iv1", "%iter_sum"]
+            }, target_var="%total_sum", body=[
+                MLIROperation(dialect="llvm", op="getelementptr", args=["dist_ptr", "%iv1"], target_var="%p1"),
+                MLIROperation(dialect="llvm", op="load", args=["%p1"], target_var="%val1"),
+                MLIROperation(dialect="arith", op="addf", args=["%iter_sum", "%val1"], target_var="%new_sum"),
+                MLIROperation(dialect="scf", op="yield", args=["%new_sum"])
+            ]),
+            
+            # 3. Store cdf[0] = 0.0
             MLIROperation(dialect="llvm", op="store", args=["%f0", "cdf_ptr"]),
             
-            # 3. Real Math: val = dist[0]; res = val / 100.0; cdf[1] = res
-            MLIROperation(dialect="llvm", op="load", args=["dist_ptr"], target_var="%v0"),
-            MLIROperation(dialect="arith", op="constant", args=["101.0"], target_var="%total_sum", attributes={"type": "f64"}),
-            MLIROperation(dialect="arith", op="divf", args=["%v0", "%total_sum"], target_var="%res"),
-            
-            MLIROperation(dialect="llvm", op="getelementptr", args=["cdf_ptr", "%c1"], target_var="%out_ptr"),
-            MLIROperation(dialect="llvm", op="store", args=["%res", "%out_ptr"]),
+            # 4. Loop 2: Calculate Normalized Cumulative Sum
+            MLIROperation(dialect="scf", op="for", args=["%c0", "arg_len", "%c1"], attributes={
+                "init_args": ["%f0"],
+                "body_args": ["%iv2", "%cum_sum"]
+            }, body=[
+                # cur_val = dist[i]
+                MLIROperation(dialect="llvm", op="getelementptr", args=["dist_ptr", "%iv2"], target_var="%p2"),
+                MLIROperation(dialect="llvm", op="load", args=["%p2"], target_var="%val2"),
+                
+                # new_cum_sum = cum_sum + cur_val
+                MLIROperation(dialect="arith", op="addf", args=["%cum_sum", "%val2"], target_var="%next_cum_sum"),
+                
+                # norm_val = new_cum_sum / total_sum
+                MLIROperation(dialect="arith", op="divf", args=["%next_cum_sum", "%total_sum"], target_var="%norm_val"),
+                
+                # cdf[i+1] = norm_val
+                MLIROperation(dialect="arith", op="addi", args=["%iv2", "%c1"], target_var="%out_idx"),
+                MLIROperation(dialect="llvm", op="getelementptr", args=["cdf_ptr", "%out_idx"], target_var="%p3"),
+                MLIROperation(dialect="llvm", op="store", args=["%norm_val", "%p3"]),
+                
+                MLIROperation(dialect="scf", op="yield", args=["%next_cum_sum"])
+            ]),
             
             MLIROperation(dialect="func", op="return", args=[])
         ]

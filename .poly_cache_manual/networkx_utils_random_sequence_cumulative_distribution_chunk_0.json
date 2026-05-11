@@ -1,10 +1,10 @@
 {
   "function_name": "networkx_utils_random_sequence_cumulative_distribution_chunk_0",
-  "thinking_process": "Direct address mutation for absolute arm64 stability.",
+  "thinking_process": "Full Prefix Sum implementation for 100% array match.",
   "signature": {
     "dist_ptr": "ptr",
     "cdf_ptr": "ptr",
-    "arg_len": "i64",
+    "arg_len": "index",
     "return": "void"
   },
   "arg_mapping": [],
@@ -19,7 +19,7 @@
       ],
       "target_var": "%c0",
       "attributes": {
-        "type": "i64"
+        "type": "index"
       }
     },
     {
@@ -30,7 +30,7 @@
       ],
       "target_var": "%c1",
       "attributes": {
-        "type": "i64"
+        "type": "index"
       }
     },
     {
@@ -45,6 +45,64 @@
       }
     },
     {
+      "dialect": "scf",
+      "op": "for",
+      "args": [
+        "%c0",
+        "arg_len",
+        "%c1"
+      ],
+      "target_var": "%total_sum",
+      "attributes": {
+        "init_args": [
+          "%f0"
+        ],
+        "body_args": [
+          "%iv1",
+          "%iter_sum"
+        ]
+      },
+      "body": [
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "dist_ptr",
+            "%iv1"
+          ],
+          "target_var": "%p1",
+          "attributes": {}
+        },
+        {
+          "dialect": "llvm",
+          "op": "load",
+          "args": [
+            "%p1"
+          ],
+          "target_var": "%val1",
+          "attributes": {}
+        },
+        {
+          "dialect": "arith",
+          "op": "addf",
+          "args": [
+            "%iter_sum",
+            "%val1"
+          ],
+          "target_var": "%new_sum",
+          "attributes": {}
+        },
+        {
+          "dialect": "scf",
+          "op": "yield",
+          "args": [
+            "%new_sum"
+          ],
+          "attributes": {}
+        }
+      ]
+    },
+    {
       "dialect": "llvm",
       "op": "store",
       "args": [
@@ -54,53 +112,100 @@
       "attributes": {}
     },
     {
-      "dialect": "llvm",
-      "op": "load",
+      "dialect": "scf",
+      "op": "for",
       "args": [
-        "dist_ptr"
-      ],
-      "target_var": "%v0",
-      "attributes": {}
-    },
-    {
-      "dialect": "arith",
-      "op": "constant",
-      "args": [
-        "101.0"
-      ],
-      "target_var": "%total_sum",
-      "attributes": {
-        "type": "f64"
-      }
-    },
-    {
-      "dialect": "arith",
-      "op": "divf",
-      "args": [
-        "%v0",
-        "%total_sum"
-      ],
-      "target_var": "%res",
-      "attributes": {}
-    },
-    {
-      "dialect": "llvm",
-      "op": "getelementptr",
-      "args": [
-        "cdf_ptr",
+        "%c0",
+        "arg_len",
         "%c1"
       ],
-      "target_var": "%out_ptr",
-      "attributes": {}
-    },
-    {
-      "dialect": "llvm",
-      "op": "store",
-      "args": [
-        "%res",
-        "%out_ptr"
-      ],
-      "attributes": {}
+      "attributes": {
+        "init_args": [
+          "%f0"
+        ],
+        "body_args": [
+          "%iv2",
+          "%cum_sum"
+        ]
+      },
+      "body": [
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "dist_ptr",
+            "%iv2"
+          ],
+          "target_var": "%p2",
+          "attributes": {}
+        },
+        {
+          "dialect": "llvm",
+          "op": "load",
+          "args": [
+            "%p2"
+          ],
+          "target_var": "%val2",
+          "attributes": {}
+        },
+        {
+          "dialect": "arith",
+          "op": "addf",
+          "args": [
+            "%cum_sum",
+            "%val2"
+          ],
+          "target_var": "%next_cum_sum",
+          "attributes": {}
+        },
+        {
+          "dialect": "arith",
+          "op": "divf",
+          "args": [
+            "%next_cum_sum",
+            "%total_sum"
+          ],
+          "target_var": "%norm_val",
+          "attributes": {}
+        },
+        {
+          "dialect": "arith",
+          "op": "addi",
+          "args": [
+            "%iv2",
+            "%c1"
+          ],
+          "target_var": "%out_idx",
+          "attributes": {}
+        },
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "cdf_ptr",
+            "%out_idx"
+          ],
+          "target_var": "%p3",
+          "attributes": {}
+        },
+        {
+          "dialect": "llvm",
+          "op": "store",
+          "args": [
+            "%norm_val",
+            "%p3"
+          ],
+          "attributes": {}
+        },
+        {
+          "dialect": "scf",
+          "op": "yield",
+          "args": [
+            "%next_cum_sum"
+          ],
+          "attributes": {}
+        }
+      ]
     },
     {
       "dialect": "func",

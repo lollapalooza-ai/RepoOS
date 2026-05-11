@@ -49,7 +49,6 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                         if t == "ptr" or t == "llvm.ptr" or t.startswith("memref"): return ptr_t
                         return None
                     
-                    # ABI: result pointer first, then args
                     input_types = [ptr_t]
                     for k,v in verified_mlir_data.signature.items():
                         if k != "return": input_types.append(get_type(v))
@@ -64,14 +63,23 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                     if not s: return None
                                     if s in ssa_map: return ssa_map[s]
                                     if s.startswith("%arg") and s[4:].isdigit(): return mlir_func.entry_block.arguments[int(s[4:])]
-                                    try: return arith.ConstantOp(f64 if "." in s else i64, ir.FloatAttr.get(f64, float(s)) if "." in s else ir.IntegerAttr.get(i64, int(s))).result
+                                    try: 
+                                        if "." in s: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(s))).result
+                                        return arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(s))).result
                                     except: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, 0.0)).result
+
+                                def cast_to_i64(val):
+                                    if str(val.type) == "index":
+                                        return arith.IndexCastOp(i64, val).result
+                                    return val
 
                                 res = None
                                 if op_data.dialect == "llvm":
                                     if op_data.op == "getelementptr":
-                                        # result_type, base, dynamicIndices, rawConstantIndices, elem_type, noWrapFlags
-                                        res = llvm.GEPOp(ptr_t, resolve(op_data.args[0]), [resolve(op_data.args[1])], [-2147483648], f64, 0).result
+                                        # FIX: Cast dynamic indices from 'index' to 'i64' for LLVM compatibility
+                                        raw_indices = [resolve(a) for a in op_data.args[1:]]
+                                        i64_indices = [cast_to_i64(idx) for idx in raw_indices]
+                                        res = llvm.GEPOp(ptr_t, resolve(op_data.args[0]), i64_indices, [-2147483648], f64, 0).result
                                     elif op_data.op == "load":
                                         res = llvm.LoadOp(f64, resolve(op_data.args[0])).result
                                     elif op_data.op == "store":
@@ -81,11 +89,27 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 elif op_data.op == "constant":
                                     t = get_type(op_data.attributes.get("type", "f64"))
                                     v = op_data.args[0] if op_data.args else op_data.attributes.get("value", "0.0")
-                                    if t == i64 or t == index_t: res = arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(float(v)))).result
+                                    if t == index_t: res = arith.ConstantOp(index_t, ir.IntegerAttr.get(index_t, int(float(v)))).result
+                                    elif t == i64: res = arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(float(v)))).result
                                     else: res = arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(v))).result
                                 elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
                                 elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
                                 elif op_data.op == "addi": res = arith.AddIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "for":
+                                    ia = [resolve(a) for a in op_data.attributes.get("init_args", [])]
+                                    for_op = scf.ForOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2]), ia)
+                                    body_map = ssa_map.copy()
+                                    ba = op_data.attributes.get("body_args", ["%iv"])
+                                    body_map[ba[0]] = for_op.induction_variable
+                                    for j in range(1, len(ba)): body_map[ba[j]] = for_op.inner_iter_args[j-1]
+                                    process_ops(op_data.body, InsertionPoint(for_op.body), body_map)
+                                    with InsertionPoint(for_op.body):
+                                        if not any(isinstance(o.opview, scf.YieldOp) for o in for_op.body.operations):
+                                            scf.YieldOp(for_op.inner_iter_args)
+                                    res = for_op.results[0] if for_op.results else None
+                                elif op_data.op == "yield":
+                                    scf.YieldOp([resolve(a) for a in op_data.args if a])
+                                    continue
                                 elif op_data.op == "return":
                                     if op_data.args:
                                         v_ret = resolve(op_data.args[0])
@@ -95,7 +119,6 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 if op_data.target_var: ssa_map[op_data.target_var] = res
 
                     main_map = {}
-                    # arg0 is Result Pointer. dist_ptr is arg1.
                     for i, (k,v) in enumerate(verified_mlir_data.signature.items()):
                         if k != "return": main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i+1]
                     process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
@@ -120,14 +143,12 @@ async def aot_compile_all(module_filter: str = ""):
             fqn, chunk_code, inputs_json = record["c.fqn"], record["c.code"], record["c.inputs"]
             sanitized = sanitize_fqn(fqn)
             print(f"\n[AOT] {fqn} -> {sanitized}...")
-            
             base_json_path = os.path.join(MANUAL_CACHE_DIR, f"{sanitized}.json")
             if os.path.exists(base_json_path):
                 print(f"   [STRICT] Using verified manual template: {base_json_path}")
                 with open(base_json_path, 'r') as f: verified_mlir = VerifiedMLIR.model_validate(json.load(f))
             else:
                 verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, len(json.loads(inputs_json)))
-            
             verified_mlir.function_name = sanitized
             with driver.session() as session:
                 session.run("MATCH (c:Chunk {fqn: $fqn}) SET c.arg_mapping = $mapping, c.signature = $sig, c.sanitized_name = $sn", 

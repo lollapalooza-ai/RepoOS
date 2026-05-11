@@ -1,13 +1,8 @@
 ; ModuleID = 'LLVMDialectModule'
 source_filename = "LLVMDialectModule"
 
-define double @init_db() {
-  ret double 0.000000e+00
-}
-
-define double @_mlir_ciface_init_db() {
-  %1 = call double @init_db()
-  ret double %1
+define void @networkx_utils_random_sequence_zipf_rv_chunk_0(ptr %0, double %1) {
+  ret void
 }
 
 !llvm.module.flags = !{!0}
