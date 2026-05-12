@@ -21,21 +21,20 @@ class PolyKernelMLIRJIT:
         self.libraries.append(lib)
         
         # 2. Extract the C-interface symbol
-        # MLIR generated wrappers always have the _mlir_ciface_ prefix
         ciface_name = f"_mlir_ciface_{func_name}"
         try:
             func_ptr = getattr(lib, ciface_name)
         except AttributeError:
-            # Fallback to raw name if wrapper missing
             func_ptr = getattr(lib, func_name)
             
         def execution_wrapper(*args):
-            # MILESTONE 5: C-ABI Standard (Pointer for result, values/pointers for args)
-            # Define ABI ONCE to avoid massive ctypes overhead in loops
+            # Define ABI ONCE
             if func_ptr.argtypes is None:
-                arg_types = [ctypes.POINTER(ctypes.c_double)]
+                arg_types = []
+                if return_type != "void":
+                    arg_types.append(ctypes.POINTER(ctypes.c_double))
+                
                 for arg in args:
-                    # In Milestone 5, all complex types are passed as raw pointers (uint64)
                     if isinstance(arg, int):
                         arg_types.append(ctypes.c_void_p)
                     elif isinstance(arg, float):
@@ -44,6 +43,10 @@ class PolyKernelMLIRJIT:
                         arg_types.append(type(arg))
                 func_ptr.argtypes = arg_types
                 func_ptr.restype = None 
+            
+            if return_type == "void":
+                func_ptr(*args)
+                return None
             
             # 1. Prepare result buffer
             result = ctypes.c_double(0.0)

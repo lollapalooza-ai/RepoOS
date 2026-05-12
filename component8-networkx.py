@@ -29,7 +29,7 @@ import component8_networkx_helper as helper
 
 def run_benchmark():
     ITERATIONS = 5000
-    SIZE = 100
+    SIZE = 10000
     
     # 1. Standard Python List
     dist_list = [float(i) for i in range(1, SIZE + 1)]

@@ -86,5 +86,25 @@ def setup_networkx_templates():
     )
     create_manual_template(cd_fqn, cd_mlir)
 
+    # ZIPF_RV MATH KERNEL
+    zipf_fqn = "networkx.utils.random_sequence.zipf_rv.chunk_0"
+    zipf_mlir = VerifiedMLIR(
+        function_name=sanitize_fqn(zipf_fqn),
+        thinking_process="Scalar math acceleration for zipf_rv.",
+        signature={
+            "alpha": "f64",
+            "return": "f64"
+        },
+        arg_mapping=[],
+        operations=[
+            MLIROperation(dialect="arith", op="constant", args=["1.0"], target_var="%c1", attributes={"type": "f64"}),
+            MLIROperation(dialect="arith", op="subf", args=["alpha", "%c1"], target_var="%a1"),
+            MLIROperation(dialect="arith", op="constant", args=["2.0"], target_var="%c2", attributes={"type": "f64"}),
+            MLIROperation(dialect="math", op="powf", args=["%c2", "%a1"], target_var="%b"),
+            MLIROperation(dialect="func", op="return", args=["%b"])
+        ]
+    )
+    create_manual_template(zipf_fqn, zipf_mlir)
+
 if __name__ == "__main__":
     setup_networkx_templates()
