@@ -74,8 +74,9 @@ Checks that the `.poly_cache_manual` directory contains valid, parseable MLIR JS
 
 ---
 
-## 📊 Performance Suite (`component8-networkx.py`)
+## 📊 Performance Suite
 
+### A. NetworkX Cumulative Distribution Benchmark
 Runs the comprehensive benchmark comparing Native Python, RepoOS (Standard List), and RepoOS (NumPy Zero-Copy).
 
 **Run Command:**
@@ -87,6 +88,19 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 ./build_venv/bin/python3 component8-networkx.py
 ```
 *   **Success Criteria:** RepoOS (NumPy) should show a **~25x Speedup** over Native Python for 10,000 elements.
+
+### B. PageRank CSR Benchmark
+Validates high-performance graph processing using CSR devirtualization with 100% mathematical correctness.
+
+**Run Command:**
+```bash
+export PYTHONPATH=/Users/yeshr/Applications/Program1/llvm-project/build/tools/mlir/python_packages/mlir_core:/Users/yeshr/Applications/Program1
+export DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib:/Users/yeshr/Applications/Program1/llvm-project/build/lib
+REPOOS_CACHE_DIR=.poly_cache_networkx \
+REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
+./build_venv/bin/python3 component8-pagerank.py
+```
+*   **Success Criteria:** RepoOS should show a **~2.0x Speedup** and **~70% Memory Reduction** for 20,000 nodes.
 
 ---
 

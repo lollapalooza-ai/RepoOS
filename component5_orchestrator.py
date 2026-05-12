@@ -101,16 +101,38 @@ class LazyCallManager:
                 
                 if is_networkx:
                     try:
+                        # 1. Flatten the Dictionary Graph
                         row_ptrs, col_idx, weights, node_map, rev_node_map, num_nodes, num_edges = networkx_to_csr(input_obj)
+                        
+                        # 2. Extract PageRank Parameters (Transparency Path)
+                        # Signature: (G, alpha, personalization, max_iter, tol, nstart, weight, dangling)
+                        alpha = kwargs.get('alpha', args[1] if len(args) > 1 else 0.85)
+                        personalization = kwargs.get('personalization', args[2] if len(args) > 2 else None)
+                        
+                        # Prepare vectors (Standardized as raw C-arrays for MLIR)
+                        import numpy as np
+                        x_last = np.ones(num_nodes, dtype=np.float64) / num_nodes
+                        p_vector = np.ones(num_nodes, dtype=np.float64) / num_nodes
+                        
+                        if personalization:
+                            p_sum = sum(personalization.values())
+                            for node, val in personalization.items():
+                                if node in node_map: p_vector[node_map[node]] = val / p_sum
+                        
+                        # 3. Allocate Output Buffer
                         result_arr = (ctypes.c_double * num_nodes)()
                         
+                        # 4. Extract Raw Integer Pointers for the MLIR ABI
                         row_ptr_addr = ctypes.cast(row_ptrs, ctypes.c_void_p).value
                         col_idx_addr = ctypes.cast(col_idx, ctypes.c_void_p).value
                         weight_addr  = ctypes.cast(weights, ctypes.c_void_p).value
                         res_addr     = ctypes.cast(result_arr, ctypes.c_void_p).value
+                        x_last_addr  = x_last.ctypes.data
+                        p_addr       = p_vector.ctypes.data
                         
-                        # Note: our JIT wrapper handles return_type="void" for CSR kernels
-                        self.registry[fqn](res_addr, row_ptr_addr, col_idx_addr, weight_addr, num_nodes, num_edges)
+                        # 5. Bare-Metal Execution!
+                        # ABI: (res, rows, cols, wts, xlast, p, num_nodes, alpha)
+                        self.registry[fqn](res_addr, row_ptr_addr, col_idx_addr, weight_addr, x_last_addr, p_addr, num_nodes, float(alpha))
                         
                         return {rev_node_map[i]: result_arr[i] for i in range(num_nodes)}
                     except Exception as e:

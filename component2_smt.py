@@ -35,7 +35,8 @@ class MLIROperation(BaseModel):
         "call", "return",                                  # func
         "for", "if", "yield",                              # scf
         "load", "store", "alloc", "gep",                   # memref
-        "getelementptr"                                    # llvm
+        "getelementptr",                                   # llvm
+        "index_cast"                                       # arith
     ] = Field(..., description="The opcode.")
     
     args: List[str] = Field(..., description="SSA values or literals.")

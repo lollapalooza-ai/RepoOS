@@ -81,7 +81,11 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                         i64_indices = [cast_to_i64(idx) for idx in raw_indices]
                                         res = llvm.GEPOp(ptr_t, resolve(op_data.args[0]), i64_indices, [-2147483648], f64, 0).result
                                     elif op_data.op == "load":
-                                        res = llvm.LoadOp(f64, resolve(op_data.args[0])).result
+                                        t_str = op_data.attributes.get("type", "f64")
+                                        l_type = f64
+                                        if t_str == "i64": l_type = i64
+                                        elif t_str == "index": l_type = index_t
+                                        res = llvm.LoadOp(l_type, resolve(op_data.args[0])).result
                                     elif op_data.op == "store":
                                         v_to_store, p_to_store = resolve(op_data.args[0]), resolve(op_data.args[1])
                                         if v_to_store and p_to_store: llvm.StoreOp(v_to_store, p_to_store)
@@ -103,6 +107,10 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 elif op_data.op == "cmpi": 
                                     pred = op_data.attributes.get("predicate", 0)
                                     res = arith.CmpIOp(pred, resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "index_cast":
+                                    # Target type detection
+                                    out_type = ir.IndexType.get() if op_data.attributes.get("type") == "index" else i64
+                                    res = arith.IndexCastOp(out_type, resolve(op_data.args[0])).result
                                 elif op_data.op == "select":
                                     res = arith.SelectOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2])).result
                                 elif op_data.op == "for":
