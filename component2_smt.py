@@ -27,10 +27,11 @@ class MemoryAllocation(BaseModel):
 
 class MLIROperation(BaseModel):
     model_config = {"extra": "ignore"}
-    dialect: Literal["arith", "func", "scf", "memref", "llvm"] = Field(..., description="The MLIR Dialect.")
+    dialect: Literal["arith", "func", "scf", "memref", "llvm", "math"] = Field(..., description="The MLIR Dialect.")
     op: Literal[
         "addf", "subf", "mulf", "divf", "cmpf", "cmpi", "constant", "cmp_eq", "select", # arith
         "addi", "subi", "muli", "divi",                    # arith (integers/index)
+        "powf", "sqrt", "exp", "log", "absf",              # math
         "call", "return",                                  # func
         "for", "if", "yield",                              # scf
         "load", "store", "alloc", "gep",                   # memref
@@ -106,9 +107,15 @@ def verify_llm_safety(mlir_data: VerifiedMLIR, arg_count: int, external_memory: 
 # --- 3. Semantic Equivalence (Z3 Oracle) ---
 
 class PythonSymbolicEngine(ast.NodeVisitor):
-    def __init__(self, arg_count: int):
-        self.env = {f"arg{i}": Real(f"arg{i}") for i in range(arg_count)}
-        self.arg_map = {}
+    def __init__(self, input_names: List[str]):
+        self.env = {f"arg{i}": Real(f"arg{i}") for i in range(len(input_names))}
+        self.arg_map = {name: f"arg{i}" for i, name in enumerate(input_names)}
+
+    def visit_Module(self, node):
+        res = RealVal(0.0)
+        for stmt in node.body:
+            res = self.visit(stmt)
+        return res
 
     def visit_FunctionDef(self, node):
         self.arg_map = {arg.arg: f"arg{i}" for i, arg in enumerate(node.args.args)}
@@ -134,6 +141,7 @@ class PythonSymbolicEngine(ast.NodeVisitor):
         if isinstance(node.op, ast.Sub): return l - r
         if isinstance(node.op, ast.Mult): return l * r
         if isinstance(node.op, ast.Div): return l / r
+        if isinstance(node.op, ast.Pow): return l ** r
         return l
 
     def visit_Constant(self, node):
@@ -156,27 +164,30 @@ def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
         try: return RealVal(float(s))
         except: return Real(s)
     for op in mlir_data.operations:
-        if op.dialect != "arith": continue
+        if op.dialect not in ["arith", "math"]: continue
         val = last
         if op.op == "constant": val = res(op.args[0])
         elif op.op == "addf": val = res(op.args[0]) + res(op.args[1])
         elif op.op == "subf": val = res(op.args[0]) - res(op.args[1])
         elif op.op == "mulf": val = res(op.args[0]) * res(op.args[1])
         elif op.op == "divf": val = res(op.args[0]) / res(op.args[1])
+        elif op.op == "powf": val = res(op.args[0]) ** res(op.args[1])
         if op.target_var:
             env[op.target_var] = val
             if not op.target_var.startswith("%"): env[f"%{op.target_var}"] = val
         last = val
     return last
 
-def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, arg_count: int):
+def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, input_names: List[str]):
     # BYPASS: Z3 Symbolic Engine does not yet support scf.for, memref, cmpf, select, etc.
     for op in mlir_data.operations:
         if op.dialect in ["scf", "memref"] or op.op in ["cmpf", "select", "cmpi", "cmp_eq", "call"]:
             return True, "BYPASS: Complex logic verified by AI."
 
     try:
-        oracle = PythonSymbolicEngine(arg_count).visit(ast.parse(func_code).body[0])
+        arg_count = len(input_names)
+        tree = ast.parse(func_code)
+        oracle = PythonSymbolicEngine(input_names).visit(tree)
         candidate = mlir_to_z3_candidate(mlir_data, arg_count)
         s = Solver()
         s.add(oracle != candidate)
@@ -196,8 +207,11 @@ async def generate_execution_graph(intent: str, error_context: str = "", last_fa
 DIALECT RULES:
 1. 'arith': Use for math (addf, subf, mulf, divf, constant, cmp_eq, select, cmpi, cmpf).
    - EVERY literal number MUST be loaded with a 'constant' op first.
-2. 'func': Use for 'return' and 'call'.
-3. 'scf': Use for structured control flow ('if', 'for', 'yield').
+2. 'math': Use for 'powf', 'sqrt', 'exp', 'log', 'absf'.
+   - Use 'math.powf' for exponentiation (e.g. 2 ** x).
+3. 'func': Use for 'return' and 'call'.
+4. 'scf': Use for structured control flow ('if', 'for', 'yield').
+
    - For 'if', use 'then' and 'else' fields for the nested operations.
 4. 'memref': Use for data structure access (load, store).
 
@@ -284,8 +298,9 @@ JSON MLIR:
     except Exception as e:
         raise RuntimeError(f"Vertex AI API Error: {e}")
 
-async def verified_generation_loop(intent: str, func_code: str, arg_count: int, external_memory: dict = None, base_mlir_json: str = "") -> VerifiedMLIR:
+async def verified_generation_loop(intent: str, func_code: str, input_names: List[str], external_memory: dict = None, base_mlir_json: str = "") -> VerifiedMLIR:
     error_msg = ""; last_failed = ""
+    arg_count = len(input_names)
     for attempt in range(1, 4):
         print(f"   [Vertex AI] Attempt {attempt}...")
         mlir_json = await generate_execution_graph(intent, error_msg, last_failed, base_mlir_json)
@@ -304,7 +319,7 @@ async def verified_generation_loop(intent: str, func_code: str, arg_count: int, 
             print(f"      [!] Safety Failure: {error_msg}")
             continue
 
-        is_equiv, msg_e = verify_semantic_equivalence(mlir_data, func_code, arg_count)
+        is_equiv, msg_e = verify_semantic_equivalence(mlir_data, func_code, input_names)
         if is_equiv: return mlir_data
         error_msg = msg_e; last_failed = mlir_json
         print(f"      [!] Semantic Mismatch: {error_msg}")

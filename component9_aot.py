@@ -62,7 +62,7 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 def resolve(s):
                                     if not s: return None
                                     if s in ssa_map: return ssa_map[s]
-                                    if s.startswith("%arg") and s[4:].isdigit(): return mlir_func.entry_block.arguments[int(s[4:])]
+                                    if s.startswith("%arg") and s[4:].isdigit(): return mlir_func.entry_block.arguments[int(s[4:]) + 1]
                                     try: 
                                         if "." in s: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(s))).result
                                         return arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(s))).result
@@ -93,8 +93,18 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                     elif t == i64: res = arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(float(v)))).result
                                     else: res = arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(v))).result
                                 elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "subf": res = arith.SubFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "mulf": res = arith.MulFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
                                 elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "powf": res = math.PowFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
                                 elif op_data.op == "addi": res = arith.AddIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "subi": res = arith.SubIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "muli": res = arith.MulIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "cmpi": 
+                                    pred = op_data.attributes.get("predicate", 0)
+                                    res = arith.CmpIOp(pred, resolve(op_data.args[0]), resolve(op_data.args[1])).result
+                                elif op_data.op == "select":
+                                    res = arith.SelectOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2])).result
                                 elif op_data.op == "for":
                                     ia = [resolve(a) for a in op_data.attributes.get("init_args", [])]
                                     for_op = scf.ForOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2]), ia)
@@ -127,6 +137,14 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                 pipeline = "builtin.module(convert-scf-to-cf,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
                 subprocess.run([MLIR_OPT, mlir_path, f"-pass-pipeline={pipeline}", "-o", opt_mlir_path], check=True)
                 subprocess.run([MLIR_TRANSLATE, "--mlir-to-llvmir", opt_mlir_path, "-o", ll_path], check=True)
+                
+                # Post-process .ll to remove attributes that older Clang/Apple Clang might not understand
+                with open(ll_path, 'r') as f:
+                    ll_content = f.read()
+                ll_content = ll_content.replace("nocreateundeforpoison ", "")
+                with open(ll_path, 'w') as f:
+                    f.write(ll_content)
+
                 subprocess.run([CLANG, "-shared", "-O3", ll_path, "-o", dylib_path, "-lm"], check=True)
                 print(f"   [OK] Compiled: {dylib_path}")
             except Exception as e: print(f"   [ERROR] build failed: {e}")
@@ -148,7 +166,8 @@ async def aot_compile_all(module_filter: str = ""):
                 print(f"   [STRICT] Using verified manual template: {base_json_path}")
                 with open(base_json_path, 'r') as f: verified_mlir = VerifiedMLIR.model_validate(json.load(f))
             else:
-                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, len(json.loads(inputs_json)))
+                input_names = json.loads(inputs_json)
+                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, input_names)
             verified_mlir.function_name = sanitized
             with driver.session() as session:
                 session.run("MATCH (c:Chunk {fqn: $fqn}) SET c.arg_mapping = $mapping, c.signature = $sig, c.sanitized_name = $sn", 

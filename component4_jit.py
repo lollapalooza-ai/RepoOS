@@ -31,19 +31,24 @@ class PolyKernelMLIRJIT:
             
         def execution_wrapper(*args):
             # MILESTONE 5: C-ABI Standard (Pointer for result, values/pointers for args)
+            # Define ABI ONCE to avoid massive ctypes overhead in loops
+            if func_ptr.argtypes is None:
+                arg_types = [ctypes.POINTER(ctypes.c_double)]
+                for arg in args:
+                    # In Milestone 5, all complex types are passed as raw pointers (uint64)
+                    if isinstance(arg, int):
+                        arg_types.append(ctypes.c_void_p)
+                    elif isinstance(arg, float):
+                        arg_types.append(ctypes.c_double)
+                    else:
+                        arg_types.append(type(arg))
+                func_ptr.argtypes = arg_types
+                func_ptr.restype = None 
+            
             # 1. Prepare result buffer
             result = ctypes.c_double(0.0)
             
-            # 2. Define the machine-code ABI
-            # For Milestone 5 Direct Pointer ABI, all arguments are primitives
-            arg_types = [ctypes.POINTER(ctypes.c_double)] # Result always first
-            for arg in args:
-                arg_types.append(type(arg))
-            
-            func_ptr.argtypes = arg_types
-            func_ptr.restype = None # Standard ciface returns void, puts result in first arg
-            
-            # 3. Execute
+            # 2. Execute
             func_ptr(ctypes.pointer(result), *args)
             return result.value
 

@@ -23,6 +23,7 @@ class LazyCallManager:
     def __init__(self):
         self.kernel = PolyKernelMLIRJIT()
         self.registry = {} 
+        self.buffer_cache = {} # Persistent C-Buffers for zero-allocation loops
         self.driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         self._compiling_flags = set()
         self._failed_compilation = set()
@@ -35,9 +36,13 @@ class LazyCallManager:
         self._loop.run_forever()
 
     def register_lazy_function(self, func_name: str, original_func, fqn: str):
+        import numpy as np
         chunk_0_sanitized = sanitize_fqn(f"{fqn}.chunk_0")
         cache_file_mlir = os.path.join(CACHE_DIR, f"{chunk_0_sanitized}.mlir")
         
+        # Local cache for the trampoline closure to avoid dict lookups on 'self'
+        _local_cache = {}
+
         if os.path.exists(cache_file_mlir) and fqn not in self.registry:
             try:
                 self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, chunk_0_sanitized)
@@ -46,39 +51,70 @@ class LazyCallManager:
 
         def trampoline_trap(*args, **kwargs):
             if fqn in self.registry:
-                call_args = args
-                if inspect.ismethod(original_func) or (args and hasattr(args[0], '__class__') and fqn.split('.')[-2] == args[0].__class__.__name__):
-                    call_args = args[1:]
+                # Use faster argument unpacking
+                input_obj = args[0]
                 
-                # MILESTONE 5.3: SIGNATURE-AWARE ADAPTATION
-                dist_list = call_args[0]
+                # ZERO-COPY DETECTOR (NumPy Support)
+                is_numpy = hasattr(input_obj, '__array_interface__')
                 
-                # NetworkX logic: If second arg missing, return NEW list. 
-                # Else mutate second arg.
-                if len(call_args) > 1 and isinstance(call_args[1], list):
-                    cdf_list = call_args[1]
-                    should_return = False
+                if is_numpy:
+                    # Bypasses all Python-to-C copying
+                    size = input_obj.size
+                    dist_ptr = input_obj.ctypes.data
+                    
+                    # We still need a result buffer. 
+                    # If the user passed a second arg, use it if it's numpy too.
+                    if len(args) > 1 and hasattr(args[1], '__array_interface__'):
+                        cdf_ptr = args[1].ctypes.data
+                        cdf_np_view = args[1]
+                        should_return = False
+                    else:
+                        # Fallback: allocate persistent buffer for the result
+                        cache_key = f"res_np_{size}"
+                        if cache_key in _local_cache:
+                            cdf_np_view, cdf_ptr = _local_cache[cache_key]
+                        else:
+                            cdf_obj = (ctypes.c_double * (size + 1))()
+                            cdf_ptr = ctypes.cast(cdf_obj, ctypes.c_void_p).value
+                            # Create the NumPy view ONCE and cache it
+                            cdf_np_view = np.ctypeslib.as_array(cdf_obj)
+                            _local_cache[cache_key] = (cdf_np_view, cdf_ptr)
+                        should_return = True
                 else:
-                    cdf_list = [0.0] * (len(dist_list) + 1)
-                    should_return = True
-                
-                # Create underlying C-arrays
-                dist_arr = (ctypes.c_double * len(dist_list))(*dist_list)
-                cdf_arr = (ctypes.c_double * len(cdf_list))()
-                
-                dist_ptr = ctypes.cast(dist_arr, ctypes.c_void_p).value
-                cdf_ptr = ctypes.cast(cdf_arr, ctypes.c_void_p).value
-                
-                res_buf = ctypes.c_double(0.0)
+                    # STANDARD CPYTHON LIST (Requires O(N) copy)
+                    dist_list = input_obj
+                    size = len(dist_list)
+                    if size in _local_cache:
+                        dist_arr, dist_ptr, cdf_arr, cdf_ptr = _local_cache[size]
+                    else:
+                        dist_arr = (ctypes.c_double * size)()
+                        dist_ptr = ctypes.cast(dist_arr, ctypes.c_void_p).value
+                        cdf_arr = (ctypes.c_double * (size + 1))()
+                        cdf_ptr = ctypes.cast(cdf_arr, ctypes.c_void_p).value
+                        _local_cache[size] = (dist_arr, dist_ptr, cdf_arr, cdf_ptr)
+                    
+                    dist_arr[:] = dist_list
+                    
+                    if len(args) > 1 and isinstance(args[1], list):
+                        cdf_list = args[1]
+                        should_return = False
+                        cdf_target = cdf_list
+                    else:
+                        cdf_list = [0.0] * (size + 1)
+                        should_return = True
+                        cdf_target = cdf_list
                 
                 try:
-                    self.registry[fqn](ctypes.pointer(res_buf), dist_ptr, cdf_ptr, len(dist_list))
+                    # BARE-METAL EXECUTION (ZERO-COPY IF NUMPY)
+                    # Note: registry[fqn] is the execution_wrapper from component4_jit
+                    # which internally adds the result pointer.
+                    res_val = self.registry[fqn](dist_ptr, cdf_ptr, size)
                     
-                    # Sync back to Python object
-                    for i in range(len(cdf_list)):
-                        cdf_list[i] = cdf_arr[i]
-                    
-                    return cdf_list if should_return else None
+                    if is_numpy:
+                        return cdf_np_view if should_return else None
+                    else:
+                        cdf_target[:] = list(cdf_arr)
+                        return cdf_target if should_return else None
                 except Exception as e:
                     return original_func(*args, **kwargs)
             
@@ -102,7 +138,7 @@ class LazyCallManager:
             
             if not os.path.exists(cache_file_mlir):
                 from component9_aot import build_and_cache_mlir
-                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, len(inputs))
+                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, inputs)
                 verified_mlir.function_name = sanitized
                 build_and_cache_mlir(verified_mlir, os.path.join(CACHE_DIR, f"{sanitized}.json"))
             

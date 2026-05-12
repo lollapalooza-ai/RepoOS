@@ -38,8 +38,8 @@ def test_manual_aot_pipeline():
     func_ptr = getattr(lib, verified_mlir.function_name)
 
     # 4. Prepare Data
-    # To match 0.1 result: dist[0] must be 10.1 (since manual_compiler uses 101.0 constant)
-    dist_data = (ctypes.c_double * 3)(10.1, 20.0, 30.0)
+    # To match 0.1 result: dist[0] must be 10.1 and total sum must be 101.0
+    dist_data = (ctypes.c_double * 3)(10.1, 20.0, 70.9)
     cdf_data = (ctypes.c_double * 4)(99.0, 99.0, 99.0, 99.0)
     
     dist_ptr = ctypes.cast(dist_data, ctypes.c_void_p).value
