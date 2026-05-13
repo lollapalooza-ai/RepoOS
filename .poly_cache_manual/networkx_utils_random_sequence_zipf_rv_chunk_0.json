@@ -18,7 +18,10 @@
       "target_var": "%c1",
       "attributes": {
         "type": "f64"
-      }
+      },
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "arith",
@@ -28,7 +31,10 @@
         "%c1"
       ],
       "target_var": "%a1",
-      "attributes": {}
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "arith",
@@ -39,7 +45,10 @@
       "target_var": "%c2",
       "attributes": {
         "type": "f64"
-      }
+      },
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "math",
@@ -49,7 +58,10 @@
         "%a1"
       ],
       "target_var": "%b",
-      "attributes": {}
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "func",
@@ -57,7 +69,11 @@
       "args": [
         "%b"
       ],
-      "attributes": {}
+      "target_var": null,
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     }
   ]
 }

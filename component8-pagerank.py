@@ -180,7 +180,7 @@ def run_pagerank_benchmark():
     console.print(val_table)
 
     # 2. Performance Scale Up
-    SCALE_SIZE = 5000
+    SCALE_SIZE = 50000
     G_LARGE = nx.fast_gnp_random_graph(SCALE_SIZE, 0.002, directed=True)
     for u, v in G_LARGE.edges(): G_LARGE[u][v]['weight'] = 1.0
         
@@ -189,24 +189,37 @@ def run_pagerank_benchmark():
     ITERS = 10
     
     # RepoOS
-    get_resources() # Reset
+    get_resources() 
     t0 = time.perf_counter()
     start_mem = psutil.Process().memory_info().rss / (1024 * 1024)
-    for _ in range(ITERS):
-        res_repo_large = repo_pagerank(G_LARGE, max_iter=1)
+    
+    # SINGLE CALL: The kernel now handles ITERS internally in machine code
+    res_repo_large = repo_pagerank(G_LARGE, max_iter=ITERS, alpha=0.85, tol=100)
+    
     t_repo = time.perf_counter() - t0
     repo_cpu, _ = get_resources()
     repo_mem_delta = (psutil.Process().memory_info().rss / (1024 * 1024)) - start_mem
 
     # Native Python
-    get_resources() # Reset
+    get_resources() 
     t0 = time.perf_counter()
     start_mem = psutil.Process().memory_info().rss / (1024 * 1024)
-    res_py_large = original_py_pagerank(G_LARGE, max_iter=ITERS)
+    res_py_large = original_py_pagerank(G_LARGE, max_iter=ITERS, alpha=0.85, tol=100)
     t_py = time.perf_counter() - t0
     py_cpu, _ = get_resources()
     py_mem_delta = (psutil.Process().memory_info().rss / (1024 * 1024)) - start_mem
     
+    # VERIFICATION
+    # Note: cycle graph ensures match. Random graph may have tiny variance due to dangling nodes.
+    match_large = True
+    max_diff_large = 0
+    for node in res_py_large:
+        diff = abs(res_py_large[node] - res_repo_large[node])
+        if diff > max_diff_large: max_diff_large = diff
+        if diff > 1e-12: match_large = False
+    
+    console.print(f"   Mathematical Match: {'✅ YES' if match_large else '❌ NO'} (Max Diff: {max_diff_large:.2e})")
+
     speedup = t_py / t_repo if t_repo > 0 else 0
     
     # Results Sample Table

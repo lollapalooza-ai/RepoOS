@@ -1,11 +1,11 @@
 {
   "function_name": "networkx_utils_random_sequence_cumulative_distribution_chunk_0",
-  "thinking_process": "Full Prefix Sum implementation for 100% array match.",
+  "thinking_process": "High-performance prefix sum kernel.",
   "signature": {
     "dist_ptr": "ptr",
     "cdf_ptr": "ptr",
-    "arg_len": "index",
-    "return": "void"
+    "size": "i64",
+    "return": "f64"
   },
   "arg_mapping": [],
   "return_type": "f64",
@@ -20,7 +20,10 @@
       "target_var": "%c0",
       "attributes": {
         "type": "index"
-      }
+      },
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "arith",
@@ -31,7 +34,10 @@
       "target_var": "%c1",
       "attributes": {
         "type": "index"
-      }
+      },
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "arith",
@@ -42,14 +48,31 @@
       "target_var": "%f0",
       "attributes": {
         "type": "f64"
-      }
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "index_cast",
+      "args": [
+        "size"
+      ],
+      "target_var": "%size_idx",
+      "attributes": {
+        "type": "index"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "scf",
       "op": "for",
       "args": [
         "%c0",
-        "arg_len",
+        "%size_idx",
         "%c1"
       ],
       "target_var": "%total_sum",
@@ -58,7 +81,7 @@
           "%f0"
         ],
         "body_args": [
-          "%iv1",
+          "%iv_sum",
           "%iter_sum"
         ]
       },
@@ -68,29 +91,38 @@
           "op": "getelementptr",
           "args": [
             "dist_ptr",
-            "%iv1"
+            "%iv_sum"
           ],
-          "target_var": "%p1",
-          "attributes": {}
+          "target_var": "%p_dist",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "llvm",
           "op": "load",
           "args": [
-            "%p1"
+            "%p_dist"
           ],
-          "target_var": "%val1",
-          "attributes": {}
+          "target_var": "%val",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "arith",
           "op": "addf",
           "args": [
             "%iter_sum",
-            "%val1"
+            "%val"
           ],
           "target_var": "%new_sum",
-          "attributes": {}
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "scf",
@@ -98,34 +130,58 @@
           "args": [
             "%new_sum"
           ],
-          "attributes": {}
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         }
-      ]
+      ],
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "llvm",
+      "op": "getelementptr",
+      "args": [
+        "cdf_ptr",
+        "%c0"
+      ],
+      "target_var": "%p_cdf0",
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "llvm",
       "op": "store",
       "args": [
         "%f0",
-        "cdf_ptr"
+        "%p_cdf0"
       ],
-      "attributes": {}
+      "target_var": null,
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "scf",
       "op": "for",
       "args": [
         "%c0",
-        "arg_len",
+        "%size_idx",
         "%c1"
       ],
+      "target_var": "%final_sum",
       "attributes": {
         "init_args": [
           "%f0"
         ],
         "body_args": [
-          "%iv2",
-          "%cum_sum"
+          "%iv_prefix",
+          "%current_sum"
         ]
       },
       "body": [
@@ -134,84 +190,116 @@
           "op": "getelementptr",
           "args": [
             "dist_ptr",
-            "%iv2"
+            "%iv_prefix"
           ],
-          "target_var": "%p2",
-          "attributes": {}
+          "target_var": "%p_d",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "llvm",
           "op": "load",
           "args": [
-            "%p2"
+            "%p_d"
           ],
-          "target_var": "%val2",
-          "attributes": {}
+          "target_var": "%d_val",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "arith",
           "op": "addf",
           "args": [
-            "%cum_sum",
-            "%val2"
+            "%current_sum",
+            "%d_val"
           ],
-          "target_var": "%next_cum_sum",
-          "attributes": {}
+          "target_var": "%next_sum",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "arith",
           "op": "divf",
           "args": [
-            "%next_cum_sum",
+            "%next_sum",
             "%total_sum"
           ],
-          "target_var": "%norm_val",
-          "attributes": {}
+          "target_var": "%norm",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "arith",
           "op": "addi",
           "args": [
-            "%iv2",
+            "%iv_prefix",
             "%c1"
           ],
-          "target_var": "%out_idx",
-          "attributes": {}
+          "target_var": "%iv_next",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "llvm",
           "op": "getelementptr",
           "args": [
             "cdf_ptr",
-            "%out_idx"
+            "%iv_next"
           ],
-          "target_var": "%p3",
-          "attributes": {}
+          "target_var": "%p_c",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "llvm",
           "op": "store",
           "args": [
-            "%norm_val",
-            "%p3"
+            "%norm",
+            "%p_c"
           ],
-          "attributes": {}
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         },
         {
           "dialect": "scf",
           "op": "yield",
           "args": [
-            "%next_cum_sum"
+            "%next_sum"
           ],
-          "attributes": {}
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
         }
-      ]
+      ],
+      "then": null,
+      "else_": null
     },
     {
       "dialect": "func",
       "op": "return",
       "args": [],
-      "attributes": {}
+      "target_var": null,
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
     }
   ]
 }

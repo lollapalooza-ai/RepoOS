@@ -25,7 +25,7 @@ def sanitize_fqn(fqn: str):
             return fqn[idx:].replace('.', '_').replace('-', '_')
     return fqn.replace('.', '_').replace('-', '_')
 
-def networkx_to_csr(G):
+def networkx_to_csr(G, stochastic=False):
     """
     Devirtualizes a NetworkX Dictionary Graph into flat CSR Memory Arrays.
     Returns: row_ptrs, col_indices, weights, node_to_idx, idx_to_node, num_nodes, num_edges
@@ -48,9 +48,17 @@ def networkx_to_csr(G):
     edge_idx = 0
     for i, node in enumerate(G.nodes()):
         row_ptrs[i] = edge_idx
+        
+        # Calculate total out-weight for normalization if stochastic is requested
+        out_weight = 1.0
+        if stochastic:
+            out_weight = sum(float(edge_data.get('weight', 1.0)) for neighbor, edge_data in G[node].items())
+            if out_weight == 0: out_weight = 1.0 # Avoid division by zero
+            
         for neighbor, edge_data in G[node].items():
             col_indices[edge_idx] = node_to_idx[neighbor]
-            weights[edge_idx] = float(edge_data.get('weight', 1.0))
+            raw_weight = float(edge_data.get('weight', 1.0))
+            weights[edge_idx] = raw_weight / out_weight
             edge_idx += 1
             
     row_ptrs[n_nodes] = edge_idx
@@ -101,18 +109,24 @@ class LazyCallManager:
                 
                 if is_networkx:
                     try:
-                        # 1. Flatten the Dictionary Graph
-                        row_ptrs, col_idx, weights, node_map, rev_node_map, num_nodes, num_edges = networkx_to_csr(input_obj)
+                        # 1. Flatten the Dictionary Graph (Request Stochastic Normalization for PageRank)
+                        row_ptrs, col_idx, weights, node_map, rev_node_map, num_nodes, num_edges = networkx_to_csr(input_obj, stochastic=True)
                         
                         # 2. Extract PageRank Parameters (Transparency Path)
                         # Signature: (G, alpha, personalization, max_iter, tol, nstart, weight, dangling)
                         alpha = kwargs.get('alpha', args[1] if len(args) > 1 else 0.85)
                         personalization = kwargs.get('personalization', args[2] if len(args) > 2 else None)
+                        max_iter = kwargs.get('max_iter', args[3] if len(args) > 3 else 100)
+                        nstart = kwargs.get('nstart', args[5] if len(args) > 5 else None)
                         
-                        # Prepare vectors (Standardized as raw C-arrays for MLIR)
                         import numpy as np
                         x_last = np.ones(num_nodes, dtype=np.float64) / num_nodes
                         p_vector = np.ones(num_nodes, dtype=np.float64) / num_nodes
+                        
+                        # Use nstart if provided
+                        if nstart:
+                            for node, val in nstart.items():
+                                if node in node_map: x_last[node_map[node]] = val
                         
                         if personalization:
                             p_sum = sum(personalization.values())
@@ -131,8 +145,8 @@ class LazyCallManager:
                         p_addr       = p_vector.ctypes.data
                         
                         # 5. Bare-Metal Execution!
-                        # ABI: (res, rows, cols, wts, xlast, p, num_nodes, alpha)
-                        self.registry[fqn](res_addr, row_ptr_addr, col_idx_addr, weight_addr, x_last_addr, p_addr, num_nodes, float(alpha))
+                        # ABI: (res, rows, cols, wts, xlast, p, num_nodes, alpha, max_iter)
+                        self.registry[fqn](res_addr, row_ptr_addr, col_idx_addr, weight_addr, x_last_addr, p_addr, num_nodes, float(alpha), int(max_iter))
                         
                         return {rev_node_map[i]: result_arr[i] for i in range(num_nodes)}
                     except Exception as e:
@@ -253,3 +267,4 @@ if __name__ == "__main__":
                 trampoline = orchestrator.register_lazy_function(name, original_func, fqn)
                 orchestrator.registry[name] = trampoline 
         print(f"✅ Boot Complete.")
+
