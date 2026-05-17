@@ -1,66 +1,66 @@
 ; ModuleID = 'LLVMDialectModule'
 source_filename = "LLVMDialectModule"
 
-define void @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, ptr %6, i64 %7, double %8) {
-  %10 = fsub double 1.000000e+00, %8
-  br label %11
+define void @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, i64 %6, double %7) {
+  %9 = fsub double 1.000000e+00, %7
+  br label %10
 
-11:                                               ; preds = %14, %9
-  %12 = phi i64 [ %19, %14 ], [ 0, %9 ]
-  %13 = icmp slt i64 %12, %7
-  br i1 %13, label %14, label %20
+10:                                               ; preds = %13, %8
+  %11 = phi i64 [ %18, %13 ], [ 0, %8 ]
+  %12 = icmp slt i64 %11, %6
+  br i1 %12, label %13, label %19
 
-14:                                               ; preds = %11
-  %15 = getelementptr double, ptr %6, i64 %12
-  %16 = load double, ptr %15, align 8
-  %17 = fmul double %10, %16
-  %18 = getelementptr double, ptr %1, i64 %12
-  store double %17, ptr %18, align 8
-  %19 = add i64 %12, 1
-  br label %11
+13:                                               ; preds = %10
+  %14 = getelementptr double, ptr %5, i64 %11
+  %15 = load double, ptr %14, align 8
+  %16 = fmul double %9, %15
+  %17 = getelementptr double, ptr %0, i64 %11
+  store double %16, ptr %17, align 8
+  %18 = add i64 %11, 1
+  br label %10
 
-20:                                               ; preds = %11
-  br label %21
+19:                                               ; preds = %10
+  br label %20
 
-21:                                               ; preds = %46, %20
-  %22 = phi i64 [ %47, %46 ], [ 0, %20 ]
-  %23 = icmp slt i64 %22, %7
-  br i1 %23, label %24, label %48
+20:                                               ; preds = %45, %19
+  %21 = phi i64 [ %46, %45 ], [ 0, %19 ]
+  %22 = icmp slt i64 %21, %6
+  br i1 %22, label %23, label %47
 
-24:                                               ; preds = %21
-  %25 = getelementptr double, ptr %5, i64 %22
-  %26 = load double, ptr %25, align 8
-  %27 = fmul double %8, %26
-  %28 = getelementptr double, ptr %2, i64 %22
-  %29 = load i64, ptr %28, align 4
-  %30 = add i64 %22, 1
-  %31 = getelementptr double, ptr %2, i64 %30
-  %32 = load i64, ptr %31, align 4
-  br label %33
+23:                                               ; preds = %20
+  %24 = getelementptr double, ptr %4, i64 %21
+  %25 = load double, ptr %24, align 8
+  %26 = fmul double %7, %25
+  %27 = getelementptr double, ptr %1, i64 %21
+  %28 = load i64, ptr %27, align 4
+  %29 = add i64 %21, 1
+  %30 = getelementptr double, ptr %1, i64 %29
+  %31 = load i64, ptr %30, align 4
+  br label %32
 
-33:                                               ; preds = %36, %24
-  %34 = phi i64 [ %45, %36 ], [ %29, %24 ]
-  %35 = icmp slt i64 %34, %32
-  br i1 %35, label %36, label %46
+32:                                               ; preds = %35, %23
+  %33 = phi i64 [ %44, %35 ], [ %28, %23 ]
+  %34 = icmp slt i64 %33, %31
+  br i1 %34, label %35, label %45
 
-36:                                               ; preds = %33
-  %37 = getelementptr double, ptr %3, i64 %34
-  %38 = load i64, ptr %37, align 4
-  %39 = getelementptr double, ptr %4, i64 %34
-  %40 = load double, ptr %39, align 8
-  %41 = fmul double %27, %40
-  %42 = getelementptr double, ptr %1, i64 %38
-  %43 = load double, ptr %42, align 8
-  %44 = fadd double %43, %41
-  store double %44, ptr %42, align 8
-  %45 = add i64 %34, 1
-  br label %33
+35:                                               ; preds = %32
+  %36 = getelementptr double, ptr %2, i64 %33
+  %37 = load i64, ptr %36, align 4
+  %38 = getelementptr double, ptr %3, i64 %33
+  %39 = load double, ptr %38, align 8
+  %40 = fmul double %26, %39
+  %41 = getelementptr double, ptr %0, i64 %37
+  %42 = load double, ptr %41, align 8
+  %43 = fadd double %42, %40
+  store double %43, ptr %41, align 8
+  %44 = add i64 %33, 1
+  br label %32
 
-46:                                               ; preds = %33
-  %47 = add i64 %22, 1
-  br label %21
+45:                                               ; preds = %32
+  %46 = add i64 %21, 1
+  br label %20
 
-48:                                               ; preds = %21
+47:                                               ; preds = %20
   ret void
 }
 

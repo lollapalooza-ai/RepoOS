@@ -90,8 +90,13 @@ class LazyCallManager:
         if os.path.exists(cache_file_mlir) and fqn not in self.registry:
             try:
                 rtype = "f64"
-                if os.path.exists(cache_file_json):
-                    with open(cache_file_json, 'r') as f:
+                # Check standard cache first, then manual cache for the JSON metadata
+                meta_path = cache_file_json
+                if not os.path.exists(meta_path):
+                    meta_path = os.path.join(MANUAL_CACHE_DIR, f"{chunk_0_sanitized}.json")
+                
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r') as f:
                         rtype = json.load(f).get("signature", {}).get("return", "f64")
                 
                 self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, chunk_0_sanitized, return_type=rtype)
@@ -146,12 +151,13 @@ class LazyCallManager:
                         
                         # 5. Bare-Metal Execution!
                         # ABI: (res, rows, cols, wts, xlast, p, num_nodes, alpha, max_iter)
+                        print(f"   [RepoOS] Invoking Bare-Metal CSR Kernel (Nodes: {num_nodes}, Edges: {num_edges})...")
                         self.registry[fqn](res_addr, row_ptr_addr, col_idx_addr, weight_addr, x_last_addr, p_addr, num_nodes, float(alpha), int(max_iter))
                         
                         return {rev_node_map[i]: result_arr[i] for i in range(num_nodes)}
                     except Exception as e:
                         print(f"⚠️ CSR Devirtualization Failed: {e}")
-                        return original_func(*args, **kwargs)
+                        raise e # Force failure instead of silent fallback for verification
 
                 # --- 2. CONTAINER DETECTION (NumPy / List) ---
                 is_numpy = hasattr(input_obj, '__array_interface__')
@@ -228,15 +234,35 @@ class LazyCallManager:
 
     async def background_compile(self, fqn, original_func):
         try:
+            # First, check if we already have it in registry to avoid double work
+            if fqn in self.registry:
+                return
+
+            sanitized = sanitize_fqn(f"{fqn}.chunk_0")
+            cache_file_mlir = os.path.join(CACHE_DIR, f"{sanitized}.mlir")
+            cache_file_json = os.path.join(CACHE_DIR, f"{sanitized}.json")
+            
+            # If the MLIR already exists, we don't need to re-generate or re-compile
+            # The sync-loader in register_lazy_function likely already picked it up, 
+            # but if not, we can load it here.
+            if os.path.exists(cache_file_mlir):
+                rtype = "f64"
+                meta_path = cache_file_json
+                if not os.path.exists(meta_path):
+                    meta_path = os.path.join(MANUAL_CACHE_DIR, f"{sanitized}.json")
+                
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r') as f:
+                        rtype = json.load(f).get("signature", {}).get("return", "f64")
+                
+                self.registry[fqn] = self.kernel.load_and_compile(cache_file_mlir, sanitized, return_type=rtype)
+                return
+
             with self.driver.session() as session:
                 res = session.run("MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) RETURN c.code, c.inputs LIMIT 1", fqn=fqn)
                 record = res.single()
                 if not record: return
                 chunk_code, inputs = record[0], json.loads(record[1])
-            
-            sanitized = sanitize_fqn(f"{fqn}.chunk_0")
-            cache_file_mlir = os.path.join(CACHE_DIR, f"{sanitized}.mlir")
-            cache_file_json = os.path.join(CACHE_DIR, f"{sanitized}.json")
             
             if not os.path.exists(cache_file_mlir):
                 from component9_aot import build_and_cache_mlir

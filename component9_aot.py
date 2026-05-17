@@ -49,7 +49,10 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                         if t == "ptr" or t == "llvm.ptr" or t.startswith("memref"): return ptr_t
                         return None
                     
-                    input_types = [ptr_t]
+                    input_types = []
+                    if verified_mlir_data.signature.get("return", "f64") != "void":
+                        input_types.append(ptr_t)
+                    
                     for k,v in verified_mlir_data.signature.items():
                         if k != "return": input_types.append(get_type(v))
                     
@@ -137,8 +140,10 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
                                 if op_data.target_var: ssa_map[op_data.target_var] = res
 
                     main_map = {}
+                    arg_offset = 1 if verified_mlir_data.signature.get("return", "f64") != "void" else 0
                     for i, (k,v) in enumerate(verified_mlir_data.signature.items()):
-                        if k != "return": main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i+1]
+                        if k != "return": 
+                            main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i + arg_offset]
                     process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
 
                 with open(mlir_path, "w") as f: f.write(str(module))
