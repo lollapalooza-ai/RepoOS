@@ -14,6 +14,7 @@
   },
   "arg_mapping": [],
   "return_type": "f64",
+  "config": {},
   "memory_allocations": [],
   "operations": [
     {

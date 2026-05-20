@@ -1,0 +1,1737 @@
+{
+  "function_name": "networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0",
+  "thinking_process": "Brandes Betweenness Centrality (Unweighted).",
+  "signature": {
+    "betweenness_ptr": "ptr",
+    "row_ptrs": "ptr",
+    "col_idx": "ptr",
+    "d_ptr": "ptr",
+    "sigma_ptr": "ptr",
+    "s_ptr": "ptr",
+    "q_ptr": "ptr",
+    "delta_ptr": "ptr",
+    "num_nodes": "i64",
+    "return": "void"
+  },
+  "arg_mapping": [],
+  "return_type": "f64",
+  "config": {
+    "result_buffer": "betweenness_ptr",
+    "undirected_double_counted": true,
+    "post_process": [
+      {
+        "type": "scale",
+        "factor": "0.5_if_undirected"
+      },
+      {
+        "type": "scale",
+        "factor": "normalization"
+      }
+    ]
+  },
+  "memory_allocations": [],
+  "operations": [
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0"
+      ],
+      "target_var": "%c0",
+      "attributes": {
+        "type": "index"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1"
+      ],
+      "target_var": "%c1",
+      "attributes": {
+        "type": "index"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "-1"
+      ],
+      "target_var": "%m1_i64",
+      "attributes": {
+        "type": "i64"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "0.0"
+      ],
+      "target_var": "%f0",
+      "attributes": {
+        "type": "f64"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1.0"
+      ],
+      "target_var": "%f1",
+      "attributes": {
+        "type": "f64"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "index_cast",
+      "args": [
+        "num_nodes"
+      ],
+      "target_var": "%num_nodes_idx",
+      "attributes": {
+        "type": "index"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "arith",
+      "op": "constant",
+      "args": [
+        "1"
+      ],
+      "target_var": "%c1_i64",
+      "attributes": {
+        "type": "i64"
+      },
+      "body": null,
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "scf",
+      "op": "for",
+      "args": [
+        "%c0",
+        "%num_nodes_idx",
+        "%c1"
+      ],
+      "target_var": null,
+      "attributes": {
+        "init_args": [],
+        "body_args": [
+          "%s_idx"
+        ]
+      },
+      "body": [
+        {
+          "dialect": "scf",
+          "op": "for",
+          "args": [
+            "%c0",
+            "%num_nodes_idx",
+            "%c1"
+          ],
+          "target_var": null,
+          "attributes": {
+            "init_args": [],
+            "body_args": [
+              "%init_idx"
+            ]
+          },
+          "body": [
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "d_ptr",
+                "%init_idx"
+              ],
+              "target_var": "%pd",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "store",
+              "args": [
+                "%m1_i64",
+                "%pd"
+              ],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "sigma_ptr",
+                "%init_idx"
+              ],
+              "target_var": "%psig",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "store",
+              "args": [
+                "%f0",
+                "%psig"
+              ],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "delta_ptr",
+                "%init_idx"
+              ],
+              "target_var": "%pdel",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "store",
+              "args": [
+                "%f0",
+                "%pdel"
+              ],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "yield",
+              "args": [],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            }
+          ],
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "sigma_ptr",
+            "%s_idx"
+          ],
+          "target_var": "%ps_sig",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "store",
+          "args": [
+            "%f1",
+            "%ps_sig"
+          ],
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "d_ptr",
+            "%s_idx"
+          ],
+          "target_var": "%ps_d",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "arith",
+          "op": "constant",
+          "args": [
+            "0"
+          ],
+          "target_var": "%c0_i64",
+          "attributes": {
+            "type": "i64"
+          },
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "store",
+          "args": [
+            "%c0_i64",
+            "%ps_d"
+          ],
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "getelementptr",
+          "args": [
+            "q_ptr",
+            "%c0"
+          ],
+          "target_var": "%pq0",
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "arith",
+          "op": "index_cast",
+          "args": [
+            "%s_idx"
+          ],
+          "target_var": "%s_i64",
+          "attributes": {
+            "type": "i64"
+          },
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "llvm",
+          "op": "store",
+          "args": [
+            "%s_i64",
+            "%pq0"
+          ],
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "scf",
+          "op": "for",
+          "args": [
+            "%c0",
+            "%num_nodes_idx",
+            "%c1"
+          ],
+          "target_var": "%q_final",
+          "attributes": {
+            "init_args": [
+              "%c0",
+              "%c1",
+              "%c0"
+            ],
+            "body_args": [
+              "%bfs_iter",
+              "%q_start",
+              "%q_end",
+              "%s_end"
+            ]
+          },
+          "body": [
+            {
+              "dialect": "arith",
+              "op": "cmpi",
+              "args": [
+                "%q_start",
+                "%q_end"
+              ],
+              "target_var": "%is_empty",
+              "attributes": {
+                "predicate": 0
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "if",
+              "args": [
+                "%is_empty"
+              ],
+              "target_var": "%res_q",
+              "attributes": {
+                "then": [
+                  {
+                    "dialect": "scf",
+                    "op": "yield",
+                    "args": [
+                      "%q_start",
+                      "%q_end",
+                      "%s_end"
+                    ],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  }
+                ],
+                "else": [
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "q_ptr",
+                      "%q_start"
+                    ],
+                    "target_var": "%pv_ptr",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%pv_ptr"
+                    ],
+                    "target_var": "%v_i64",
+                    "attributes": {
+                      "type": "i64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "index_cast",
+                    "args": [
+                      "%v_i64"
+                    ],
+                    "target_var": "%v_idx",
+                    "attributes": {
+                      "type": "index"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "s_ptr",
+                      "%s_end"
+                    ],
+                    "target_var": "%ps_ptr",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "store",
+                    "args": [
+                      "%v_i64",
+                      "%ps_ptr"
+                    ],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "addi",
+                    "args": [
+                      "%s_end",
+                      "%c1"
+                    ],
+                    "target_var": "%s_end_next",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "d_ptr",
+                      "%v_idx"
+                    ],
+                    "target_var": "%pdv_ptr",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%pdv_ptr"
+                    ],
+                    "target_var": "%dv_i64",
+                    "attributes": {
+                      "type": "i64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "addi",
+                    "args": [
+                      "%dv_i64",
+                      "%c1_i64"
+                    ],
+                    "target_var": "%dw_i64",
+                    "attributes": {
+                      "type": "i64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "sigma_ptr",
+                      "%v_idx"
+                    ],
+                    "target_var": "%psigmav_ptr",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%psigmav_ptr"
+                    ],
+                    "target_var": "%sigmav",
+                    "attributes": {
+                      "type": "f64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "row_ptrs",
+                      "%v_idx"
+                    ],
+                    "target_var": "%pstart",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%pstart"
+                    ],
+                    "target_var": "%start_i64",
+                    "attributes": {
+                      "type": "i64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "index_cast",
+                    "args": [
+                      "%start_i64"
+                    ],
+                    "target_var": "%start_idx",
+                    "attributes": {
+                      "type": "index"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "addi",
+                    "args": [
+                      "%v_idx",
+                      "%c1"
+                    ],
+                    "target_var": "%v_next",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "row_ptrs",
+                      "%v_next"
+                    ],
+                    "target_var": "%pend",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%pend"
+                    ],
+                    "target_var": "%end_i64",
+                    "attributes": {
+                      "type": "i64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "index_cast",
+                    "args": [
+                      "%end_i64"
+                    ],
+                    "target_var": "%end_idx",
+                    "attributes": {
+                      "type": "index"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "scf",
+                    "op": "for",
+                    "args": [
+                      "%start_idx",
+                      "%end_idx",
+                      "%c1"
+                    ],
+                    "target_var": "%new_q_end",
+                    "attributes": {
+                      "init_args": [
+                        "%q_end"
+                      ],
+                      "body_args": [
+                        "%edge_idx",
+                        "%curr_q_end"
+                      ]
+                    },
+                    "body": [
+                      {
+                        "dialect": "llvm",
+                        "op": "getelementptr",
+                        "args": [
+                          "col_idx",
+                          "%edge_idx"
+                        ],
+                        "target_var": "%pw_ptr",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "load",
+                        "args": [
+                          "%pw_ptr"
+                        ],
+                        "target_var": "%w_i64",
+                        "attributes": {
+                          "type": "i64"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "arith",
+                        "op": "index_cast",
+                        "args": [
+                          "%w_i64"
+                        ],
+                        "target_var": "%w_idx",
+                        "attributes": {
+                          "type": "index"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "getelementptr",
+                        "args": [
+                          "d_ptr",
+                          "%w_idx"
+                        ],
+                        "target_var": "%pdw_ptr",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "load",
+                        "args": [
+                          "%pdw_ptr"
+                        ],
+                        "target_var": "%dw_curr",
+                        "attributes": {
+                          "type": "i64"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "arith",
+                        "op": "cmpi",
+                        "args": [
+                          "%dw_curr",
+                          "%m1_i64"
+                        ],
+                        "target_var": "%is_new",
+                        "attributes": {
+                          "predicate": 0
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "scf",
+                        "op": "if",
+                        "args": [
+                          "%is_new"
+                        ],
+                        "target_var": "%res_q_end",
+                        "attributes": {
+                          "then": [
+                            {
+                              "dialect": "llvm",
+                              "op": "store",
+                              "args": [
+                                "%dw_i64",
+                                "%pdw_ptr"
+                              ],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "llvm",
+                              "op": "getelementptr",
+                              "args": [
+                                "q_ptr",
+                                "%curr_q_end"
+                              ],
+                              "target_var": "%pq_next",
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "llvm",
+                              "op": "store",
+                              "args": [
+                                "%w_i64",
+                                "%pq_next"
+                              ],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "arith",
+                              "op": "addi",
+                              "args": [
+                                "%curr_q_end",
+                                "%c1"
+                              ],
+                              "target_var": "%next_q_end",
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "scf",
+                              "op": "yield",
+                              "args": [
+                                "%next_q_end"
+                              ],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            }
+                          ],
+                          "else": [
+                            {
+                              "dialect": "scf",
+                              "op": "yield",
+                              "args": [
+                                "%curr_q_end"
+                              ],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            }
+                          ]
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "load",
+                        "args": [
+                          "%pdw_ptr"
+                        ],
+                        "target_var": "%dw_final",
+                        "attributes": {
+                          "type": "i64"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "arith",
+                        "op": "cmpi",
+                        "args": [
+                          "%dw_final",
+                          "%dw_i64"
+                        ],
+                        "target_var": "%is_sp",
+                        "attributes": {
+                          "predicate": 0
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "scf",
+                        "op": "if",
+                        "args": [
+                          "%is_sp"
+                        ],
+                        "target_var": null,
+                        "attributes": {
+                          "then": [
+                            {
+                              "dialect": "llvm",
+                              "op": "getelementptr",
+                              "args": [
+                                "sigma_ptr",
+                                "%w_idx"
+                              ],
+                              "target_var": "%psigmaw_ptr",
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "llvm",
+                              "op": "load",
+                              "args": [
+                                "%psigmaw_ptr"
+                              ],
+                              "target_var": "%sigmaw",
+                              "attributes": {
+                                "type": "f64"
+                              },
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "arith",
+                              "op": "addf",
+                              "args": [
+                                "%sigmaw",
+                                "%sigmav"
+                              ],
+                              "target_var": "%new_sigmaw",
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "llvm",
+                              "op": "store",
+                              "args": [
+                                "%new_sigmaw",
+                                "%psigmaw_ptr"
+                              ],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            },
+                            {
+                              "dialect": "scf",
+                              "op": "yield",
+                              "args": [],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            }
+                          ],
+                          "else": [
+                            {
+                              "dialect": "scf",
+                              "op": "yield",
+                              "args": [],
+                              "target_var": null,
+                              "attributes": {},
+                              "body": null,
+                              "then": null,
+                              "else_": null
+                            }
+                          ]
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "scf",
+                        "op": "yield",
+                        "args": [
+                          "%res_q_end"
+                        ],
+                        "target_var": null,
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      }
+                    ],
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "addi",
+                    "args": [
+                      "%q_start",
+                      "%c1"
+                    ],
+                    "target_var": "%q_start_next",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "scf",
+                    "op": "yield",
+                    "args": [
+                      "%q_start_next",
+                      "%new_q_end",
+                      "%s_end_next"
+                    ],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  }
+                ]
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "yield",
+              "args": [
+                "%res_q#0",
+                "%res_q#1",
+                "%res_q#2"
+              ],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            }
+          ],
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "scf",
+          "op": "for",
+          "args": [
+            "%c0",
+            "%q_final#2",
+            "%c1"
+          ],
+          "target_var": null,
+          "attributes": {
+            "init_args": [],
+            "body_args": [
+              "%acc_iter"
+            ]
+          },
+          "body": [
+            {
+              "dialect": "arith",
+              "op": "subi",
+              "args": [
+                "%q_final#2",
+                "%c1"
+              ],
+              "target_var": "%s_top",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "subi",
+              "args": [
+                "%s_top",
+                "%acc_iter"
+              ],
+              "target_var": "%w_s_idx",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "s_ptr",
+                "%w_s_idx"
+              ],
+              "target_var": "%pw_s",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%pw_s"
+              ],
+              "target_var": "%w_i64",
+              "attributes": {
+                "type": "i64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "index_cast",
+              "args": [
+                "%w_i64"
+              ],
+              "target_var": "%w_idx",
+              "attributes": {
+                "type": "index"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "d_ptr",
+                "%w_idx"
+              ],
+              "target_var": "%pdw",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%pdw"
+              ],
+              "target_var": "%dw_i64",
+              "attributes": {
+                "type": "i64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "subi",
+              "args": [
+                "%dw_i64",
+                "%c1_i64"
+              ],
+              "target_var": "%dv_target",
+              "attributes": {
+                "type": "i64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "delta_ptr",
+                "%w_idx"
+              ],
+              "target_var": "%pdeltaw",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%pdeltaw"
+              ],
+              "target_var": "%deltaw",
+              "attributes": {
+                "type": "f64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "sigma_ptr",
+                "%w_idx"
+              ],
+              "target_var": "%psigmaw",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%psigmaw"
+              ],
+              "target_var": "%sigmaw",
+              "attributes": {
+                "type": "f64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "addf",
+              "args": [
+                "%f1",
+                "%deltaw"
+              ],
+              "target_var": "%num",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "divf",
+              "args": [
+                "%num",
+                "%sigmaw"
+              ],
+              "target_var": "%coeff",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "row_ptrs",
+                "%w_idx"
+              ],
+              "target_var": "%pstart_w",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%pstart_w"
+              ],
+              "target_var": "%start_w_i64",
+              "attributes": {
+                "type": "i64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "index_cast",
+              "args": [
+                "%start_w_i64"
+              ],
+              "target_var": "%start_w_idx",
+              "attributes": {
+                "type": "index"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "addi",
+              "args": [
+                "%w_idx",
+                "%c1"
+              ],
+              "target_var": "%w_next",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "getelementptr",
+              "args": [
+                "row_ptrs",
+                "%w_next"
+              ],
+              "target_var": "%pend_w",
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "llvm",
+              "op": "load",
+              "args": [
+                "%pend_w"
+              ],
+              "target_var": "%end_w_i64",
+              "attributes": {
+                "type": "i64"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "index_cast",
+              "args": [
+                "%end_w_i64"
+              ],
+              "target_var": "%end_w_idx",
+              "attributes": {
+                "type": "index"
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "for",
+              "args": [
+                "%start_w_idx",
+                "%end_w_idx",
+                "%c1"
+              ],
+              "target_var": null,
+              "attributes": {
+                "init_args": [],
+                "body_args": [
+                  "%e_idx_w"
+                ]
+              },
+              "body": [
+                {
+                  "dialect": "llvm",
+                  "op": "getelementptr",
+                  "args": [
+                    "col_idx",
+                    "%e_idx_w"
+                  ],
+                  "target_var": "%pv_ptr_w",
+                  "attributes": {},
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "llvm",
+                  "op": "load",
+                  "args": [
+                    "%pv_ptr_w"
+                  ],
+                  "target_var": "%v_i64_w",
+                  "attributes": {
+                    "type": "i64"
+                  },
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "arith",
+                  "op": "index_cast",
+                  "args": [
+                    "%v_i64_w"
+                  ],
+                  "target_var": "%v_idx_w",
+                  "attributes": {
+                    "type": "index"
+                  },
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "llvm",
+                  "op": "getelementptr",
+                  "args": [
+                    "d_ptr",
+                    "%v_idx_w"
+                  ],
+                  "target_var": "%pdv_ptr_w",
+                  "attributes": {},
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "llvm",
+                  "op": "load",
+                  "args": [
+                    "%pdv_ptr_w"
+                  ],
+                  "target_var": "%dv_curr_w",
+                  "attributes": {
+                    "type": "i64"
+                  },
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "arith",
+                  "op": "cmpi",
+                  "args": [
+                    "%dv_curr_w",
+                    "%dv_target"
+                  ],
+                  "target_var": "%is_pred",
+                  "attributes": {
+                    "predicate": 0
+                  },
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "scf",
+                  "op": "if",
+                  "args": [
+                    "%is_pred"
+                  ],
+                  "target_var": null,
+                  "attributes": {
+                    "then": [
+                      {
+                        "dialect": "llvm",
+                        "op": "getelementptr",
+                        "args": [
+                          "sigma_ptr",
+                          "%v_idx_w"
+                        ],
+                        "target_var": "%psigmav_w",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "load",
+                        "args": [
+                          "%psigmav_w"
+                        ],
+                        "target_var": "%sigmav_w",
+                        "attributes": {
+                          "type": "f64"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "arith",
+                        "op": "mulf",
+                        "args": [
+                          "%sigmav_w",
+                          "%coeff"
+                        ],
+                        "target_var": "%term",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "getelementptr",
+                        "args": [
+                          "delta_ptr",
+                          "%v_idx_w"
+                        ],
+                        "target_var": "%pdeltav_w",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "load",
+                        "args": [
+                          "%pdeltav_w"
+                        ],
+                        "target_var": "%deltav_old",
+                        "attributes": {
+                          "type": "f64"
+                        },
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "arith",
+                        "op": "addf",
+                        "args": [
+                          "%deltav_old",
+                          "%term"
+                        ],
+                        "target_var": "%deltav_new",
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "llvm",
+                        "op": "store",
+                        "args": [
+                          "%deltav_new",
+                          "%pdeltav_w"
+                        ],
+                        "target_var": null,
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      },
+                      {
+                        "dialect": "scf",
+                        "op": "yield",
+                        "args": [],
+                        "target_var": null,
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      }
+                    ],
+                    "else": [
+                      {
+                        "dialect": "scf",
+                        "op": "yield",
+                        "args": [],
+                        "target_var": null,
+                        "attributes": {},
+                        "body": null,
+                        "then": null,
+                        "else_": null
+                      }
+                    ]
+                  },
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                },
+                {
+                  "dialect": "scf",
+                  "op": "yield",
+                  "args": [],
+                  "target_var": null,
+                  "attributes": {},
+                  "body": null,
+                  "then": null,
+                  "else_": null
+                }
+              ],
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "arith",
+              "op": "cmpi",
+              "args": [
+                "%w_idx",
+                "%s_idx"
+              ],
+              "target_var": "%not_source",
+              "attributes": {
+                "predicate": 1
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "if",
+              "args": [
+                "%not_source"
+              ],
+              "target_var": null,
+              "attributes": {
+                "then": [
+                  {
+                    "dialect": "llvm",
+                    "op": "getelementptr",
+                    "args": [
+                      "betweenness_ptr",
+                      "%w_idx"
+                    ],
+                    "target_var": "%pb",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "load",
+                    "args": [
+                      "%pb"
+                    ],
+                    "target_var": "%b_old",
+                    "attributes": {
+                      "type": "f64"
+                    },
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "arith",
+                    "op": "addf",
+                    "args": [
+                      "%b_old",
+                      "%deltaw"
+                    ],
+                    "target_var": "%b_new",
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "llvm",
+                    "op": "store",
+                    "args": [
+                      "%b_new",
+                      "%pb"
+                    ],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  },
+                  {
+                    "dialect": "scf",
+                    "op": "yield",
+                    "args": [],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  }
+                ],
+                "else": [
+                  {
+                    "dialect": "scf",
+                    "op": "yield",
+                    "args": [],
+                    "target_var": null,
+                    "attributes": {},
+                    "body": null,
+                    "then": null,
+                    "else_": null
+                  }
+                ]
+              },
+              "body": null,
+              "then": null,
+              "else_": null
+            },
+            {
+              "dialect": "scf",
+              "op": "yield",
+              "args": [],
+              "target_var": null,
+              "attributes": {},
+              "body": null,
+              "then": null,
+              "else_": null
+            }
+          ],
+          "then": null,
+          "else_": null
+        },
+        {
+          "dialect": "scf",
+          "op": "yield",
+          "args": [],
+          "target_var": null,
+          "attributes": {},
+          "body": null,
+          "then": null,
+          "else_": null
+        }
+      ],
+      "then": null,
+      "else_": null
+    },
+    {
+      "dialect": "func",
+      "op": "return",
+      "args": [],
+      "target_var": null,
+      "attributes": {},
+      "body": null,
+      "then": null,
+      "else_": null
+    }
+  ]
+}

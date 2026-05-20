@@ -6,20 +6,22 @@ import subprocess
 import shutil
 import mlir.ir as ir
 from mlir.ir import Context, Module, Location, InsertionPoint, F64Type, FloatAttr, StringAttr, UnitAttr
-from mlir.dialects import arith, func, builtin, memref, scf, math, llvm
-from mlir.passmanager import PassManager
-from component2_smt import verified_generation_loop, VerifiedMLIR
+from mlir.dialects import func, arith, scf, llvm, math
 from neo4j import GraphDatabase
+from component2_smt import VerifiedMLIR, verified_generation_loop
 
+# Milestone 5: Stable Bare-Metal Pipeline
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
 CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache3")
 MANUAL_CACHE_DIR = os.getenv("REPOOS_MANUAL_CACHE_DIR", "./.poly_cache_manual")
 
-LLVM_BIN_DIR = "/Users/yeshr/Applications/Program1/llvm-project/build/bin"
-MLIR_OPT = os.path.join(LLVM_BIN_DIR, "mlir-opt")
-MLIR_TRANSLATE = os.path.join(LLVM_BIN_DIR, "mlir-translate")
-CLANG = "/usr/bin/clang"
+# Compiler Paths
+MLIR_OPT = "/Users/yeshr/Applications/Program1/llvm-project/build/bin/mlir-opt"
+MLIR_TRANSLATE = "/Users/yeshr/Applications/Program1/llvm-project/build/bin/mlir-translate"
+CLANG = "clang"
+
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 def sanitize_fqn(fqn: str):
     for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
@@ -28,130 +30,181 @@ def sanitize_fqn(fqn: str):
             return fqn[idx:].replace('.', '_').replace('-', '_')
     return fqn.replace('.', '_').replace('-', '_')
 
-def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_filepath: str):
-    os.makedirs(os.path.dirname(cache_filepath), exist_ok=True)
-    base_path, _ = os.path.splitext(cache_filepath)
-    mlir_path, opt_mlir_path, ll_path, dylib_path = f"{base_path}.mlir", f"{base_path}_opt.mlir", f"{base_path}.ll", f"{base_path}.dylib"
+def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str):
+    sanitized = verified_mlir_data.function_name
+    mlir_path = os.path.join(CACHE_DIR, f"{sanitized}.mlir")
+    opt_mlir_path = os.path.join(CACHE_DIR, f"{sanitized}_opt.mlir")
+    ll_path = os.path.join(CACHE_DIR, f"{sanitized}.ll")
+    dylib_path = os.path.join(CACHE_DIR, f"{sanitized}.dylib")
 
-    with Context() as ctx:
-        ctx.attach_diagnostic_handler(lambda d: True)
-        with Location.unknown():
-            module = Module.create()
+    with Context() as ctx, Location.unknown():
+        ctx.allow_unregistered_dialects = True
+        module = Module.create()
+        f64 = F64Type.get()
+        i64 = ir.IntegerType.get_signless(64)
+        ptr = llvm.PointerType.get(context=ctx)
+        
+        type_map = {"f64": f64, "i64": i64, "ptr": ptr, "void": None}
+        
+        with InsertionPoint(module.body):
             try:
-                with InsertionPoint(module.body):
-                    f64, i32, i64, index_t, ptr_t = F64Type.get(), ir.IntegerType.get_signless(32), ir.IntegerType.get_signless(64), ir.IndexType.get(), llvm.PointerType.get()
-                    def get_type(t):
-                        t = str(t).lower()
-                        if t == "f64": return f64
-                        if t == "i32": return i32
-                        if t == "i64": return i64
-                        if t == "index": return index_t
-                        if t == "ptr" or t == "llvm.ptr" or t.startswith("memref"): return ptr_t
-                        return None
-                    
-                    input_types = []
-                    if verified_mlir_data.signature.get("return", "f64") != "void":
-                        input_types.append(ptr_t)
-                    
-                    for k,v in verified_mlir_data.signature.items():
-                        if k != "return": input_types.append(get_type(v))
-                    
-                    mlir_func = func.FuncOp(name=verified_mlir_data.function_name, type=builtin.FunctionType.get(inputs=input_types, results=[]))
-                    mlir_func.add_entry_block()
-                    
-                    def process_ops(ops, ip, ssa_map):
-                        with ip:
-                            for op_data in ops:
-                                def resolve(s):
-                                    if not s: return None
-                                    if s in ssa_map: return ssa_map[s]
-                                    if s.startswith("%arg") and s[4:].isdigit(): return mlir_func.entry_block.arguments[int(s[4:]) + 1]
-                                    try: 
-                                        if "." in s: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(s))).result
-                                        return arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(s))).result
-                                    except: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, 0.0)).result
+                # 1. Build Native Function Signature
+                arg_types = []
+                # If function returns a value, the first argument is often used as a result pointer in LLVM lowering
+                # for simple AOT, we follow a convention: return via pointer or standard return
+                # Here we use standard return for scalar and void for everything else (using pointers for res)
+                ret_type_str = verified_mlir_data.signature.get("return", "f64")
+                mlir_ret_type = type_map.get(ret_type_str)
+                
+                for k, v in verified_mlir_data.signature.items():
+                    if k != "return": arg_types.append(type_map.get(v, f64))
+                
+                # If it's a pointer return (like an array), we usually pass the result buffer as an arg
+                # To keep ABI simple for ctypes:
+                func_type = ir.FunctionType.get(arg_types, [mlir_ret_type] if mlir_ret_type else [])
+                mlir_func = func.FuncOp(sanitized, func_type)
+                mlir_func.add_entry_block()
+                mlir_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
-                                def cast_to_i64(val):
-                                    if str(val.type) == "index":
-                                        return arith.IndexCastOp(i64, val).result
-                                    return val
+                def process_ops(ops, ip, ssa_map):
+                    with ip:
+                        for op_data in ops:
+                            def get_attr(obj, name, default=None):
+                                if hasattr(obj, name): return getattr(obj, name)
+                                if isinstance(obj, dict): return obj.get(name, default)
+                                return default
 
-                                res = None
-                                if op_data.dialect == "llvm":
-                                    if op_data.op == "getelementptr":
-                                        # FIX: Cast dynamic indices from 'index' to 'i64' for LLVM compatibility
-                                        raw_indices = [resolve(a) for a in op_data.args[1:]]
-                                        i64_indices = [cast_to_i64(idx) for idx in raw_indices]
-                                        res = llvm.GEPOp(ptr_t, resolve(op_data.args[0]), i64_indices, [-2147483648], f64, 0).result
-                                    elif op_data.op == "load":
-                                        t_str = op_data.attributes.get("type", "f64")
-                                        l_type = f64
-                                        if t_str == "i64": l_type = i64
-                                        elif t_str == "index": l_type = index_t
-                                        res = llvm.LoadOp(l_type, resolve(op_data.args[0])).result
-                                    elif op_data.op == "store":
-                                        v_to_store, p_to_store = resolve(op_data.args[0]), resolve(op_data.args[1])
-                                        if v_to_store and p_to_store: llvm.StoreOp(v_to_store, p_to_store)
-                                        continue
-                                elif op_data.op == "constant":
-                                    t = get_type(op_data.attributes.get("type", "f64"))
-                                    v = op_data.args[0] if op_data.args else op_data.attributes.get("value", "0.0")
-                                    if t == index_t: res = arith.ConstantOp(index_t, ir.IntegerAttr.get(index_t, int(float(v)))).result
-                                    elif t == i64: res = arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(float(v)))).result
+                            def resolve(s):
+                                if not s: return None
+                                if s in ssa_map: return ssa_map[s]
+                                if s.startswith('%'):
+                                    clean = s[1:]
+                                    if clean in ssa_map: return ssa_map[clean]
+                                    if '#' in clean: # Handle multi-result indexing
+                                        base, idx = clean.split('#')
+                                        if base in ssa_map: return ssa_map[s] # Already in map if handled by parent
+                                # Fallback to constant
+                                try: 
+                                    if "." in s: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(s))).result
+                                    return arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(s))).result
+                                except: return arith.ConstantOp(f64, ir.FloatAttr.get(f64, 0.0)).result
+
+                            dialect = get_attr(op_data, "dialect")
+                            op = get_attr(op_data, "op")
+                            args = get_attr(op_data, "args", [])
+                            attributes = get_attr(op_data, "attributes", {})
+                            target_var = get_attr(op_data, "target_var")
+                            body = get_attr(op_data, "body", [])
+
+                            res = None
+                            if dialect == "arith":
+                                if op == "constant":
+                                    v = args[0]
+                                    t = attributes.get("type")
+                                    if t == "index": res = arith.ConstantOp(ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), int(v))).result
+                                    elif t == "i1": res = arith.ConstantOp(ir.IntegerType.get_signless(1), ir.IntegerAttr.get(ir.IntegerType.get_signless(1), int(v))).result
+                                    elif t == "i64" or t == i64: res = arith.ConstantOp(i64, ir.IntegerAttr.get(i64, int(float(v)))).result
                                     else: res = arith.ConstantOp(f64, ir.FloatAttr.get(f64, float(v))).result
-                                elif op_data.op == "addf": res = arith.AddFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "subf": res = arith.SubFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "mulf": res = arith.MulFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "divf": res = arith.DivFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "powf": res = math.PowFOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "addi": res = arith.AddIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "subi": res = arith.SubIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "muli": res = arith.MulIOp(resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "cmpi": 
-                                    pred = op_data.attributes.get("predicate", 0)
-                                    res = arith.CmpIOp(pred, resolve(op_data.args[0]), resolve(op_data.args[1])).result
-                                elif op_data.op == "index_cast":
-                                    # Target type detection
-                                    out_type = ir.IndexType.get() if op_data.attributes.get("type") == "index" else i64
-                                    res = arith.IndexCastOp(out_type, resolve(op_data.args[0])).result
-                                elif op_data.op == "select":
-                                    res = arith.SelectOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2])).result
-                                elif op_data.op == "for":
-                                    ia = [resolve(a) for a in op_data.attributes.get("init_args", [])]
-                                    for_op = scf.ForOp(resolve(op_data.args[0]), resolve(op_data.args[1]), resolve(op_data.args[2]), ia)
+                                elif op == "addf": res = arith.AddFOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "subf": res = arith.SubFOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "mulf": res = arith.MulFOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "divf": res = arith.DivFOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "addi": res = arith.AddIOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "subi": res = arith.SubIOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "muli": res = arith.MulIOp(resolve(args[0]), resolve(args[1])).result
+                                elif op == "cmpi": 
+                                    pred = attributes.get("predicate", 0)
+                                    res = arith.CmpIOp(pred, resolve(args[0]), resolve(args[1])).result
+                                elif op == "index_cast":
+                                    out_type = ir.IndexType.get() if attributes.get("type") == "index" else i64
+                                    res = arith.IndexCastOp(out_type, resolve(args[0])).result
+                                elif op == "select":
+                                    res = arith.SelectOp(resolve(args[0]), resolve(args[1]), resolve(args[2])).result
+                            elif dialect == "math":
+                                if op == "powf": res = math.PowFOp(resolve(args[0]), resolve(args[1])).result
+                            elif dialect == "llvm":
+                                if op == "getelementptr":
+                                    base = resolve(args[0])
+                                    raw_idx = resolve(args[1])
+                                    # LLVM GEP requires signless integer indices, not 'index' type
+                                    if str(raw_idx.type) == "index":
+                                        # Use the current insertion point to add the cast
+                                        idx = arith.IndexCastOp(i64, raw_idx).result
+                                    else:
+                                        idx = raw_idx
+                                    
+                                    # Signature: (res, base, dynamicIndices, rawConstantIndices, elem_type, noWrapFlags)
+                                    raw_consts = [-2147483648]
+                                    et = i64 if attributes.get("type") == "i64" else f64
+                                    res = llvm.GEPOp(ptr, base, [idx], raw_consts, et, llvm.GEPNoWrapFlags.none).result
+                                elif op == "load":
+                                    t = i64 if attributes.get("type") == "i64" else f64
+                                    res = llvm.LoadOp(t, resolve(args[0])).result
+                                elif op == "store":
+                                    llvm.StoreOp(resolve(args[0]), resolve(args[1]))
+                            elif dialect == "scf":
+                                if op == "for":
+                                    ia = [resolve(a) for a in attributes.get("init_args", [])]
+                                    for_op = scf.ForOp(resolve(args[0]), resolve(args[1]), resolve(args[2]), ia)
                                     body_map = ssa_map.copy()
-                                    ba = op_data.attributes.get("body_args", ["%iv"])
+                                    ba = attributes.get("body_args", ["%iv"])
                                     body_map[ba[0]] = for_op.induction_variable
                                     for j in range(1, len(ba)): body_map[ba[j]] = for_op.inner_iter_args[j-1]
-                                    process_ops(op_data.body, InsertionPoint(for_op.body), body_map)
+                                    process_ops(body, InsertionPoint(for_op.body), body_map)
                                     with InsertionPoint(for_op.body):
                                         if not any(isinstance(o.opview, scf.YieldOp) for o in for_op.body.operations):
                                             scf.YieldOp(for_op.inner_iter_args)
-                                    res = for_op.results[0] if for_op.results else None
-                                elif op_data.op == "yield":
-                                    scf.YieldOp([resolve(a) for a in op_data.args if a])
+                                    if for_op.results:
+                                        res = for_op.results[0]
+                                        for k, r in enumerate(for_op.results):
+                                            ssa_map[f"{target_var}#{k}"] = r
+                                    else: res = None
+                                elif op == "if":
+                                    cond = resolve(args[0])
+                                    has_else = "else" in attributes
+                                    res_types = []
+                                    then_ops = attributes.get("then", [])
+                                    for o in then_ops:
+                                        o_op = o.get("op") if isinstance(o, dict) else o.op
+                                        if o_op == "yield":
+                                            y_args = o.get("args") if isinstance(o, dict) else o.args
+                                            res_types = [ir.IndexType.get() for _ in y_args]
+                                    
+                                    if_op = scf.IfOp(cond, res_types, has_else=has_else)
+                                    then_map = ssa_map.copy()
+                                    process_ops(then_ops, InsertionPoint(if_op.then_block), then_map)
+                                    if has_else:
+                                        else_map = ssa_map.copy()
+                                        process_ops(attributes.get("else", []), InsertionPoint(if_op.else_block), else_map)
+                                    
+                                    if if_op.results:
+                                        res = if_op.results[0]
+                                        for k, r in enumerate(if_op.results):
+                                            ssa_map[f"{target_var}#{k}"] = r
+                                    else: res = None
+                                elif op == "yield":
+                                    scf.YieldOp([resolve(a) for a in args if a])
                                     continue
-                                elif op_data.op == "return":
-                                    if op_data.args:
-                                        v_ret = resolve(op_data.args[0])
+                            elif dialect == "func":
+                                if op == "return":
+                                    if args:
+                                        v_ret = resolve(args[0])
                                         if v_ret: llvm.StoreOp(v_ret, mlir_func.entry_block.arguments[0])
                                     func.ReturnOp([])
                                     continue
-                                if op_data.target_var: ssa_map[op_data.target_var] = res
+                            if target_var: ssa_map[target_var] = res
 
-                    main_map = {}
-                    arg_offset = 1 if verified_mlir_data.signature.get("return", "f64") != "void" else 0
-                    for i, (k,v) in enumerate(verified_mlir_data.signature.items()):
-                        if k != "return": 
-                            main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i + arg_offset]
-                    process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
+                main_map = {}
+                for i, (k,v) in enumerate(verified_mlir_data.signature.items()):
+                    if k != "return": 
+                        main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i]
+                process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
 
                 with open(mlir_path, "w") as f: f.write(str(module))
                 pipeline = "builtin.module(convert-scf-to-cf,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
                 subprocess.run([MLIR_OPT, mlir_path, f"-pass-pipeline={pipeline}", "-o", opt_mlir_path], check=True)
                 subprocess.run([MLIR_TRANSLATE, "--mlir-to-llvmir", opt_mlir_path, "-o", ll_path], check=True)
                 
-                # Post-process .ll to remove attributes that older Clang/Apple Clang might not understand
                 with open(ll_path, 'r') as f:
                     ll_content = f.read()
                 ll_content = ll_content.replace("nocreateundeforpoison ", "")
@@ -168,23 +221,38 @@ async def aot_compile_all(module_filter: str = ""):
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
     print(f"\n--- 🚀 Milestone 5: Stable Bare-Metal Pipeline ---")
     with driver.session() as session:
-        query = "MATCH (f:Function)-[:HAS_CHUNK]->(c:Chunk) WHERE f.fqn CONTAINS $mod RETURN c.fqn, c.code, c.inputs"
+        query = """
+        MATCH (f:Function) WHERE f.fqn CONTAINS $mod
+        OPTIONAL MATCH (f)-[:HAS_CHUNK]->(c:Chunk)
+        RETURN f.fqn as f_fqn, f.code as f_code, c.fqn as c_fqn, c.code as c_code, c.inputs as c_inputs
+        """
         results = session.run(query, mod=module_filter)
+        seen_targets = set()
         for record in results:
-            fqn, chunk_code, inputs_json = record["c.fqn"], record["c.code"], record["c.inputs"]
-            sanitized = sanitize_fqn(fqn)
-            print(f"\n[AOT] {fqn} -> {sanitized}...")
+            target_fqn = record["c_fqn"] or f"{record['f_fqn']}.chunk_0"
+            if target_fqn in seen_targets: continue
+            seen_targets.add(target_fqn)
+            
+            chunk_code = record["c_code"] or record["f_code"]
+            input_names = json.loads(record["c_inputs"]) if record["c_inputs"] else []
+            
+            sanitized = sanitize_fqn(target_fqn)
+            print(f"\n[AOT] {target_fqn} -> {sanitized}...")
             base_json_path = os.path.join(MANUAL_CACHE_DIR, f"{sanitized}.json")
+            
             if os.path.exists(base_json_path):
                 print(f"   [STRICT] Using verified manual template: {base_json_path}")
                 with open(base_json_path, 'r') as f: verified_mlir = VerifiedMLIR.model_validate(json.load(f))
             else:
-                input_names = json.loads(inputs_json)
+                if not chunk_code: continue
                 verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, input_names)
+            
             verified_mlir.function_name = sanitized
-            with driver.session() as session:
-                session.run("MATCH (c:Chunk {fqn: $fqn}) SET c.arg_mapping = $mapping, c.signature = $sig, c.sanitized_name = $sn", 
-                            fqn=fqn, mapping=json.dumps(verified_mlir.arg_mapping), sig=json.dumps(verified_mlir.signature), sn=sanitized)
+            if record["c_fqn"]:
+                with driver.session() as session:
+                    session.run("MATCH (c:Chunk {fqn: $fqn}) SET c.arg_mapping = $mapping, c.signature = $sig, c.sanitized_name = $sn", 
+                                fqn=target_fqn, mapping=json.dumps(verified_mlir.arg_mapping), sig=json.dumps(verified_mlir.signature), sn=sanitized)
+            
             build_and_cache_mlir(verified_mlir, os.path.join(CACHE_DIR, f"{sanitized}.json"))
     driver.close()
 

@@ -4,7 +4,21 @@ RepoOS is an AI-driven, formally verified compiler toolchain that bridges Python
 
 ---
 
-## 🛠 Prerequisites & Environment
+## ⚖️ Core Engineering Principles
+
+To ensure RepoOS functions as a truly generic, enterprise-grade acceleration layer, all contributions MUST adhere to these foundational rules:
+
+1.  **Zero Hardcoding:** Never hardcode function-specific checks, names, or specialized logic into core files. RepoOS must remain agnostic of the target codebase. All algorithm-specific behavior (e.g., scaling, normalization) must be driven by generic metadata (`config` field in `VerifiedMLIR`).
+2.  **Universal Applicability:** Rule #1 applies to all core components (1 thru 9), `manual_compiler.py`, and the Orchestrator. Logic must be designed to handle arbitrary codebases and functions.
+3.  **Mandatory Triple-Verification:** Once a benchmark or test completes successfully, you MUST triple-check that the RepoOS bare-metal kernel was actually executed. 
+    *   **Audit logs:** Ensure "Invoking Bare-Metal Kernel" appears in the output.
+    *   **Fallback Detection:** Verify the system did not silently fallback to native Python, which can lead to "false positive" mathematical matches but zero real-world speedup.
+    *   **Side-by-Side Validation:** Always use independent scripts (like `verify_side_by_side.py`) to confirm exact mathematical parity.
+
+---
+
+## 🛠 Prerequisites
+ & Environment
 
 All commands must be run from the project root: `/Users/yeshr/Applications/Program1` using the specialized build environment.
 

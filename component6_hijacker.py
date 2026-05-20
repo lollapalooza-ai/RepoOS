@@ -27,9 +27,16 @@ class PolyKernelLoader(Loader):
         process_file(self.file_path, forced_module_name=module.__name__)
 
         # 2. Execute the module to get the objects
-        with open(self.file_path, 'r', encoding='utf-8') as f:
-            code = compile(f.read(), self.file_path, 'exec')
-            exec(code, module.__dict__)
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                code = compile(f.read(), self.file_path, 'exec')
+                exec(code, module.__dict__)
+        except KeyError as e:
+            # Handle libraries that perform strict one-time registration in global registries
+            if "already exists" in str(e):
+                pass
+            else:
+                raise e
 
         # 3. UPGRADED: Class-Level Hijacking
         func_count = 0

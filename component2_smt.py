@@ -54,6 +54,9 @@ class MLIROperation(BaseModel):
     def validate_args_flatness(cls, v: List[str]) -> List[str]:
         for arg in v:
             arg_str = str(arg)
+            # Allow negative numbers (starts with - and followed by digits/dots)
+            if arg_str.startswith('-') and all(c.isdigit() or c == '.' for c in arg_str[1:]):
+                continue
             if any(op in arg_str for op in ["*", "/", "+", "-"]):
                 if 'e' in arg_str.lower() and all(c.isdigit() or c in ".e-+" for c in arg_str.lower()):
                     continue
@@ -67,6 +70,7 @@ class VerifiedMLIR(BaseModel):
     signature: Dict[str, str] = Field(default_factory=lambda: {"arg0": "f64"}, description="Arg names to types.")
     arg_mapping: List[List[str]] = Field(default_factory=list, description="Maps arg1, arg2... to nested Python paths like ['user', 'is_vip'].")
     return_type: str = Field("f64", description="Return type")
+    config: Dict[str, Any] = Field(default_factory=dict, description="Algorithm-specific tuning/metadata.")
     memory_allocations: List[MemoryAllocation] = Field(default_factory=list)
     operations: List[MLIROperation] = Field(..., description="Execution Graph.")
 

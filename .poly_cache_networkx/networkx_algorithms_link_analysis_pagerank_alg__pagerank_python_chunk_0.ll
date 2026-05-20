@@ -64,6 +64,11 @@ define void @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chu
   ret void
 }
 
+define void @_mlir_ciface_networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, i64 %6, double %7) {
+  call void @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, i64 %6, double %7)
+  ret void
+}
+
 !llvm.module.flags = !{!0}
 
 !0 = !{i32 2, !"Debug Info Version", i32 3}
