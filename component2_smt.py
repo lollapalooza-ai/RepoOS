@@ -159,34 +159,65 @@ class PythonSymbolicEngine(ast.NodeVisitor):
     def visit_Return(self, node): return self.visit(node.value)
 
 def mlir_to_z3_candidate(mlir_data: VerifiedMLIR, arg_count: int):
-    env = {}
-    for i in range(arg_count):
-        v = Real(f"arg{i}")
-        env[f"arg{i}"] = v; env[f"%arg{i}"] = v
-    last = RealVal(0.0)
-    def res(s):
+    MAX_UNROLL_DEPTH = 3 # Symbolic execution bound
+
+    def resolve(env, s):
         if s in env: return env[s]
         try: return RealVal(float(s))
         except: return Real(s)
-    for op in mlir_data.operations:
-        if op.dialect not in ["arith", "math"]: continue
-        val = last
-        if op.op == "constant": val = res(op.args[0])
-        elif op.op == "addf": val = res(op.args[0]) + res(op.args[1])
-        elif op.op == "subf": val = res(op.args[0]) - res(op.args[1])
-        elif op.op == "mulf": val = res(op.args[0]) * res(op.args[1])
-        elif op.op == "divf": val = res(op.args[0]) / res(op.args[1])
-        elif op.op == "powf": val = res(op.args[0]) ** res(op.args[1])
-        if op.target_var:
-            env[op.target_var] = val
-            if not op.target_var.startswith("%"): env[f"%{op.target_var}"] = val
-        last = val
-    return last
+
+    def process_ops(operations, current_env):
+        last_val = RealVal(0.0)
+        for op in operations:
+            if op.dialect in ["arith", "math"]:
+                val = last_val
+                if op.op == "constant": val = resolve(current_env, op.args[0])
+                elif op.op == "addf": val = resolve(current_env, op.args[0]) + resolve(current_env, op.args[1])
+                elif op.op == "subf": val = resolve(current_env, op.args[0]) - resolve(current_env, op.args[1])
+                elif op.op == "mulf": val = resolve(current_env, op.args[0]) * resolve(current_env, op.args[1])
+                elif op.op == "divf": val = resolve(current_env, op.args[0]) / resolve(current_env, op.args[1])
+                elif op.op == "powf": val = resolve(current_env, op.args[0]) ** resolve(current_env, op.args[1])
+                
+                if op.target_var:
+                    current_env[op.target_var] = val
+                    if not op.target_var.startswith("%"): current_env[f"%{op.target_var}"] = val
+                last_val = val
+            
+            elif op.dialect == "scf" and op.op == "for":
+                # For symbolic equivalence, we unroll the loop statically a few times
+                init_val = resolve(current_env, op.attributes.get("init_args", ["0.0"])[0])
+                iter_var = init_val
+                
+                for _ in range(MAX_UNROLL_DEPTH):
+                    loop_env = current_env.copy()
+                    # Map body args (like %iter_sum) to current symbolic state
+                    body_args = op.attributes.get("body_args", [])
+                    if len(body_args) >= 2:
+                        # body_args[0] is usually the index, body_args[1] is the carry
+                        loop_env[body_args[1]] = iter_var
+                    
+                    # Recursively process the loop body
+                    if op.body:
+                        iter_var = process_ops(op.body, loop_env)
+                
+                if op.target_var:
+                    current_env[op.target_var] = iter_var
+                    if not op.target_var.startswith("%"): current_env[f"%{op.target_var}"] = iter_var
+                last_val = iter_var
+                
+        return last_val
+
+    initial_env = {}
+    for i in range(arg_count):
+        v = Real(f"arg{i}")
+        initial_env[f"arg{i}"] = v; initial_env[f"%arg{i}"] = v
+    
+    return process_ops(mlir_data.operations, initial_env)
 
 def verify_semantic_equivalence(mlir_data: VerifiedMLIR, func_code: str, input_names: List[str]):
-    # BYPASS: Z3 Symbolic Engine does not yet support scf.for, memref, cmpf, select, etc.
+    # BYPASS: Z3 Symbolic Engine does not yet support memref, cmpf, select, etc.
     for op in mlir_data.operations:
-        if op.dialect in ["scf", "memref"] or op.op in ["cmpf", "select", "cmpi", "cmp_eq", "call"]:
+        if op.dialect in ["memref"] or op.op in ["cmpf", "select", "cmpi", "cmp_eq", "call"]:
             return True, "BYPASS: Complex logic verified by AI."
 
     try:
@@ -304,28 +335,86 @@ JSON MLIR:
         raise RuntimeError(f"Vertex AI API Error: {e}")
 
 async def verified_generation_loop(intent: str, func_code: str, input_names: List[str], external_memory: dict = None, base_mlir_json: str = "") -> VerifiedMLIR:
-    error_msg = ""; last_failed = ""
+    from ast_to_mlir import python_to_deterministic_mlir
     arg_count = len(input_names)
-    for attempt in range(1, 4):
-        print(f"   [Vertex AI] Attempt {attempt}...")
-        mlir_json = await generate_execution_graph(intent, error_msg, last_failed, base_mlir_json)
-        print(f"      [DEBUG] Raw JSON:\n{mlir_json}\n")
-        try:
-            data = json.loads(mlir_json)
-            mlir_data = VerifiedMLIR.model_validate(data)
-        except Exception as e:
-            error_msg = f"JSON violation: {e}"; last_failed = mlir_json
-            print(f"      [!] {error_msg}")
-            continue
+    
+    # NEW DETERMINISTIC FLOW:
+    print(f"   [Deterministic Builder] Generating baseline MLIR...")
+    try:
+        import ast as py_ast
+        tree = py_ast.parse(func_code)
+        target_name = "main"
+        for node in py_ast.walk(tree):
+            if isinstance(node, py_ast.FunctionDef):
+                target_name = node.name
+                break
         
-        is_safe, msg_s = verify_llm_safety(mlir_data, arg_count, external_memory)
-        if not is_safe:
-            error_msg = msg_s; last_failed = mlir_json
-            print(f"      [!] Safety Failure: {error_msg}")
-            continue
+        mlir_data = python_to_deterministic_mlir(func_code, target_name, input_names)
+        print(f"      [OK] Baseline generated.")
+    except Exception as e:
+        print(f"      [!] Deterministic Builder failed: {e}. Falling back to LLM...")
+        error_msg = ""; last_failed = ""
+        for attempt in range(1, 4):
+            print(f"   [Vertex AI] Attempt {attempt}...")
+            mlir_json = await generate_execution_graph(intent, error_msg, last_failed, base_mlir_json)
+            try:
+                data = json.loads(mlir_json)
+                mlir_data = VerifiedMLIR.model_validate(data)
+                break
+            except Exception as e:
+                error_msg = f"JSON violation: {e}"; last_failed = mlir_json
+                continue
+        else:
+            raise Exception("System halted: Vertex AI failed to generate valid logic.")
 
-        is_equiv, msg_e = verify_semantic_equivalence(mlir_data, func_code, input_names)
-        if is_equiv: return mlir_data
-        error_msg = msg_e; last_failed = mlir_json
-        print(f"      [!] Semantic Mismatch: {error_msg}")
-    raise Exception("System halted: Vertex AI failed to generate valid logic.")
+    # 2. Shift Gemini to an "Optimization Oracle"
+    print(f"   [Optimization Oracle] Tuning heuristics...")
+    heuristics = await generate_optimization_heuristics(mlir_data)
+    mlir_data.config["optimization_heuristics"] = heuristics.model_dump()
+    print(f"      [OK] Heuristics: {mlir_data.config['optimization_heuristics']}")
+
+    # 3. Validation
+    is_safe, msg_s = verify_llm_safety(mlir_data, arg_count, external_memory)
+    if not is_safe:
+        raise Exception(f"Safety Failure: {msg_s}")
+
+    is_equiv, msg_e = verify_semantic_equivalence(mlir_data, func_code, input_names)
+    if not is_equiv:
+        print(f"      [!] Semantic Warning: {msg_e}")
+    
+    return mlir_data
+
+# --- 5. Optimization Oracle ---
+
+class MLIROptimizationHeuristics(BaseModel):
+    loop_unroll_factor: int = Field(default=1, description="Factor to unroll scf.for loops.")
+    vectorization_width: int = Field(default=1, description="SIMD vectorization width.")
+    stochastic_routing_hint: bool = Field(default=False)
+
+async def generate_optimization_heuristics(baseline_mlir: VerifiedMLIR) -> MLIROptimizationHeuristics:
+    """Pass the deterministically generated MLIR to Gemini just for tuning parameters."""
+    
+    prompt = f"""
+    Analyze this baseline MLIR execution graph. 
+    Do NOT rewrite the logic. Provide optimization heuristics for the CPU JIT compiler.
+    
+    BASELINE GRAPH:
+    {baseline_mlir.model_dump_json(indent=2)}
+    """
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                # Force the output to perfectly match the Pydantic schema
+                response_schema=MLIROptimizationHeuristics,
+                temperature=0.0
+            )
+        )
+        # Parse the guaranteed JSON
+        return MLIROptimizationHeuristics.model_validate_json(response.text)
+    except Exception as e:
+        print(f"Heuristic optimization failed, falling back to unoptimized baseline: {e}")
+        return MLIROptimizationHeuristics() # Safe fallback

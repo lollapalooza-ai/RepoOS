@@ -2,6 +2,7 @@ import sys
 import os
 import ast
 import json
+from ast_to_mlir import DeterministicMLIRBuilder # <-- NEW
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 from neo4j import GraphDatabase
@@ -24,13 +25,32 @@ class PureLogicChunker(ast.NodeVisitor):
         self.local_vars = set()
 
     def _flush_chunk(self):
-        """Saves the current pure block and resets."""
+        """Saves the current pure block, lowers it to MLIR, and resets."""
         if self.current_chunk:
             code = "\n".join([ast.unparse(n) for n in self.current_chunk])
+            inputs = list(self.inputs - self.local_vars)
+            outputs = list(self.outputs)
+            
+            # --- NEW: Deterministic Lowering ---
+            try:
+                # Wrap the chunk in a dummy function AST to process it
+                chunk_ast = ast.parse(code)
+                builder = DeterministicMLIRBuilder(function_name="chunk", args=inputs)
+                builder.visit(chunk_ast)
+                
+                # Use the builder's build() method to get a VerifiedMLIR object
+                verified_mlir = builder.build(chunk_ast)
+                baseline_mlir_json = verified_mlir.model_dump_json()
+            except Exception as e:
+                print(f"Warning: Deterministic lowering failed for chunk, storing empty baseline. Error: {e}")
+                baseline_mlir_json = "{}"
+            # -----------------------------------
+
             self.chunks.append({
                 "code": code,
-                "inputs": list(self.inputs - self.local_vars),
-                "outputs": list(self.outputs)
+                "inputs": inputs,
+                "outputs": outputs,
+                "baseline_mlir": baseline_mlir_json # <-- NEW payload
             })
             self.current_chunk = []
             self.inputs = set()
@@ -213,11 +233,17 @@ def process_file(file_path, forced_module_name=None):
                                 session.run("""
                                     MATCH (f:Function {fqn: $parent_fqn})
                                     MERGE (ch:Chunk {fqn: $chunk_fqn})
-                                    SET ch.code = $code, ch.inputs = $inputs, ch.outputs = $outputs, ch.index = $index
+                                    SET ch.code = $code, 
+                                        ch.inputs = $inputs, 
+                                        ch.outputs = $outputs, 
+                                        ch.index = $index,
+                                        ch.baseline_mlir = $baseline_mlir
                                     MERGE (f)-[:HAS_CHUNK]->(ch)
                                 """, parent_fqn=method_fqn, chunk_fqn=chunk_fqn, code=chunk_data["code"], 
                                      inputs=json.dumps(chunk_data["inputs"]), 
-                                     outputs=json.dumps(chunk_data["outputs"]), index=i)
+                                     outputs=json.dumps(chunk_data["outputs"]), 
+                                     index=i,
+                                     baseline_mlir=chunk_data["baseline_mlir"])
 
                     elif child.type == "block":
                         find_methods(child)
@@ -265,11 +291,17 @@ def process_file(file_path, forced_module_name=None):
                 session.run("""
                     MATCH (f:Function {fqn: $parent_fqn})
                     MERGE (ch:Chunk {fqn: $chunk_fqn})
-                    SET ch.code = $code, ch.inputs = $inputs, ch.outputs = $outputs, ch.index = $index
+                    SET ch.code = $code, 
+                        ch.inputs = $inputs, 
+                        ch.outputs = $outputs, 
+                        ch.index = $index,
+                        ch.baseline_mlir = $baseline_mlir
                     MERGE (f)-[:HAS_CHUNK]->(ch)
                 """, parent_fqn=fqn, chunk_fqn=chunk_fqn, code=chunk_data["code"], 
                      inputs=json.dumps(chunk_data["inputs"]), 
-                     outputs=json.dumps(chunk_data["outputs"]), index=i)
+                     outputs=json.dumps(chunk_data["outputs"]), 
+                     index=i,
+                     baseline_mlir=chunk_data["baseline_mlir"])
 
     print(f"✅ Ingested: {file_path}")
 

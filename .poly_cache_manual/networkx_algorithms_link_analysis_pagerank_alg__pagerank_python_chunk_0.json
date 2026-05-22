@@ -14,7 +14,31 @@
   },
   "arg_mapping": [],
   "return_type": "f64",
-  "config": {},
+  "config": {
+    "result_buffer": "res_ptr",
+    "stochastic": true,
+    "structural_mapping": {
+      "row_ptrs": "row_ptrs",
+      "col_idx": "col_idx",
+      "weights": "weights",
+      "num_nodes": "num_nodes"
+    },
+    "element_types": {
+      "row_ptrs": "i64",
+      "col_idx": "i64"
+    },
+    "fallbacks": {
+      "p_ptr": "personalization"
+    },
+    "normalize_buffers": {
+      "p_ptr": true,
+      "xlast_ptr": true
+    },
+    "init": {
+      "p_ptr": "1/N",
+      "xlast_ptr": "1/N"
+    }
+  },
   "memory_allocations": [],
   "operations": [
     {

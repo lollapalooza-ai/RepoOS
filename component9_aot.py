@@ -8,7 +8,8 @@ import mlir.ir as ir
 from mlir.ir import Context, Module, Location, InsertionPoint, F64Type, FloatAttr, StringAttr, UnitAttr
 from mlir.dialects import func, arith, scf, llvm, math
 from neo4j import GraphDatabase
-from component2_smt import VerifiedMLIR, verified_generation_loop
+from component2_smt import VerifiedMLIR, verified_generation_loop, generate_optimization_heuristics, verify_llm_safety
+from compiler_passes import apply_compiler_heuristics
 
 # Milestone 5: Stable Bare-Metal Pipeline
 NEO4J_URI = "bolt://localhost:7687"
@@ -50,23 +51,20 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
             try:
                 # 1. Build Native Function Signature
                 arg_types = []
-                # If function returns a value, the first argument is often used as a result pointer in LLVM lowering
-                # for simple AOT, we follow a convention: return via pointer or standard return
-                # Here we use standard return for scalar and void for everything else (using pointers for res)
                 ret_type_str = verified_mlir_data.signature.get("return", "f64")
                 mlir_ret_type = type_map.get(ret_type_str)
                 
                 for k, v in verified_mlir_data.signature.items():
                     if k != "return": arg_types.append(type_map.get(v, f64))
-                
-                # If it's a pointer return (like an array), we usually pass the result buffer as an arg
-                # To keep ABI simple for ctypes:
+
                 func_type = ir.FunctionType.get(arg_types, [mlir_ret_type] if mlir_ret_type else [])
                 mlir_func = func.FuncOp(sanitized, func_type)
                 mlir_func.add_entry_block()
-                mlir_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+                # REMOVED: llvm.emit_c_interface (Avoids descriptor structs)
+
 
                 def process_ops(ops, ip, ssa_map):
+                    if ops is None: return
                     with ip:
                         for op_data in ops:
                             def get_attr(obj, name, default=None):
@@ -122,9 +120,46 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                     res = arith.SelectOp(resolve(args[0]), resolve(args[1]), resolve(args[2])).result
                             elif dialect == "math":
                                 if op == "powf": res = math.PowFOp(resolve(args[0]), resolve(args[1])).result
+                            elif dialect == "memref":
+                                if op == "load":
+                                    # memref.load args: [base, index]
+                                    base = resolve(args[0])
+                                    idx = resolve(args[1])
+                                    if str(idx.type) == "index":
+                                        idx = arith.IndexCastOp(i64, idx).result
+                                    raw_consts = [-2147483648]
+                                    gep = llvm.GEPOp(ptr, base, [idx], raw_consts, f64, llvm.GEPNoWrapFlags.none).result
+                                    res = llvm.LoadOp(f64, gep).result
+                                elif op == "store":
+                                    # memref.store args: [value, base, index]
+                                    val = resolve(args[0])
+                                    base = resolve(args[1])
+                                    idx = resolve(args[2])
+                                    if str(idx.type) == "index":
+                                        idx = arith.IndexCastOp(i64, idx).result
+                                    raw_consts = [-2147483648]
+                                    gep = llvm.GEPOp(ptr, base, [idx], raw_consts, f64, llvm.GEPNoWrapFlags.none).result
+                                    llvm.StoreOp(val, gep)
                             elif dialect == "llvm":
                                 if op == "getelementptr":
-                                    base = resolve(args[0])
+                                    raw_base = resolve(args[0])
+                                    # --- ABI BRIDGE: Extract Raw Pointer from MemRef ---
+                                    if str(raw_base.type).startswith("memref"):
+                                        # Extract aligned pointer as index
+                                        idx_ptr = ir.IndexType.get()
+                                        raw_ptr_idx = ir.Operation.create(
+                                            "memref.extract_aligned_pointer_as_index",
+                                            results=[idx_ptr],
+                                            operands=[raw_base]
+                                        ).result
+                                        # Cast index to i64 (pointer address)
+                                        base_i64 = arith.IndexCastOp(i64, raw_ptr_idx).result
+                                        # Cast i64 to llvm.ptr
+                                        base = llvm.IntToPtrOp(ptr, base_i64).result
+                                    else:
+                                        base = raw_base
+                                    # --------------------------------------------------
+                                    
                                     raw_idx = resolve(args[1])
                                     # LLVM GEP requires signless integer indices, not 'index' type
                                     if str(raw_idx.type) == "index":
@@ -201,7 +236,8 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                 process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
 
                 with open(mlir_path, "w") as f: f.write(str(module))
-                pipeline = "builtin.module(convert-scf-to-cf,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
+                pipeline = "builtin.module(convert-scf-to-cf,expand-strided-metadata,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},finalize-memref-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
+
                 subprocess.run([MLIR_OPT, mlir_path, f"-pass-pipeline={pipeline}", "-o", opt_mlir_path], check=True)
                 subprocess.run([MLIR_TRANSLATE, "--mlir-to-llvmir", opt_mlir_path, "-o", ll_path], check=True)
                 
@@ -213,6 +249,10 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
 
                 subprocess.run([CLANG, "-shared", "-O3", ll_path, "-o", dylib_path, "-lm"], check=True)
                 print(f"   [OK] Compiled: {dylib_path}")
+                
+                # Save the JSON metadata to cache so Orchestrator can load it
+                with open(cache_json_path, 'w') as f:
+                    f.write(verified_mlir_data.model_dump_json())
             except Exception as e: print(f"   [ERROR] build failed: {e}")
 
 async def aot_compile_all(module_filter: str = ""):
@@ -224,7 +264,7 @@ async def aot_compile_all(module_filter: str = ""):
         query = """
         MATCH (f:Function) WHERE f.fqn CONTAINS $mod
         OPTIONAL MATCH (f)-[:HAS_CHUNK]->(c:Chunk)
-        RETURN f.fqn as f_fqn, f.code as f_code, c.fqn as c_fqn, c.code as c_code, c.inputs as c_inputs
+        RETURN f.fqn as f_fqn, f.code as f_code, c.fqn as c_fqn, c.code as c_code, c.inputs as c_inputs, c.baseline_mlir as baseline_mlir
         """
         results = session.run(query, mod=module_filter)
         seen_targets = set()
@@ -244,8 +284,31 @@ async def aot_compile_all(module_filter: str = ""):
                 print(f"   [STRICT] Using verified manual template: {base_json_path}")
                 with open(base_json_path, 'r') as f: verified_mlir = VerifiedMLIR.model_validate(json.load(f))
             else:
-                if not chunk_code: continue
-                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, input_names)
+                # --- NEW PIPELINE ---
+                baseline_mlir_raw = record["baseline_mlir"]
+                if not baseline_mlir_raw or baseline_mlir_raw == "{}":
+                    print(f"   [!] Skipping {target_fqn}: No deterministic baseline found.")
+                    continue
+                    
+                baseline_mlir = VerifiedMLIR.model_validate_json(baseline_mlir_raw)
+                
+                # 1. Get Heuristics from Gemini
+                heuristics = await generate_optimization_heuristics(baseline_mlir)
+                
+                # 2. Deterministically Apply Heuristics
+                optimized_mlir = apply_compiler_heuristics(baseline_mlir, heuristics)
+                
+                # 3. Z3 Safety Guard (Verify the *optimized* graph)
+                arg_count = len(input_names)
+                is_safe, msg_s = verify_llm_safety(optimized_mlir, arg_count, None)
+                
+                if not is_safe:
+                    print(f"   [!] Optimization unsafe ({msg_s}). Falling back to baseline.")
+                    verified_mlir = baseline_mlir
+                else:
+                    print(f"   [OK] Optimization verified safe.")
+                    verified_mlir = optimized_mlir
+                # --------------------
             
             verified_mlir.function_name = sanitized
             if record["c_fqn"]:

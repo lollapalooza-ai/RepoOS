@@ -1,14 +1,18 @@
 import time
 import sys
 import os
+import json
 import networkx as nx
 import numpy as np
 import ctypes
 import psutil
+from neo4j import GraphDatabase
 from rich.console import Console
 from rich.table import Table
 
 # --- 1. BOOTSTRAP ENVIRONMENT ---
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "password")
 PROJECT_ROOT = "/Users/yeshr/Applications/Program1"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -51,6 +55,31 @@ def setup_pagerank_kernel():
             "return": "void"
         },
         arg_mapping=[],
+        config={
+            "result_buffer": "res_ptr",
+            "stochastic": True,
+            "structural_mapping": {
+                "row_ptrs": "row_ptrs",
+                "col_idx": "col_idx",
+                "weights": "weights",
+                "num_nodes": "num_nodes"
+            },
+            "element_types": {
+                "row_ptrs": "i64",
+                "col_idx": "i64"
+            },
+            "fallbacks": {
+                "p_ptr": "personalization"
+            },
+            "normalize_buffers": {
+                "p_ptr": True,
+                "xlast_ptr": True
+            },
+            "init": {
+                "p_ptr": "1/N",
+                "xlast_ptr": "1/N"
+            }
+        },
         operations=[
             # Constants
             MLIROperation(dialect="arith", op="constant", args=["0"], target_var="%c0", attributes={"type": "index"}),
@@ -127,6 +156,18 @@ def setup_pagerank_kernel():
             MLIROperation(dialect="func", op="return", args=[])
         ]
     )
+    # Inject into Neo4j as baseline_mlir
+    driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
+    with driver.session() as session:
+        session.run("""
+            MERGE (f:Function {fqn: $func_fqn})
+            MERGE (c:Chunk {fqn: $chunk_fqn})
+            SET c.baseline_mlir = $baseline,
+                c.inputs = $inputs
+            MERGE (f)-[:HAS_CHUNK]->(c)
+        """, func_fqn=fqn, chunk_fqn=chunk_fqn, baseline=mlir.model_dump_json(), inputs=json.dumps(["res_ptr", "row_ptrs", "col_idx", "weights", "xlast_ptr", "p_ptr", "num_nodes", "alpha"]))
+    driver.close()
+    console.print(f"✅ Injected baseline MLIR for {chunk_fqn} into Neo4j.")
     create_manual_template(chunk_fqn, mlir)
 
 def run_pagerank_benchmark():
@@ -137,6 +178,9 @@ def run_pagerank_benchmark():
     import asyncio
     asyncio.run(aot_compile_all("networkx.algorithms.link_analysis.pagerank_alg._pagerank_python"))
     
+    # Refresh registry after AOT compilation
+    orchestrator.register_lazy_function("_pagerank_python", original_py_pagerank, fqn)
+
     start_wait = time.time()
     while fqn not in orchestrator.registry and time.time() - start_wait < 5:
         time.sleep(0.1)

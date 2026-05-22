@@ -1,5 +1,5 @@
 module {
-  func.func @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: i64, %arg7: f64) attributes {llvm.emit_c_interface} {
+  func.func @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: i64, %arg7: f64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %cst = arith.constant 0.000000e+00 : f64

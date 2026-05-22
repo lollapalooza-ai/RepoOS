@@ -122,6 +122,7 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 
 | Component | Name | Responsibility |
 | :--- | :--- | :--- |
+| **ast_to_mlir** | Builder | Deterministic AST-to-MLIR Visitor |
 | **Component 1** | Ingester | AST Parsing (tree-sitter) & Neo4j Storage |
 | **Component 2** | SMT/AI | Python-to-MLIR translation & Z3 Formal Verification |
 | **Component 4** | JIT/Loader | High-stability AOT Kernel Loader (ctypes Bridge) |

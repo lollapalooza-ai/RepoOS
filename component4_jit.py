@@ -1,5 +1,25 @@
 import ctypes
 import os
+import numpy as np
+
+# --- 1. ABI-compliant MLIR MemRef Struct for 1D arrays ---
+class MemRef1D_f64(ctypes.Structure):
+    _fields_ = [
+        ("allocatedPtr", ctypes.POINTER(ctypes.c_double)),
+        ("alignedPtr", ctypes.POINTER(ctypes.c_double)),
+        ("offset", ctypes.c_longlong),
+        ("sizes", ctypes.c_longlong * 1),
+        ("strides", ctypes.c_longlong * 1),
+    ]
+
+class MemRef1D_i64(ctypes.Structure):
+    _fields_ = [
+        ("allocatedPtr", ctypes.POINTER(ctypes.c_longlong)),
+        ("alignedPtr", ctypes.POINTER(ctypes.c_longlong)),
+        ("offset", ctypes.c_longlong),
+        ("sizes", ctypes.c_longlong * 1),
+        ("strides", ctypes.c_longlong * 1),
+    ]
 
 # Milestone 5: High-Stability AOT Kernel Loader
 # Bypasses MLIR ExecutionEngine entirely to use Native Shared Libraries (.dylib)
@@ -24,35 +44,44 @@ class PolyKernelMLIRJIT:
         ciface_name = f"_mlir_ciface_{func_name}"
         try:
             func_ptr = getattr(lib, ciface_name)
+            use_ciface = True
         except AttributeError:
             func_ptr = getattr(lib, func_name)
+            use_ciface = False
             
         def execution_wrapper(*args):
-            # Define ABI ONCE
+            final_args = []
+            
+            for arg in args:
+                if hasattr(arg, '_type_') and issubclass(type(arg), ctypes.Array):
+                    # For Bare Pointer ABI, we pass the raw pointer to the first element
+                    final_args.append(ctypes.cast(arg, ctypes.POINTER(arg._type_)))
+                else:
+                    final_args.append(arg)
+
             if func_ptr.argtypes is None:
                 arg_types = []
-                if return_type != "void":
-                    arg_types.append(ctypes.POINTER(ctypes.c_double))
-                
-                for arg in args:
-                    if isinstance(arg, int):
+                for a in final_args:
+                    if isinstance(a, ctypes._Pointer):
                         arg_types.append(ctypes.c_void_p)
-                    elif isinstance(arg, float):
+                    elif isinstance(a, float):
                         arg_types.append(ctypes.c_double)
+                    elif isinstance(a, int):
+                        arg_types.append(ctypes.c_longlong)
                     else:
-                        arg_types.append(type(arg))
+                        arg_types.append(type(a))
                 func_ptr.argtypes = arg_types
                 func_ptr.restype = None 
-            
+
             if return_type == "void":
-                func_ptr(*args)
+                func_ptr(*final_args)
                 return None
             
-            # 1. Prepare result buffer
+            # Prepare result buffer
+            # Conv: Result is first argument if void return was used in signature but logic returns scalar
+            # Our current component9 manual lowering handles return via result pointer
             result = ctypes.c_double(0.0)
-            
-            # 2. Execute
-            func_ptr(ctypes.pointer(result), *args)
+            func_ptr(ctypes.pointer(result), *final_args)
             return result.value
 
         return execution_wrapper

@@ -6,7 +6,7 @@ import inspect
 import json
 import threading
 from neo4j import GraphDatabase
-from component2_smt import verified_generation_loop
+from component2_smt import verified_generation_loop, VerifiedMLIR
 from component4_jit import PolyKernelMLIRJIT
 
 # Milestone 5: Standardizing Local Workspace Environment
@@ -131,38 +131,55 @@ class LazyCallManager:
                         for arg_name, arg_type in sig.items():
                             if arg_name == "return": continue
                             
-                            # A. Structural Mapping
-                            if arg_name == "row_ptrs": kernel_args.append(ctypes.cast(row_ptrs, ctypes.c_void_p).value)
-                            elif arg_name == "col_idx": kernel_args.append(ctypes.cast(col_idx, ctypes.c_void_p).value)
-                            elif arg_name == "weights": kernel_args.append(ctypes.cast(weights, ctypes.c_void_p).value)
-                            elif arg_name == "num_nodes": kernel_args.append(num_nodes)
-                            elif arg_name == "num_edges": kernel_args.append(num_edges)
-                            
-                            # B. Dynamic Buffer Mapping
-                            elif arg_name.endswith("_ptr") or arg_name.endswith("_buf"):
+                            # 1. Structural Mapping (CSR/Graph) via Config Hints
+                            struct_map = meta.get("config", {}).get("structural_mapping", {})
+                            if arg_name in struct_map:
+                                val_type = struct_map[arg_name]
+                                if val_type == "row_ptrs": kernel_args.append(ctypes.cast(row_ptrs, ctypes.c_void_p).value)
+                                elif val_type == "col_idx": kernel_args.append(ctypes.cast(col_idx, ctypes.c_void_p).value)
+                                elif val_type == "weights": kernel_args.append(ctypes.cast(weights, ctypes.c_void_p).value)
+                                elif val_type == "num_nodes": kernel_args.append(num_nodes)
+                                elif val_type == "num_edges": kernel_args.append(num_edges)
+                                continue
+
+                            # 2. Dynamic Buffer Mapping
+                            if arg_name.endswith("_ptr") or arg_name.endswith("_buf"):
                                 py_key = arg_name.replace("_ptr", "").replace("_buf", "")
                                 py_val = bound.arguments.get(py_key)
                                 
+                                # Generic Metadata-Driven Fallback
+                                if py_val is None:
+                                    fallback_key = meta.get("config", {}).get("fallbacks", {}).get(arg_name)
+                                    if fallback_key: py_val = bound.arguments.get(fallback_key)
+                                
                                 if py_val is not None and isinstance(py_val, dict):
                                     buf = (ctypes.c_double * num_nodes)()
+                                    # Config-driven normalization
                                     total = sum(py_val.values()) if py_val else 1.0
                                     if total == 0: total = 1.0
+                                    
+                                    needs_normalization = meta.get("config", {}).get("normalize_buffers", {}).get(arg_name, False)
+                                    
                                     for node, val in py_val.items():
-                                        if node in node_map: buf[node_map[node]] = val / total
-                                    kernel_args.append(ctypes.cast(buf, ctypes.c_void_p).value)
+                                        if node in node_map: 
+                                            buf[node_map[node]] = val / total if needs_normalization else val
+                                    kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctypes.c_double)))
                                     allocations[arg_name] = buf
                                 else:
                                     # Default Generic Buffer (Zero-initialized)
                                     ctype = ctypes.c_double if arg_type == "ptr" else ctypes.c_int64
                                     buf = (ctype * num_nodes)()
-                                    init_val = meta.get("config", {}).get("init", {}).get(arg_name)
-                                    if init_val == "1/N":
+                                    
+                                    # Generic Initialization Strategy (e.g. "1/N")
+                                    init_type = meta.get("config", {}).get("init", {}).get(arg_name)
+                                    if init_type == "1/N":
                                         dv = 1.0 / num_nodes if num_nodes > 0 else 0.0
                                         for i in range(num_nodes): buf[i] = dv
-                                    kernel_args.append(ctypes.cast(buf, ctypes.c_void_p).value)
+                                        
+                                    kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctype)))
                                     allocations[arg_name] = buf
                             
-                            # C. Direct Value Mapping
+                            # 3. Direct Value Mapping
                             elif arg_name in bound.arguments:
                                 val = bound.arguments[arg_name]
                                 if arg_type == "f64": kernel_args.append(float(val))
@@ -230,16 +247,32 @@ class LazyCallManager:
                 return
 
             with self.driver.session() as session:
-                res = session.run("MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) RETURN c.code, c.inputs LIMIT 1", fqn=fqn)
+                res = session.run("""
+                    MATCH (f:Function {fqn: $fqn})-[:HAS_CHUNK]->(c:Chunk {index: 0}) 
+                    RETURN c.code as c_code, c.inputs as c_inputs, c.baseline_mlir as baseline_mlir
+                """, fqn=fqn)
                 record = res.single()
                 if not record: return
-                chunk_code, inputs = record[0], json.loads(record[1])
+                chunk_code = record["c_code"]
+                inputs = json.loads(record["c_inputs"])
+                baseline_mlir_raw = record["baseline_mlir"]
             
             if not os.path.exists(cache_file_mlir):
                 from component9_aot import build_and_cache_mlir
-                verified_mlir = await verified_generation_loop(f"Optimize: \n{chunk_code}", chunk_code, inputs)
-                verified_mlir.function_name = sanitized
-                build_and_cache_mlir(verified_mlir, cache_file_json)
+                from component2_smt import generate_optimization_heuristics, verify_llm_safety
+                from compiler_passes import apply_compiler_heuristics
+
+                # --- NEW PIPELINE ---
+                baseline_mlir = VerifiedMLIR.model_validate_json(baseline_mlir_raw)
+                heuristics = await generate_optimization_heuristics(baseline_mlir)
+                optimized_mlir = apply_compiler_heuristics(baseline_mlir, heuristics)
+                
+                is_safe, _ = verify_llm_safety(optimized_mlir, len(inputs), None)
+                final_mlir = optimized_mlir if is_safe else baseline_mlir
+                # --------------------
+                
+                final_mlir.function_name = sanitized
+                build_and_cache_mlir(final_mlir, cache_file_json)
             
             rtype = "f64"
             if os.path.exists(cache_file_json):
