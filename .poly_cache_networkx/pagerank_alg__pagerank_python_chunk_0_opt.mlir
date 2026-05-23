@@ -1,5 +1,5 @@
 module {
-  llvm.func @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: i64, %arg7: f64) {
+  llvm.func @pagerank_alg__pagerank_python_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: i64, %arg7: f64) {
     %0 = llvm.mlir.constant(0 : index) : i64
     %1 = llvm.mlir.constant(1 : index) : i64
     %2 = llvm.mlir.constant(1.000000e+00 : f64) : f64

@@ -1,7 +1,7 @@
 ; ModuleID = 'LLVMDialectModule'
 source_filename = "LLVMDialectModule"
 
-define void @networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, i64 %6, double %7) {
+define void @pagerank_alg__pagerank_python_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, i64 %6, double %7) {
   %9 = fsub double 1.000000e+00, %7
   br label %10
 

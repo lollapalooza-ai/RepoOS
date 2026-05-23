@@ -59,14 +59,24 @@ class PolyKernelMLIRJIT:
                 else:
                     final_args.append(arg)
 
+            # Prepare result buffer
+            # Conv: Result is first argument if void return was used in signature but logic returns scalar
+            # Our current component9 manual lowering handles return via result pointer
+            result = ctypes.c_double(0.0)
+            
             if func_ptr.argtypes is None:
+                all_call_args = []
+                if return_type != "void":
+                    all_call_args.append(ctypes.pointer(result))
+                all_call_args.extend(final_args)
+                
                 arg_types = []
-                for a in final_args:
-                    if isinstance(a, ctypes._Pointer):
+                for a in all_call_args:
+                    if isinstance(a, (ctypes._Pointer, ctypes.Array, ctypes.c_void_p)):
                         arg_types.append(ctypes.c_void_p)
-                    elif isinstance(a, float):
+                    elif isinstance(a, float) or isinstance(a, ctypes.c_double):
                         arg_types.append(ctypes.c_double)
-                    elif isinstance(a, int):
+                    elif isinstance(a, int) or isinstance(a, ctypes.c_longlong):
                         arg_types.append(ctypes.c_longlong)
                     else:
                         arg_types.append(type(a))
@@ -77,10 +87,6 @@ class PolyKernelMLIRJIT:
                 func_ptr(*final_args)
                 return None
             
-            # Prepare result buffer
-            # Conv: Result is first argument if void return was used in signature but logic returns scalar
-            # Our current component9 manual lowering handles return via result pointer
-            result = ctypes.c_double(0.0)
             func_ptr(ctypes.pointer(result), *final_args)
             return result.value
 

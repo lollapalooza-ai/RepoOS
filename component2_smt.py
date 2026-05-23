@@ -42,11 +42,8 @@ class MLIROperation(BaseModel):
     args: List[str] = Field(..., description="SSA values or literals.")
     target_var: Optional[str] = Field(None, description="Output SSA variable.")
     attributes: Dict[str, Any] = Field(default_factory=dict)
-    body: List["MLIROperation"] = Field(default_factory=list, description="Nested operations for regions (e.g. loops).")
-    then: List["MLIROperation"] = Field(default_factory=list, description="Nested operations for 'then' block.")
-    else_: Optional[List["MLIROperation"]] = Field(None, alias="else", description="Nested operations for 'else' block.")
-    body: Optional[List["MLIROperation"]] = Field(None, description="Nested operations for regions (e.g. loops).")
-    then: Optional[List["MLIROperation"]] = Field(None, description="Then block for scf.if.")
+    body: Optional[List["MLIROperation"]] = Field(default_factory=list, description="Nested operations for regions (e.g. loops).")
+    then: Optional[List["MLIROperation"]] = Field(default_factory=list, description="Then block for scf.if.")
     else_: Optional[List["MLIROperation"]] = Field(alias="else", default=None, description="Else block for scf.if.")
 
     @field_validator('args')
@@ -386,10 +383,48 @@ async def verified_generation_loop(intent: str, func_code: str, input_names: Lis
 
 # --- 5. Optimization Oracle ---
 
+class ExecutionContract(BaseModel):
+    init_hints: Dict[str, str] = Field(default_factory=dict, description="e.g., {'p_ptr': '1/N', 'res_ptr': 'zeros'}")
+    structural_mapping: Dict[str, str] = Field(default_factory=dict, description="Maps graph/matrix structures to flat arrays (e.g., {'row_ptrs': 'row_ptrs'})")
+    pointer_aliases: Dict[str, str] = Field(default_factory=dict, description="Maps MLIR pointers to Python arg names (e.g., {'p_ptr': 'personalization'})")
+    element_types: Dict[str, str] = Field(default_factory=dict, description="Element types for pointers (e.g., {'row_ptrs': 'i64'})")
+    normalize_buffers: Dict[str, bool] = Field(default_factory=dict, description="Whether to normalize a buffer (e.g., {'p_ptr': True})")
+
+async def synthesize_execution_contract(raw_python_code: str) -> ExecutionContract:
+    """Pass the raw Python chunk to Gemini to infer the memory contract."""
+    
+    prompt = f"""
+    Analyze this Python code chunk and synthesize an Execution Contract for a bare-metal MLIR compiler.
+    
+    Identify:
+    1. Initializations (e.g. if you see p = 1.0/N, the init hint is '1/N').
+    2. Structural mappings (if the code processes a Graph, identify which arrays map to CSR components: row_ptrs, col_idx, weights).
+    3. Pointer aliases (map the internal kernel argument names like 'p_ptr' back to the high-level Python arguments like 'personalization').
+    4. Element types (identify if pointers should be i64/index for offsets/indices or f64 for data).
+    
+    CODE:
+    {raw_python_code}
+    """
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ExecutionContract,
+                temperature=0.0
+            )
+        )
+        return ExecutionContract.model_validate_json(response.text)
+    except Exception as e:
+        print(f"Contract synthesis failed, falling back to empty contract: {e}")
+        return ExecutionContract()
+
 class MLIROptimizationHeuristics(BaseModel):
     loop_unroll_factor: int = Field(default=1, description="Factor to unroll scf.for loops.")
     vectorization_width: int = Field(default=1, description="SIMD vectorization width.")
-    stochastic_routing_hint: bool = Field(default=False)
+    stochastic_routing_hint: bool = False
 
 async def generate_optimization_heuristics(baseline_mlir: VerifiedMLIR) -> MLIROptimizationHeuristics:
     """Pass the deterministically generated MLIR to Gemini just for tuning parameters."""

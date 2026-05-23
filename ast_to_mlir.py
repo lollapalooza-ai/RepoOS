@@ -4,12 +4,24 @@ from typing import List, Dict, Any, Optional
 from component2_smt import MLIROperation, VerifiedMLIR
 
 class DeterministicMLIRBuilder(ast.NodeVisitor):
-    def __init__(self, function_name: str, args: List[str]):
+    def __init__(self, function_name: str, args: List[str], type_hints: Dict[str, str] = None):
         self.operations = []
         self.env = {}
         self.var_counter = 0
         self.function_name = function_name
-        self.signature = {arg: "f64" for arg in args} # Default to f64 for now
+        self.type_hints = type_hints or {}
+        self.signature = {}
+        
+        for arg in args:
+            # Map Python types to MLIR Dialect types
+            py_hint = self.type_hints.get(arg, "float").lower() # Default fallback
+            if "int" in py_hint or py_hint == "index":
+                self.signature[arg] = "i64"
+            elif any(t in py_hint for t in ["list", "ndarray", "dict", "ptr", "graph"]):
+                self.signature[arg] = "ptr"
+            else:
+                self.signature[arg] = "f64"
+
         self.signature["return"] = "f64"
         self.arg_names = args
         for i, arg in enumerate(args):
@@ -172,8 +184,8 @@ class DeterministicMLIRBuilder(ast.NodeVisitor):
         self.operations.append(
             MLIROperation(
                 dialect="scf", op="if", args=[test_var],
-                then=then_ops if then_ops else None,
-                else_=else_ops if else_ops else None
+                then=then_ops,
+                else_=else_ops
             )
         )
 
@@ -231,7 +243,7 @@ class DeterministicMLIRBuilder(ast.NodeVisitor):
             MLIROperation(
                 dialect="scf", op="for", args=[lower, upper, step],
                 attributes={"body_args": [iter_var]},
-                body=body_ops if body_ops else None
+                body=body_ops
             )
         )
 
@@ -242,18 +254,25 @@ class DeterministicMLIRBuilder(ast.NodeVisitor):
             right = self.visit(comparator)
             target = self.new_var()
             
-            # Simplified comparison mapping
-            op_map = {
-                ast.Eq: "cmp_eq", # pseudo-op for arith.cmpi or arith.cmpf
-                ast.Gt: "cmp_gt",
-                ast.Lt: "cmp_lt"
+            # Simple heuristic for float vs int comparison
+            # In MLIR, cmpf is for floats, cmpi is for integers/indices
+            is_float = any(x in str(left).lower() or x in str(right).lower() for x in ["%arg", "float", "f64"])
+            mlir_op = "cmpf" if is_float else "cmpi"
+            
+            # Predicate mapping (MLIR arith dialect)
+            # Eq -> 0 (cmpi) or 1 (cmpf)
+            # Gt -> 4 (cmpi) or 4 (cmpf)
+            pred_map = {
+                ast.Eq: 0 if mlir_op == "cmpi" else 1,
+                ast.Gt: 4,
+                ast.Lt: 2
             }
-            mlir_op = op_map.get(type(op), "cmpf")
+            predicate = pred_map.get(type(op), 0)
             
             self.operations.append(
                 MLIROperation(
-                    dialect="arith", op="cmpf", args=[left, right], target_var=target,
-                    attributes={"predicate": type(op).__name__}
+                    dialect="arith", op=mlir_op, args=[left, right], target_var=target,
+                    attributes={"predicate": predicate, "op_name": type(op).__name__}
                 )
             )
             ops.append(target)
@@ -309,11 +328,11 @@ class DeterministicMLIRBuilder(ast.NodeVisitor):
             operations=self.operations
         )
 
-def python_to_deterministic_mlir(code: str, function_name: str, args: List[str]) -> VerifiedMLIR:
+def python_to_deterministic_mlir(code: str, function_name: str, args: List[str], type_hints: Dict[str, str] = None) -> VerifiedMLIR:
     tree = ast.parse(code)
     # Find the function definition
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            builder = DeterministicMLIRBuilder(function_name, args)
+            builder = DeterministicMLIRBuilder(function_name, args, type_hints=type_hints)
             return builder.build(node)
     raise ValueError(f"Function {function_name} not found in code.")

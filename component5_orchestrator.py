@@ -18,51 +18,14 @@ MANUAL_CACHE_DIR = os.getenv("REPOOS_MANUAL_CACHE_DIR", "./.poly_cache_manual")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def sanitize_fqn(fqn: str):
-    """Unified naming logic across all components."""
-    for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
-        if pkg in fqn:
-            idx = fqn.find(pkg)
-            return fqn[idx:].replace('.', '_').replace('-', '_')
-    return fqn.replace('.', '_').replace('-', '_')
-
-def networkx_to_csr(G, stochastic=False):
-    """
-    Devirtualizes a NetworkX Dictionary Graph into flat CSR Memory Arrays.
-    Returns: row_ptrs, col_indices, weights, node_to_idx, idx_to_node, num_nodes, num_edges
-    """
-    import ctypes
-    n_nodes = G.number_of_nodes()
-    n_edges = G.number_of_edges()
-    if G.is_directed():
-        total_edges = n_edges
+    """Generic naming logic that preserves unique context without hardcoding packages."""
+    parts = fqn.split('.')
+    if len(parts) > 3:
+        # Keep last 3 parts for readability, e.g. algorithms_pagerank_alg__pagerank_python
+        base = "_".join(parts[-3:])
     else:
-        total_edges = n_edges * 2
-
-    node_to_idx = {node: i for i, node in enumerate(G.nodes())}
-    idx_to_node = {i: node for node, i in node_to_idx.items()}
-
-    row_ptrs = (ctypes.c_int64 * (n_nodes + 1))()
-    col_indices = (ctypes.c_int64 * total_edges)()
-    weights = (ctypes.c_double * total_edges)()
-
-    edge_idx = 0
-    for i, node in enumerate(G.nodes()):
-        row_ptrs[i] = edge_idx
-        
-        # Calculate total out-weight for normalization if stochastic is requested
-        out_weight = 1.0
-        if stochastic:
-            out_weight = sum(float(edge_data.get('weight', 1.0)) for neighbor, edge_data in G[node].items())
-            if out_weight == 0: out_weight = 1.0 # Avoid division by zero
-            
-        for neighbor, edge_data in G[node].items():
-            col_indices[edge_idx] = node_to_idx[neighbor]
-            raw_weight = float(edge_data.get('weight', 1.0))
-            weights[edge_idx] = raw_weight / out_weight
-            edge_idx += 1
-            
-    row_ptrs[n_nodes] = edge_idx
-    return row_ptrs, col_indices, weights, node_to_idx, idx_to_node, n_nodes, edge_idx
+        base = "_".join(parts)
+    return base.replace('-', '_')
 
 class LazyCallManager:
     def __init__(self):
@@ -110,116 +73,132 @@ class LazyCallManager:
                 try:
                     meta = self.metadata.get(fqn, {})
                     sig = meta.get("signature", {})
+                    contract = meta.get("config", {})
                     
                     import inspect
                     py_sig = inspect.signature(original_func)
                     bound = py_sig.bind(*args, **kwargs)
                     bound.apply_defaults()
                     
-                    # 2. Specialized Object Devirtualization (Library-Agnostic)
-                    primary_arg = args[0] if args else None
-                    is_nx_graph = hasattr(primary_arg, 'nodes') and hasattr(primary_arg, 'edges')
+                    # 2. Specialized Object Devirtualization (Registry-Driven)
+                    from adapters import get_adapter_registry
+                    adapter_registry = get_adapter_registry()
                     
                     kernel_args = []
                     allocations = {}
+                    primary_length = 0
+                    node_map = {}; rev_node_map = {}
+
+                    # Devirtualize arguments dynamically
+                    for arg in args:
+                        for adapter in adapter_registry:
+                            if adapter.can_handle(arg):
+                                flat_buffers, length = adapter.devirtualize(arg, contract)
+                                allocations.update(flat_buffers)
+                                primary_length = max(primary_length, length)
+                                if "__node_map__" in flat_buffers: node_map = flat_buffers["__node_map__"]
+                                if "__rev_node_map__" in flat_buffers: rev_node_map = flat_buffers["__rev_node_map__"]
+                                break
                     
-                    if is_nx_graph:
-                        # Identify Stochastic Requirement from Metadata Hint
-                        needs_stochastic = meta.get("config", {}).get("stochastic", False)
-                        row_ptrs, col_idx, weights, node_map, rev_node_map, num_nodes, num_edges = networkx_to_csr(primary_arg, stochastic=needs_stochastic)
+                    # Map signatures to kernel args using the synthesized contract
+                    for arg_name, arg_type in sig.items():
+                        if arg_name == "return": continue
                         
-                        for arg_name, arg_type in sig.items():
-                            if arg_name == "return": continue
-                            
-                            # 1. Structural Mapping (CSR/Graph) via Config Hints
-                            struct_map = meta.get("config", {}).get("structural_mapping", {})
-                            if arg_name in struct_map:
-                                val_type = struct_map[arg_name]
-                                if val_type == "row_ptrs": kernel_args.append(ctypes.cast(row_ptrs, ctypes.c_void_p).value)
-                                elif val_type == "col_idx": kernel_args.append(ctypes.cast(col_idx, ctypes.c_void_p).value)
-                                elif val_type == "weights": kernel_args.append(ctypes.cast(weights, ctypes.c_void_p).value)
-                                elif val_type == "num_nodes": kernel_args.append(num_nodes)
-                                elif val_type == "num_edges": kernel_args.append(num_edges)
+                        # A. Structural Mapping via Config Hints
+                        struct_map = contract.get("structural_mapping", {})
+                        if arg_name in struct_map:
+                            val_key = struct_map[arg_name]
+                            if val_key in allocations:
+                                val = allocations[val_key]
+                                if isinstance(val, int): kernel_args.append(val)
+                                else: kernel_args.append(ctypes.cast(val, ctypes.c_void_p).value)
                                 continue
 
-                            # 2. Dynamic Buffer Mapping
-                            if arg_name.endswith("_ptr") or arg_name.endswith("_buf"):
+                        # B. Dynamic Buffer Mapping
+                        if arg_name.endswith("_ptr") or arg_name.endswith("_buf"):
+                            # Check pointer aliases first
+                            alias_key = contract.get("pointer_aliases", {}).get(arg_name)
+                            py_val = bound.arguments.get(alias_key) if alias_key else None
+                            
+                            if py_val is None:
                                 py_key = arg_name.replace("_ptr", "").replace("_buf", "")
                                 py_val = bound.arguments.get(py_key)
-                                
-                                # Generic Metadata-Driven Fallback
-                                if py_val is None:
-                                    fallback_key = meta.get("config", {}).get("fallbacks", {}).get(arg_name)
-                                    if fallback_key: py_val = bound.arguments.get(fallback_key)
-                                
-                                if py_val is not None and isinstance(py_val, dict):
-                                    buf = (ctypes.c_double * num_nodes)()
-                                    # Config-driven normalization
-                                    total = sum(py_val.values()) if py_val else 1.0
-                                    if total == 0: total = 1.0
-                                    
-                                    needs_normalization = meta.get("config", {}).get("normalize_buffers", {}).get(arg_name, False)
-                                    
-                                    for node, val in py_val.items():
-                                        if node in node_map: 
-                                            buf[node_map[node]] = val / total if needs_normalization else val
-                                    kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctypes.c_double)))
-                                    allocations[arg_name] = buf
-                                else:
-                                    # Default Generic Buffer (Zero-initialized)
-                                    ctype = ctypes.c_double if arg_type == "ptr" else ctypes.c_int64
-                                    buf = (ctype * num_nodes)()
-                                    
-                                    # Generic Initialization Strategy (e.g. "1/N")
-                                    init_type = meta.get("config", {}).get("init", {}).get(arg_name)
-                                    if init_type == "1/N":
-                                        dv = 1.0 / num_nodes if num_nodes > 0 else 0.0
-                                        for i in range(num_nodes): buf[i] = dv
-                                        
-                                    kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctype)))
-                                    allocations[arg_name] = buf
                             
-                            # 3. Direct Value Mapping
-                            elif arg_name in bound.arguments:
-                                val = bound.arguments[arg_name]
-                                if arg_type == "f64": kernel_args.append(float(val))
-                                elif arg_type == "i64": kernel_args.append(int(val))
-                                else: kernel_args.append(val)
-                            else: kernel_args.append(0)
-
-                        print(f"   [RepoOS] Invoking Bare-Metal Kernel for {fqn}...")
-                        self.registry[fqn](*kernel_args)
-                        
-                        # 3. Generic Result Reconstruction & Post-Processing
-                        res_key = meta.get("config", {}).get("result_buffer") or \
-                                  next((k for k in allocations if any(s in k for s in ["res", "betweenness", "centrality"])), None)
-                        
-                        if res_key:
-                            res_buf = allocations[res_key]
-                            final_res = {rev_node_map[i]: res_buf[i] for i in range(num_nodes)}
+                            # Fallback logic from contract
+                            if py_val is None:
+                                fallback_key = contract.get("fallbacks", {}).get(arg_name)
+                                if fallback_key: py_val = bound.arguments.get(fallback_key)
                             
-                            # Meta-Driven Post-Processing (NO HARDCODING)
-                            post_ops = meta.get("config", {}).get("post_process", [])
-                            for op in post_ops:
-                                if op["type"] == "scale":
-                                    factor = 1.0
-                                    if op["factor"] == "0.5_if_undirected" and not primary_arg.is_directed(): factor = 0.5
-                                    elif op["factor"] == "normalization":
-                                        is_norm = bound.arguments.get("normalized", True)
-                                        if is_norm and num_nodes > 2:
-                                            factor = 1.0 / ((num_nodes - 1) * (num_nodes - 2))
-                                            if not primary_arg.is_directed() and meta.get("config", {}).get("undirected_double_counted", False):
-                                                factor *= 2.0
-                                    for v in final_res: final_res[v] *= factor
-                            return final_res
-                        return None
-
-                    # --- 2. CONTAINER DETECTION (NumPy / List) ---
-                    is_numpy = hasattr(primary_arg, '__array_interface__')
-                    if is_numpy:
-                        # (Keep original container logic, simplified for brevity)
-                        return original_func(*args, **kwargs)
+                            if py_val is not None and isinstance(py_val, dict):
+                                buf = (ctypes.c_double * primary_length)()
+                                needs_normalization = contract.get("normalize_buffers", {}).get(arg_name, False)
+                                total = sum(py_val.values()) if py_val else 1.0
+                                if total == 0: total = 1.0
+                                for node, val in py_val.items():
+                                    if node in node_map: 
+                                        buf[node_map[node]] = val / total if needs_normalization else val
+                                kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctypes.c_double)))
+                                allocations[arg_name] = buf
+                            else:
+                                # Default Generic Buffer (Zero-initialized)
+                                ctype = ctypes.c_double if arg_type == "ptr" else ctypes.c_int64
+                                buf = (ctype * primary_length)()
+                                
+                                # Config-driven initialization
+                                init_type = contract.get("init", {}).get(arg_name) or contract.get("init_hints", {}).get(arg_name)
+                                if init_type == "1/N":
+                                    dv = 1.0 / primary_length if primary_length > 0 else 0.0
+                                    for i in range(primary_length): buf[i] = dv
+                                    
+                                kernel_args.append(ctypes.cast(buf, ctypes.POINTER(ctype)))
+                                allocations[arg_name] = buf
                         
+                        # C. Direct Value Mapping
+                        elif arg_name in bound.arguments:
+                            val = bound.arguments[arg_name]
+                            if arg_type == "f64": kernel_args.append(float(val))
+                            elif arg_type == "i64": kernel_args.append(int(val))
+                            else: kernel_args.append(val)
+                        else: kernel_args.append(0)
+
+                    print(f"   [RepoOS] Invoking Bare-Metal Kernel for {fqn}...")
+                    self.registry[fqn](*kernel_args)
+                    
+                    # 3. Generic Result Reconstruction & Post-Processing
+                    # Look for result buffer in: 1. Manual contract, 2. Synthesized pointer aliases, 3. Allocation heuristics
+                    res_key = contract.get("result_buffer")
+                    if not res_key:
+                        # Search pointer aliases for something that looks like 'result' or 'pagerank'
+                        aliases = contract.get("pointer_aliases", {})
+                        for k, v in aliases.items():
+                            if any(s in v.lower() for s in ["res", "out", "pagerank", "centrality"]):
+                                res_key = k
+                                break
+                    
+                    if not res_key:
+                        # Heuristic fallback
+                        res_key = next((k for k in allocations if any(s in k.lower() for s in ["res", "betweenness", "centrality", "output", "buffer"])), None)
+                    
+                    print(f"   [DEBUG] res_key: {res_key}, primary_length: {primary_length}, allocations: {list(allocations.keys())}")
+                    
+                    if res_key:
+                        res_buf = allocations[res_key]
+                        final_res = {rev_node_map[i]: res_buf[i] for i in range(primary_length)}
+                        
+                        # Meta-Driven Post-Processing (NO HARDCODING)
+                        post_ops = contract.get("post_process", [])
+                        for op in post_ops:
+                            if op["type"] == "scale":
+                                factor = 1.0
+                                if op["factor"] == "0.5_if_undirected" and not hasattr(args[0], 'is_directed') or not args[0].is_directed(): factor = 0.5
+                                elif op["factor"] == "normalization":
+                                    is_norm = bound.arguments.get("normalized", True)
+                                    if is_norm and primary_length > 2:
+                                        factor = 1.0 / ((primary_length - 1) * (primary_length - 2))
+                                for v in final_res: final_res[v] *= factor
+                        return final_res
+                    return None
+
                 except Exception as e:
                     print(f"⚠️ RepoOS Execution Failed: {e}")
                     raise e

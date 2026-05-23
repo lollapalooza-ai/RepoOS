@@ -8,12 +8,12 @@ RepoOS is an AI-driven, formally verified compiler toolchain that bridges Python
 
 To ensure RepoOS functions as a truly generic, enterprise-grade acceleration layer, all contributions MUST adhere to these foundational rules:
 
-1.  **Zero Hardcoding:** Never hardcode function-specific checks, names, or specialized logic into core files. RepoOS must remain agnostic of the target codebase. All algorithm-specific behavior (e.g., scaling, normalization) must be driven by generic metadata (`config` field in `VerifiedMLIR`).
-2.  **Universal Applicability:** Rule #1 applies to all core components (1 thru 9), `manual_compiler.py`, and the Orchestrator. Logic must be designed to handle arbitrary codebases and functions.
-3.  **Mandatory Triple-Verification:** Once a benchmark or test completes successfully, you MUST triple-check that the RepoOS bare-metal kernel was actually executed. 
+1.  **Zero Hardcoding (Generalization Mandate):** Never hardcode function-specific checks, names, or specialized logic into core files. RepoOS must remain agnostic of the target codebase. All algorithm-specific behavior (e.g., scaling, normalization, structural mapping) must be driven by generic metadata (`config` field in `VerifiedMLIR`).
+2.  **Universal Applicability:** Logic must be designed to handle arbitrary codebases and functions. This applies to all core components (1 thru 9), the AI Oracle, and the Orchestrator. The system should function as a **drop-in agent** that autonomously adapts to the provided Python context.
+3.  **Autonomous Contract Synthesis:** Future expansions should prioritize AI-driven inference for memory and execution contracts instead of manual configuration bridges.
+4.  **Mandatory Triple-Verification:** Once a benchmark or test completes successfully, you MUST triple-check that the RepoOS bare-metal kernel was actually executed. 
     *   **Audit logs:** Ensure "Invoking Bare-Metal Kernel" appears in the output.
-    *   **Fallback Detection:** Verify the system did not silently fallback to native Python, which can lead to "false positive" mathematical matches but zero real-world speedup.
-    *   **Side-by-Side Validation:** Always use independent scripts (like `verify_side_by_side.py`) to confirm exact mathematical parity.
+    *   **Fallback Detection:** Verify the system did not silently fallback to native Python.
 
 ---
 
@@ -38,27 +38,24 @@ export DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib:/Users/yeshr/Applications/P
 
 ## 🚀 The Operational Pipeline
 
-### 1. Semantic Ingestion (Neo4j)
-Parses Python source code, extracts pure logic chunks, and stores them in the Neo4j Semantic Graph.
-*   **Example:** Ingest the NetworkX random sequence module.
+### 1. Semantic Ingestion & Deterministic Lowering (`component1_ingest.py` & `ast_to_mlir.py`)
+Parses Python source code, extracts pure logic chunks, and deterministically lowers them to baseline MLIR (`ast_to_mlir.py`). This baseline is then stored in the Neo4j Semantic Graph as the Ground Truth.
+*   **Example:** Ingest the NetworkX PageRank algorithm.
 ```bash
-./build_venv/bin/python3 component1_ingest.py venv/lib/python3.9/site-packages/networkx/utils/random_sequence.py
+./build_venv/bin/python3 component1_ingest.py venv/lib/python3.9/site-packages/networkx/algorithms/link_analysis/pagerank_alg.py
 ```
 
-### 2. Reference Baselining (`manual_compiler.py`)
-**CRITICAL:** This component provides the "Ground Truth" MLIR templates for complex kernels to prevent AI hallucinations.
-```bash
-REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual ./build_venv/bin/python3 manual_compiler.py
-```
-
-### 3. AOT Compilation (MLIR to .dylib)
-Translates Python chunks into MLIR and compiles them into native shared libraries.
+### 2. AOT Compilation & Formal Optimization (`component9_aot.py`, `component2_smt.py`, `compiler_passes.py`)
+Retrieves the deterministic baseline MLIR from Neo4j. It queries Gemini as an **Optimization Oracle** for tuning heuristics (e.g., unroll factor) and deterministically applies them (`compiler_passes.py`). The optimized graph is formally verified by Z3 before being lowered to LLVM IR using the Bare Pointer Calling Convention and compiled to `.dylib`.
 *   **Example:** Compile all detected chunks for the NetworkX package.
 ```bash
 REPOOS_CACHE_DIR=.poly_cache_networkx \
 REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 ./build_venv/bin/python3 component9_aot.py networkx
 ```
+
+### 3. Metadata-Driven Orchestration (`component5_orchestrator.py`)
+Intercepts Python execution at runtime. Utilizing the `VerifiedMLIR.config` contract stored in Neo4j (or manually injected), it dynamically devirtualizes complex objects (like NetworkX CSR Graphs), handles buffer initializations, and hot-swaps to the native kernel without hardcoded application logic.
 
 ---
 
@@ -123,6 +120,7 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 | Component | Name | Responsibility |
 | :--- | :--- | :--- |
 | **ast_to_mlir** | Builder | Deterministic AST-to-MLIR Visitor |
+| **compiler_passes**| Optimizer | Deterministic application of LLM heuristics |
 | **Component 1** | Ingester | AST Parsing (tree-sitter) & Neo4j Storage |
 | **Component 2** | SMT/AI | Python-to-MLIR translation & Z3 Formal Verification |
 | **Component 4** | JIT/Loader | High-stability AOT Kernel Loader (ctypes Bridge) |

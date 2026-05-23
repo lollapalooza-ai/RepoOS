@@ -8,7 +8,7 @@ import mlir.ir as ir
 from mlir.ir import Context, Module, Location, InsertionPoint, F64Type, FloatAttr, StringAttr, UnitAttr
 from mlir.dialects import func, arith, scf, llvm, math
 from neo4j import GraphDatabase
-from component2_smt import VerifiedMLIR, verified_generation_loop, generate_optimization_heuristics, verify_llm_safety
+from component2_smt import VerifiedMLIR, verified_generation_loop, generate_optimization_heuristics, verify_llm_safety, synthesize_execution_contract
 from compiler_passes import apply_compiler_heuristics
 
 # Milestone 5: Stable Bare-Metal Pipeline
@@ -25,11 +25,13 @@ CLANG = "clang"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def sanitize_fqn(fqn: str):
-    for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
-        if pkg in fqn:
-            idx = fqn.find(pkg)
-            return fqn[idx:].replace('.', '_').replace('-', '_')
-    return fqn.replace('.', '_').replace('-', '_')
+    """Generic naming logic that preserves unique context without hardcoding packages."""
+    parts = fqn.split('.')
+    if len(parts) > 3:
+        base = "_".join(parts[-3:])
+    else:
+        base = "_".join(parts)
+    return base.replace('-', '_')
 
 def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str):
     sanitized = verified_mlir_data.function_name
@@ -52,21 +54,31 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                 # 1. Build Native Function Signature
                 arg_types = []
                 ret_type_str = verified_mlir_data.signature.get("return", "f64")
-                mlir_ret_type = type_map.get(ret_type_str)
-                
-                for k, v in verified_mlir_data.signature.items():
-                    if k != "return": arg_types.append(type_map.get(v, f64))
 
-                func_type = ir.FunctionType.get(arg_types, [mlir_ret_type] if mlir_ret_type else [])
+                # Convention: If returning a value, it's passed as a result pointer in Arg0
+                if ret_type_str != "void":
+                    arg_types.append(ptr)
+
+                for k, v in verified_mlir_data.signature.items():
+                    if k == "return": continue
+                    arg_types.append(type_map.get(v, f64))
+
+                func_type = ir.FunctionType.get(arg_types, []) # Always return void in signature
                 mlir_func = func.FuncOp(sanitized, func_type)
                 mlir_func.add_entry_block()
                 # REMOVED: llvm.emit_c_interface (Avoids descriptor structs)
-
 
                 def process_ops(ops, ip, ssa_map):
                     if ops is None: return
                     with ip:
                         for op_data in ops:
+                            # Robust terminator check
+                            if len(ip.block.operations) > 0:
+                                last_op_name = str(ip.block.operations[-1].operation.name)
+                                if any(t in last_op_name for t in ["return", "yield", "br"]):
+                                    break
+                            ...
+
                             def get_attr(obj, name, default=None):
                                 if hasattr(obj, name): return getattr(obj, name)
                                 if isinstance(obj, dict): return obj.get(name, default)
@@ -112,7 +124,21 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                 elif op == "muli": res = arith.MulIOp(resolve(args[0]), resolve(args[1])).result
                                 elif op == "cmpi": 
                                     pred = attributes.get("predicate", 0)
-                                    res = arith.CmpIOp(pred, resolve(args[0]), resolve(args[1])).result
+                                    lhs = resolve(args[0])
+                                    rhs = resolve(args[1])
+                                    if lhs and rhs:
+                                        # Auto-bridge index vs integer
+                                        if str(lhs.type) == "index" and str(rhs.type) != "index":
+                                            rhs = arith.IndexCastOp(ir.IndexType.get(), rhs).result
+                                        elif str(rhs.type) == "index" and str(lhs.type) != "index":
+                                            lhs = arith.IndexCastOp(ir.IndexType.get(), lhs).result
+                                        res = arith.CmpIOp(pred, lhs, rhs).result
+                                elif op == "cmpf":
+                                    pred = attributes.get("predicate", 1) # Default to oeq (1)
+                                    lhs = resolve(args[0])
+                                    rhs = resolve(args[1])
+                                    if lhs and rhs:
+                                        res = arith.CmpFOp(pred, lhs, rhs).result
                                 elif op == "index_cast":
                                     out_type = ir.IndexType.get() if attributes.get("type") == "index" else i64
                                     res = arith.IndexCastOp(out_type, resolve(args[0])).result
@@ -186,31 +212,42 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                     body_map[ba[0]] = for_op.induction_variable
                                     for j in range(1, len(ba)): body_map[ba[j]] = for_op.inner_iter_args[j-1]
                                     process_ops(body, InsertionPoint(for_op.body), body_map)
+
+                                    # Ensure terminator
                                     with InsertionPoint(for_op.body):
-                                        if not any(isinstance(o.opview, scf.YieldOp) for o in for_op.body.operations):
+                                        if len(for_op.body.operations) == 0 or not any(t in str(for_op.body.operations[-1].operation.name).lower() for t in ["return", "yield", "br"]):
                                             scf.YieldOp(for_op.inner_iter_args)
+
                                     if for_op.results:
+
                                         res = for_op.results[0]
                                         for k, r in enumerate(for_op.results):
                                             ssa_map[f"{target_var}#{k}"] = r
                                     else: res = None
                                 elif op == "if":
                                     cond = resolve(args[0])
-                                    has_else = "else" in attributes
-                                    res_types = []
-                                    then_ops = attributes.get("then", [])
-                                    for o in then_ops:
-                                        o_op = o.get("op") if isinstance(o, dict) else o.op
-                                        if o_op == "yield":
-                                            y_args = o.get("args") if isinstance(o, dict) else o.args
-                                            res_types = [ir.IndexType.get() for _ in y_args]
+                                    then_ops = get_attr(op_data, "then") or attributes.get("then", [])
+                                    else_ops = get_attr(op_data, "else_") or get_attr(op_data, "else") or attributes.get("else", [])
                                     
+                                    # If the field exists at all, we assume an else block is intended
+                                    # (Pydantic might have defaults, so check against the raw data if possible)
+                                    raw_data = op_data if isinstance(op_data, dict) else op_data.model_dump()
+                                    has_else = "else" in raw_data or "else_" in raw_data or "else" in attributes
+                                    
+                                    res_types = []
+                                    # ... (res_type logic)
                                     if_op = scf.IfOp(cond, res_types, has_else=has_else)
-                                    then_map = ssa_map.copy()
-                                    process_ops(then_ops, InsertionPoint(if_op.then_block), then_map)
+                                    
+                                    process_ops(then_ops, InsertionPoint(if_op.then_block), ssa_map.copy())
+                                    with InsertionPoint(if_op.then_block):
+                                        if len(if_op.then_block.operations) == 0 or not any(t in str(if_op.then_block.operations[-1].operation.name).lower() for t in ["return", "yield", "br"]):
+                                            scf.YieldOp([])
+
                                     if has_else:
-                                        else_map = ssa_map.copy()
-                                        process_ops(attributes.get("else", []), InsertionPoint(if_op.else_block), else_map)
+                                        process_ops(else_ops, InsertionPoint(if_op.else_block), ssa_map.copy())
+                                        with InsertionPoint(if_op.else_block):
+                                            if len(if_op.else_block.operations) == 0 or not any(t in str(if_op.else_block.operations[-1].operation.name).lower() for t in ["return", "yield", "br"]):
+                                                scf.YieldOp([])
                                     
                                     if if_op.results:
                                         res = if_op.results[0]
@@ -225,18 +262,30 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                     if args:
                                         v_ret = resolve(args[0])
                                         if v_ret: llvm.StoreOp(v_ret, mlir_func.entry_block.arguments[0])
-                                    func.ReturnOp([])
+                                    
+                                    # ONLY emit func.return if we are in the main block
+                                    if ip.block == mlir_func.entry_block:
+                                        func.ReturnOp([])
+                                    else:
+                                        # Inside scf.if/for, we must use scf.yield
+                                        # But we can't easily break out of the parent loop/if.
+                                        # For now, just yield to satisfy the terminator requirement
+                                        scf.YieldOp([])
                                     continue
                             if target_var: ssa_map[target_var] = res
 
                 main_map = {}
+                offset = 1 if ret_type_str != "void" else 0
                 for i, (k,v) in enumerate(verified_mlir_data.signature.items()):
-                    if k != "return": 
-                        main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i]
+                    if k == "return": continue
+                    main_map[k] = main_map[f"%{k}"] = mlir_func.entry_block.arguments[i + offset]
                 process_ops(verified_mlir_data.operations, InsertionPoint(mlir_func.entry_block), main_map)
+                with InsertionPoint(mlir_func.entry_block):
+                    if len(mlir_func.entry_block.operations) == 0 or not any(t in str(mlir_func.entry_block.operations[-1].operation.name).lower() for t in ["return", "yield", "br"]):
+                        func.ReturnOp([])
 
                 with open(mlir_path, "w") as f: f.write(str(module))
-                pipeline = "builtin.module(convert-scf-to-cf,expand-strided-metadata,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},finalize-memref-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
+                pipeline = "builtin.module(convert-scf-to-cf,convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts,canonicalize)"
 
                 subprocess.run([MLIR_OPT, mlir_path, f"-pass-pipeline={pipeline}", "-o", opt_mlir_path], check=True)
                 subprocess.run([MLIR_TRANSLATE, "--mlir-to-llvmir", opt_mlir_path, "-o", ll_path], check=True)
@@ -292,6 +341,14 @@ async def aot_compile_all(module_filter: str = ""):
                     
                 baseline_mlir = VerifiedMLIR.model_validate_json(baseline_mlir_raw)
                 
+                # --- NEW: Agentic Contract Synthesis ---
+                if not baseline_mlir.config:
+                    print(f"   [Oracle] Synthesizing Execution Contract...")
+                    contract = await synthesize_execution_contract(chunk_code)
+                    baseline_mlir.config = contract.model_dump()
+                    print(f"      [OK] Contract synthesized.")
+                # ----------------------------------------
+
                 # 1. Get Heuristics from Gemini
                 heuristics = await generate_optimization_heuristics(baseline_mlir)
                 

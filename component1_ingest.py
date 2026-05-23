@@ -2,6 +2,7 @@ import sys
 import os
 import ast
 import json
+from typing import List, Dict, Any, Optional
 from ast_to_mlir import DeterministicMLIRBuilder # <-- NEW
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
@@ -17,12 +18,13 @@ PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 
 class PureLogicChunker(ast.NodeVisitor):
-    def __init__(self):
+    def __init__(self, type_hints: Dict[str, str] = None):
         self.chunks = []       # List of valid code chunks
         self.current_chunk = [] # Current contiguous pure block
         self.inputs = set()    # Variables read from outside the chunk
         self.outputs = set()   # Variables mutated inside the chunk
         self.local_vars = set()
+        self.type_hints = type_hints or {}
 
     def _flush_chunk(self):
         """Saves the current pure block, lowers it to MLIR, and resets."""
@@ -35,7 +37,7 @@ class PureLogicChunker(ast.NodeVisitor):
             try:
                 # Wrap the chunk in a dummy function AST to process it
                 chunk_ast = ast.parse(code)
-                builder = DeterministicMLIRBuilder(function_name="chunk", args=inputs)
+                builder = DeterministicMLIRBuilder(function_name="chunk", args=inputs, type_hints=self.type_hints)
                 builder.visit(chunk_ast)
                 
                 # Use the builder's build() method to get a VerifiedMLIR object
@@ -88,7 +90,7 @@ class PureLogicChunker(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         # We only want to chunk the body, not the def signature
         for stmt in node.body:
-            if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.For, ast.If, ast.While)) and self.is_pure(stmt):
+            if isinstance(stmt, (ast.Assign, ast.AugAssign, ast.For, ast.If, ast.While, ast.Return, ast.Expr)) and self.is_pure(stmt):
                 self.current_chunk.append(stmt)
                 self.extract_io(stmt)
             else:
@@ -215,7 +217,7 @@ def process_file(file_path, forced_module_name=None):
                             arg_names = [a.split('=')[0].strip() for a in method_params.strip("() ").split(',') if a.strip()]
                             
                             # CHUNKING
-                            chunker = PureLogicChunker()
+                            chunker = PureLogicChunker(type_hints=hints)
                             try:
                                 f_ast = ast.parse(method_body)
                                 chunker.visit(f_ast)
@@ -269,11 +271,11 @@ def process_file(file_path, forced_module_name=None):
             f_code = source_code[f_node.start_byte:f_node.end_byte]
             
             arg_names = [a.split('=')[0].strip() for a in f_params.strip("() ").split(',') if a.strip()]
-            arg_count = len(arg_names)
+            arg_count, hints, _ = get_arg_info(f_code)
             fqn = f"{module_name}.{f_name}"
             
             # CHUNKING
-            chunker = PureLogicChunker()
+            chunker = PureLogicChunker(type_hints=hints)
             try:
                 f_ast = ast.parse(f_code)
                 chunker.visit(f_ast)
