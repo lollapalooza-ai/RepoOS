@@ -1,7 +1,7 @@
 ; ModuleID = 'LLVMDialectModule'
 source_filename = "LLVMDialectModule"
 
-define void @networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, ptr %6, ptr %7, i64 %8) {
+define void @betweenness_betweenness_centrality_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, ptr %6, ptr %7, i64 %8) {
   br label %10
 
 10:                                               ; preds = %134, %9
@@ -211,11 +211,6 @@ define void @networkx_algorithms_centrality_betweenness_betweenness_centrality_c
   br label %10
 
 136:                                              ; preds = %10
-  ret void
-}
-
-define void @_mlir_ciface_networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, ptr %6, ptr %7, i64 %8) {
-  call void @networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4, ptr %5, ptr %6, ptr %7, i64 %8)
   ret void
 }
 

@@ -11,11 +11,13 @@ OUTPUT_DIR = os.getenv("REPOOS_MANUAL_CACHE_DIR", "./.poly_cache_manual")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def sanitize_fqn(fqn: str):
-    for pkg in ["networkx", "legacy_shop", "django", "numpy", "scipy"]:
-        if pkg in fqn:
-            idx = fqn.find(pkg)
-            return fqn[idx:].replace('.', '_').replace('-', '_')
-    return fqn.replace('.', '_').replace('-', '_')
+    """Generic naming logic that preserves unique context without hardcoding packages."""
+    parts = fqn.split('.')
+    if len(parts) > 3:
+        base = "_".join(parts[-3:])
+    else:
+        base = "_".join(parts)
+    return base.replace('-', '_')
 
 def create_manual_template(fqn: str, mlir_data: VerifiedMLIR):
     sanitized = sanitize_fqn(fqn)
@@ -148,6 +150,18 @@ def setup_betweenness_template():
         config={
             "result_buffer": "betweenness_ptr",
             "undirected_double_counted": True,
+            "structural_mapping": {
+                "row_ptrs": "row_ptrs",
+                "col_idx": "col_idx",
+                "num_nodes": "num_nodes"
+            },
+            "element_types": {
+                "row_ptrs": "i64",
+                "col_idx": "i64",
+                "d_ptr": "i64",
+                "s_ptr": "i64",
+                "q_ptr": "i64"
+            },
             "post_process": [
                 {"type": "scale", "factor": "0.5_if_undirected"},
                 {"type": "scale", "factor": "normalization"}

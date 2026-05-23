@@ -1,5 +1,5 @@
 module {
-  func.func @networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64) attributes {llvm.emit_c_interface} {
+  func.func @betweenness_betweenness_centrality_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c-1_i64 = arith.constant -1 : i64

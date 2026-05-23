@@ -1,5 +1,5 @@
 module {
-  llvm.func @networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64) attributes {llvm.emit_c_interface} {
+  llvm.func @betweenness_betweenness_centrality_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64) {
     %0 = llvm.mlir.constant(0 : i64) : i64
     %1 = llvm.mlir.constant(0 : index) : i64
     %2 = llvm.mlir.constant(1 : index) : i64
@@ -167,10 +167,6 @@ module {
     %98 = llvm.add %7, %2 : i64
     llvm.br ^bb1(%98 : i64)
   ^bb35:  // pred: ^bb1
-    llvm.return
-  }
-  llvm.func @_mlir_ciface_networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg6: !llvm.ptr, %arg7: !llvm.ptr, %arg8: i64) attributes {llvm.emit_c_interface} {
-    llvm.call @networkx_algorithms_centrality_betweenness_betweenness_centrality_chunk_0(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) : (!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, i64) -> ()
     llvm.return
   }
 }

@@ -179,8 +179,6 @@ class LazyCallManager:
                         # Heuristic fallback
                         res_key = next((k for k in allocations if any(s in k.lower() for s in ["res", "betweenness", "centrality", "output", "buffer"])), None)
                     
-                    print(f"   [DEBUG] res_key: {res_key}, primary_length: {primary_length}, allocations: {list(allocations.keys())}")
-                    
                     if res_key:
                         res_buf = allocations[res_key]
                         final_res = {rev_node_map[i]: res_buf[i] for i in range(primary_length)}
@@ -190,7 +188,7 @@ class LazyCallManager:
                         for op in post_ops:
                             if op["type"] == "scale":
                                 factor = 1.0
-                                if op["factor"] == "0.5_if_undirected" and not hasattr(args[0], 'is_directed') or not args[0].is_directed(): factor = 0.5
+                                if op["factor"] == "0.5_if_undirected" and (not hasattr(args[0], 'is_directed') or not args[0].is_directed()): factor = 0.5
                                 elif op["factor"] == "normalization":
                                     is_norm = bound.arguments.get("normalized", True)
                                     if is_norm and primary_length > 2:

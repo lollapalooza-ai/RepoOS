@@ -206,6 +206,9 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                             elif dialect == "scf":
                                 if op == "for":
                                     ia = [resolve(a) for a in attributes.get("init_args", [])]
+                                    # Determine result types from init_args
+                                    res_types = [a.type for a in ia]
+                                    
                                     for_op = scf.ForOp(resolve(args[0]), resolve(args[1]), resolve(args[2]), ia)
                                     body_map = ssa_map.copy()
                                     ba = attributes.get("body_args", ["%iv"])
@@ -219,10 +222,10 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                             scf.YieldOp(for_op.inner_iter_args)
 
                                     if for_op.results:
-
                                         res = for_op.results[0]
                                         for k, r in enumerate(for_op.results):
                                             ssa_map[f"{target_var}#{k}"] = r
+                                            ssa_map[f"%{target_var}#{k}"] = r
                                     else: res = None
                                 elif op == "if":
                                     cond = resolve(args[0])
@@ -230,12 +233,18 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                     else_ops = get_attr(op_data, "else_") or get_attr(op_data, "else") or attributes.get("else", [])
                                     
                                     # If the field exists at all, we assume an else block is intended
-                                    # (Pydantic might have defaults, so check against the raw data if possible)
                                     raw_data = op_data if isinstance(op_data, dict) else op_data.model_dump()
                                     has_else = "else" in raw_data or "else_" in raw_data or "else" in attributes
                                     
                                     res_types = []
-                                    # ... (res_type logic)
+                                    # Scan then_ops for yield types
+                                    for o in then_ops:
+                                        o_op = get_attr(o, "op")
+                                        if o_op == "yield":
+                                            y_args = get_attr(o, "args", [])
+                                            # Default to index for control flow state
+                                            res_types = [ir.IndexType.get() for _ in y_args]
+
                                     if_op = scf.IfOp(cond, res_types, has_else=has_else)
                                     
                                     process_ops(then_ops, InsertionPoint(if_op.then_block), ssa_map.copy())
@@ -253,6 +262,7 @@ def build_and_cache_mlir(verified_mlir_data: VerifiedMLIR, cache_json_path: str)
                                         res = if_op.results[0]
                                         for k, r in enumerate(if_op.results):
                                             ssa_map[f"{target_var}#{k}"] = r
+                                            ssa_map[f"%{target_var}#{k}"] = r
                                     else: res = None
                                 elif op == "yield":
                                     scf.YieldOp([resolve(a) for a in args if a])

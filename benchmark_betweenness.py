@@ -41,6 +41,10 @@ def run_betweenness_benchmark():
     # Kernel already defined in manual_compiler.py
     asyncio.run(aot_compile_all("networkx.algorithms.centrality.betweenness.betweenness_centrality"))
     
+    # Refresh registry after AOT compilation
+    global repo_betweenness
+    repo_betweenness = orchestrator.register_lazy_function("betweenness_centrality", original_py_betweenness, fqn)
+
     # 2. Trigger hot-swap (the 'Trampoline Trap')
     # Small graph for trigger
     try:
@@ -100,7 +104,6 @@ def run_betweenness_benchmark():
     t0 = time.perf_counter()
     start_mem_repo = psutil.Process().memory_info().rss / (1024 * 1024)
     
-    console.print(f"   [Action] Invoking repo_betweenness for Size={SCALE_SIZE}...")
     res_repo_large = repo_betweenness(G_LARGE, normalized=False)
     
     t_repo = time.perf_counter() - t0

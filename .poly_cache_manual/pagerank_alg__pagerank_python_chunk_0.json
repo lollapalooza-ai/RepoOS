@@ -1,5 +1,5 @@
 {
-  "function_name": "networkx_algorithms_link_analysis_pagerank_alg__pagerank_python_chunk_0",
+  "function_name": "pagerank_alg__pagerank_python_chunk_0",
   "thinking_process": "High-performance iterated CSR PageRank kernel.",
   "signature": {
     "res_ptr": "ptr",

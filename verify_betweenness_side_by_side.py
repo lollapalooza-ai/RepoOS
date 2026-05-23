@@ -16,6 +16,12 @@ console = Console()
 def verify_integrity():
     orchestrator = LazyCallManager()
     fqn = "networkx.algorithms.centrality.betweenness.betweenness_centrality"
+    
+    # 0. AOT Compile
+    from component9_aot import aot_compile_all
+    import asyncio
+    asyncio.run(aot_compile_all("networkx.algorithms.centrality.betweenness.betweenness_centrality"))
+
     repo_bc = orchestrator.register_lazy_function("bc", original_py, fqn)
     
     # 1. Create a fixed seed graph for reproducibility
