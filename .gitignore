@@ -4,6 +4,8 @@ venv/
 .poly_cache/
 .env
 build_venv/
+build_venv_311/
+oracle_logs/
 __pycache__/
 *.pyc
 requirements_temp.txt

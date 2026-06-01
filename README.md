@@ -115,6 +115,41 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 
 ---
 
+## 🏗 Detailed Lowering Flow (Step-by-Step)
+
+The RepoOS pipeline is a multi-stage bridge that transforms high-level Python intent into hardware-optimized machine code.
+
+### 1. Semantic Ingestion (Source to Graph)
+*   **Trigger**: `./repoos.sh <script> <package>` calls `component1_ingest.py`.
+*   **Resolution**: Resolves the package name to its actual `.py` file path (even inside venvs).
+*   **Parsing**: Uses **Tree-sitter** to parse Python source into an AST.
+*   **Storage**: AST metadata, code, and signatures are stored in **Neo4j**, serving as the "Ground Truth."
+
+### 2. AI Frontend Synthesis (Intent to Tracing)
+*   **Kernel Synthesis**: **Gemini 2.5 Pro** analyzes legacy Python and synthesizes a `torch.nn.Module` (the "Kernel Wrapper") containing the mathematical core.
+*   **Data Bridge Synthesis**: AI generates `prep_inputs` (Object-to-Tensor) and `post_process` (Tensor-to-Object) scripts for universal devirtualization.
+
+### 3. Deterministic Tracing (Torch to MLIR)
+*   **Capture**: **`torch-mlir`** executes the wrapper with AI-generated sample inputs, tracing the math into a stable **MLIR graph** (`linalg-on-tensors`).
+
+### 4. Bufferization (Tensors to Pointers)
+*   **Lowering**: High-level immutable Tensors are lowered to explicit memory pointers (MemRefs) via the `mlir-opt` `-one-shot-bufferize` pass.
+
+### 5. AI Optimization Oracle
+*   **Oracle Analysis**: Gemini reviews the raw MLIR and writes a **Transform Dialect** script specifically for the target hardware (e.g., Apple Silicon).
+*   **Optimization**: Applies **Tiling** (L1 Cache alignment), **SIMD Vectorization** (NEON), and **Loop Unrolling**.
+
+### 6. Backend Compilation (MLIR to Binary)
+*   **Translation**: `mlir-translate` converts the optimized graph into **LLVM IR**.
+*   **Sanitization**: A custom sanitizer strips incompatible LLVM attributes to ensure stability with the system `clang`.
+*   **Binary**: `clang` compiles the sanitized IR into a native **`.dylib`**.
+
+### 7. Runtime Orchestration (The Drop-in Swap)
+*   **Hijacking**: `component6` intercepts imports and attaches "Shadow Trampolines" to target functions.
+*   **Execution**: `component5` runs the `prep_inputs` script, maps buffers to **zero-copy MemRef Descriptors**, invokes the native kernel, and revirtualizes the result via `post_process`.
+
+---
+
 ## 🔧 Component Overview
 
 | Component | Name | Responsibility |
@@ -136,3 +171,9 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 1.  **Always use Zero-Copy:** Passing Python lists incurs an O(N) copy tax. For maximum performance, use NumPy arrays which RepoOS detects and processes with **0ns** data transfer cost.
 2.  **Verify via Manual Pipeline:** If a new kernel is failing, run `test_manual_pipeline.py` first to isolate whether the issue is in the MLIR logic or the AI translation.
 3.  **Check Neo4j:** Ensure `component1` has successfully chunked your function by querying the Neo4j browser before running `component9`.
+
+### Unified Execution via `repoos.sh`
+The `repoos.sh` script is the primary entry point for the RepoOS drop-in agent. It handles ingestion, tracing, optimization, and hijacked execution in a single command.
+
+### Benchmark (Uses Dynamic FFI to execute the kernel and compare vs NumPy)
+./build_venv/bin/python3 component8-pagerank-v2-benchmark.py

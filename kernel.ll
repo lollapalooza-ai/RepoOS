@@ -1,8 +1,7 @@
 ; ModuleID = 'LLVMDialectModule'
 source_filename = "LLVMDialectModule"
 
-define void @betweenness_betweenness_centrality_chunk_1(ptr %0, double %1) {
-  store double %1, ptr %0, align 8
+define void @main(ptr %0, ptr %1, ptr %2, ptr %3, double %4, i64 %5, ptr %6) {
   ret void
 }
 

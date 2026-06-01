@@ -44,12 +44,12 @@ class PolyKernelLoader(Loader):
             if inspect.isclass(obj) and obj.__module__ == module.__name__:
                 for method_name, method_obj in inspect.getmembers(obj, predicate=inspect.isfunction):
                     fqn = f"{module.__name__}.{name}.{method_name}"
-                    trampoline = self.orchestrator.register_lazy_function(method_name, method_obj, fqn)
+                    trampoline = self.orchestrator.wrap(fqn, method_obj)
                     setattr(obj, method_name, trampoline) # Patch the class directly
                     func_count += 1
             elif inspect.isfunction(obj) and obj.__module__ == module.__name__:
                 fqn = f"{module.__name__}.{name}"
-                trampoline = self.orchestrator.register_lazy_function(name, obj, fqn)
+                trampoline = self.orchestrator.wrap(fqn, obj)
                 setattr(module, name, trampoline)
                 func_count += 1
                 
