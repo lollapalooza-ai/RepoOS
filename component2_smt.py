@@ -39,38 +39,41 @@ def log_oracle_interaction(stage: str, prompt: str, response: str):
 async def generate_traceable_wrapper(python_code: str) -> str:
     """
     Uses Gemini to synthesize a torch.nn.Module wrapper for the provided Python logic.
-    ENFORCES STRICT DENSE LINEAR ALGEBRA and DESTINATION-PASSING STYLE (DPS).
+    ENFORCES THE 'PURE CONSUMER MANDATE' for stable sparse math.
     """
     prompt = f"""
     You are an expert compiler engineer. Convert the following Python algorithm into a PyTorch `nn.Module` class named `GeneratedModule`.
     
-    ### CRITICAL: DESTINATION-PASSING STYLE (DPS) ###
-    The `forward` method MUST take a pre-allocated `out` Tensor as its final argument.
-    You must write the final mathematical result into this buffer using in-place operations like `out.copy_()`.
-    To satisfy the tracer, you MUST return the mutated `out` tensor at the end of the function.
+    ### CRITICAL: THE PURE CONSUMER MANDATE (SPARSE MATH) ###
+    - You are strictly a MATH CONSUMER. 
+    - Do NOT attempt to construct, instantiate, or convert tensors inside the `forward` method. 
+    - FATAL ERROR WARNING: Do NOT use `.new_sparse_csr_tensor()`, `.to_sparse()`, or any constructor inside `forward`.
+    - ASSUME the `prep_inputs` data bridge has ALREADY converted the graph into a `torch.sparse_csr_tensor`.
+    - Your `forward` method signature MUST simply accept the CSR tensor as an input argument (e.g., `adj_csr`).
+    - You MUST use `torch.sparse.mm(adj_csr, vector)` to perform the math.
     
     EXAMPLE:
     ```python
     class GeneratedModule(torch.nn.Module):
-        def forward(self, A: torch.Tensor, B: torch.Tensor, out: torch.Tensor):
-            out.copy_(torch.matmul(A, B))
+        def forward(self, adj_csr: torch.Tensor, node_vals: torch.Tensor, out: torch.Tensor):
+            out.copy_(torch.sparse.mm(adj_csr, node_vals))
             return out # MUST return the mutated buffer
     ```
 
-    ### CRITICAL: DENSE LINEAR ALGEBRA ONLY ###
-    This module will be traced by `torch-mlir` directly into the dense `linalg` MLIR dialect. You MUST avoid sparse operations.
-    
-    WHITELISTED OPERATIONS: 
-    - Dense matrix multiplication (`torch.matmul`, `torch.mm`, `@`)
-    - Element-wise arithmetic (`torch.add`, `torch.mul`, `+`, `*`, `/`)
-    - Reductions (`torch.sum`, `torch.mean`)
-    - In-place assignments (`out.copy_`, `out.add_`)
-    
-    ILLEGAL OPERATIONS (DO NOT USE - WILL CRASH COMPILER):
-    - `torch.index_add`, `torch.gather`, `torch.scatter`, `torch.sparse_*`, `torch.outer`, `torch.ger`
-    
-    If the original algorithm is a graph traversal (like PageRank), convert the logic to use Dense Adjacency Matrices instead of edge-list iteration.
-    
+    ### CRITICAL TRACER RULES (THE LOOP-FREE MANDATE) ###
+    - FATAL ERROR WARNING: Do NOT use Python `for` loops or `while` loops inside the `forward` method.
+    - FATAL ERROR WARNING: Do NOT use Python `if` statements or conditional branching that depends on tensor values.
+    - The PyTorch tracer will CRASH if you attempt to iterate over tensor indices manually.
+    - You MUST use 100% straight-line, vectorized tensor algebra.
+
+    ### CRITICAL: DESTINATION-PASSING STYLE (DPS) ###
+    The `forward` method MUST take a pre-allocated dense `out` Tensor as its final argument.
+    You must write the final mathematical result into this buffer and return it.
+
+    ### CRITICAL: KERNEL ISOLATION (PEEL & MATCH) ###
+    Do NOT synthesize setup logic, masking, or graph-parsing.
+    The kernel MUST contain ONLY the core mathematical hotspot.
+
     PYTHON LOGIC:
     ```python
     {python_code}
@@ -78,10 +81,10 @@ async def generate_traceable_wrapper(python_code: str) -> str:
     
     STRICT RULES:
     1. Output ONLY the Python code for the class `GeneratedModule(torch.nn.Module)`.
-    2. USE DATA-FLOW ONLY: Synthesize the core mathematical kernel.
-    3. NO DATA-DEPENDENT CONTROL FLOW: Never use `.item()`, `bool()`, or `if tensor > x`.
-    4. STRICT TENSOR SIGNATURE: The `forward` method MUST take ONLY `torch.Tensor`, `int`, or `float`. 
-    5. STATELESS MODULE: The `__init__` method MUST NOT take any arguments. Initialize hyperparameters as arguments to `forward`.
+    2. USE DATA-FLOW ONLY.
+    3. NO DATA-DEPENDENT CONTROL FLOW.
+    4. STRICT TENSOR SIGNATURE: `forward` must take ONLY standard `torch.Tensor` (dense or sparse) or scalars. 
+    5. STATELESS MODULE: The `__init__` method MUST NOT take any arguments.
     """
     
     try:
@@ -97,10 +100,10 @@ async def generate_traceable_wrapper(python_code: str) -> str:
 
 async def generate_data_bridge(python_code: str, wrapper_code: str) -> dict:
     """
-    Synthesizes the Prep and Post scripts to bridge high-level objects to Dense Tensor Kernels.
+    Synthesizes the Prep and Post scripts to bridge high-level objects to the Tensor-Only ABI.
     """
     prompt = f"""
-    You are a system architect. Create a 'Data Bridge' to connect a legacy Python function to a native dense Tensor Kernel.
+    You are a system architect. Create a 'Data Bridge' to connect a legacy Python function to a native CSR Sparse Kernel.
     
     ORIGINAL LOGIC:
     ```python
@@ -113,16 +116,15 @@ async def generate_data_bridge(python_code: str, wrapper_code: str) -> dict:
     ```
     
     TASK:
-    1. Write a `prep_inputs(*args, **kwargs)` function that transforms the legacy arguments into the Tensors expected by `GeneratedModule.forward`.
-    2. CRITICAL: As the kernel uses Destination-Passing Style, `prep_inputs` MUST also allocate and return the `out` tensor as the FINAL element of the return list.
-    3. Write a `post_process(tensor_output, *args, **kwargs)` function that transforms the native output back to the legacy format.
-    
-    CRITICAL CONSTRAINT:
-    If the input is a NetworkX graph, convert it into a DENSE Adjacency Matrix `torch.Tensor`. Do not return sparse CSR arrays.
+    1. Write a `prep_inputs(*args, **kwargs)` function.
+    2. CRITICAL: Every scalar (float/int) MUST be converted to a `torch.tensor()`.
+    3. Return a list of tensors matching the `forward` signature.
+    4. Include the dense `out` tensor as the FINAL element.
+    5. Write a `post_process(tensor_output, *args, **kwargs)` function.
     
     STRICT RULES:
-    1. Output ONLY a valid JSON object with keys "prep" and "post" containing the Python code strings.
-    2. Ensure standard imports (torch, numpy, networkx as nx) are handled inside the functions if needed.
+    1. Output ONLY a valid JSON object with keys "prep" and "post".
+    2. Import any required libraries (torch, numpy, etc.) inside the functions.
     """
     
     try:
@@ -140,7 +142,7 @@ async def generate_data_bridge(python_code: str, wrapper_code: str) -> dict:
 
 async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> str:
     """
-    Generates sample torch Tensors for tracing.
+    Generates sample torch Tensors for the Tensor-Only ABI.
     """
     prompt = f"""
     Provide sample inputs as a Python dictionary for this Torch Wrapper.
@@ -149,9 +151,9 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
     {wrapper_code}
     
     STRICT RULES:
-    1. Output ONLY a Python dictionary string, e.g., '{{"arg1": torch.randn(10)}}'.
-    2. Dictionary keys MUST exactly match `forward` arguments.
-    3. Include a correctly sized `out` tensor as the final entry.
+    1. Output ONLY a Python dictionary string.
+    2. EVERY entry MUST be a `torch.tensor()`. NO naked floats or ints.
+    3. Provide raw `crow_indices`, `col_indices`, and `values` as dense 1D tensors.
     """
     
     try:
@@ -180,18 +182,18 @@ async def generate_transform_script(base_mlir_text: str, target_arch: str = "ARM
     
     CRITICAL SYNTAX RULES (PEDANTIC MLIR):
     - Do NOT use `op_name = `. 
-    - You MUST include type signatures for all match operations.
+    - You MUST include type signatures on the RIGHT side of the `match` operation.
+    - FATAL ERROR: NEVER use explicit type labels on the LEFT side of an assignment.
+    - Example GOOD: `%func = transform.structured.match ...`
     - FATAL ERROR WARNING: Do NOT use brackets without curly braces (e.g., `ops["func.func"]`). 
-    - You MUST wrap the array in curly braces. 
-    - EXACT CORRECT SYNTAX: `transform.structured.match ops{{["linalg.generic"]}} in %arg0 : (!transform.any_op) -> !transform.any_op`
-    - FATAL ERROR WARNING: Do NOT use `transform.structured.fuse_into_containing_op`. It is banned.
-    - FATAL ERROR WARNING: `transform.structured.vectorize` does NOT take a type annotation (the colon `:`) or return value in this build.
-    - Example BAD: `%res = transform.structured.vectorize %0 : (!transform.any_op)` or `transform.structured.vectorize %0 : !transform.any_op`
-    - Example GOOD: `transform.structured.vectorize %0`
+    - You MUST wrap the array in curly braces: `ops{{"["}} "linalg.generic" {{"]"}}`
     - FATAL ERROR WARNING: Do NOT use or match the `iterator_types` attribute.
-
-    ### STABILITY MANDATE ###
-    - TEMPORARY BAN: Do NOT use `transform.structured.tile_using_for`. The upstream syntax is currently too volatile. Rely ONLY on `transform.structured.vectorize` and loop unrolling.
+    - FATAL ERROR WARNING: Do NOT use `transform.structured.fuse_into_containing_op`, `transform.structured.fuse`, or `single_result_user_of`.
+    - TEMPORARY BAN: Do NOT use `transform.structured.tile_using_for`. Rely ONLY on vectorization and loop unrolling.
+    
+    # --- NEW VECTORIZE RULE ---
+    - FATAL ERROR WARNING: `transform.structured.vectorize` MUST take a type annotation (the colon `:`) but NOT a return arrow (`->`).
+    - EXACT CORRECT SYNTAX: `transform.structured.vectorize %0 : !transform.any_op`
     
     # TODO: Fix syntax volatility and re-enable the following:
     # - FATAL ERROR WARNING: `transform.structured.tile` is deprecated. 

@@ -148,6 +148,12 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         print("[Compiler] Stage 3A: Bufferization to MemRefs...")
         subprocess.run([
             MLIR_OPT, target_mlir,
+            # --- THE SPARSE LOWERING BLOCK (Architecture V2 Sparse) ---
+            "--sparse-assembler",
+            "--sparsification",
+            "--sparse-tensor-conversion",
+            # --- END SPARSE BLOCK ---
+
             "--empty-tensor-to-alloc-tensor",
             # THE FIX: Force flat C-arrays
             "--one-shot-bufferize=bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map",

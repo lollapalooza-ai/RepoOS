@@ -38,22 +38,33 @@ class PolyKernelLoader(Loader):
             else:
                 raise e
 
-        # 3. UPGRADED: Class-Level Hijacking
-        func_count = 0
+        # 3. UPGRADED: Global Reference Patching
+        import inspect
         for name, obj in inspect.getmembers(module):
-            if inspect.isclass(obj) and obj.__module__ == module.__name__:
-                for method_name, method_obj in inspect.getmembers(obj, predicate=inspect.isfunction):
-                    fqn = f"{module.__name__}.{name}.{method_name}"
-                    trampoline = self.orchestrator.wrap(fqn, method_obj)
-                    setattr(obj, method_name, trampoline) # Patch the class directly
-                    func_count += 1
-            elif inspect.isfunction(obj) and obj.__module__ == module.__name__:
-                fqn = f"{module.__name__}.{name}"
-                trampoline = self.orchestrator.wrap(fqn, obj)
-                setattr(module, name, trampoline)
-                func_count += 1
+            if inspect.isfunction(obj) or inspect.isclass(obj):
+                target_fqn = f"{module.__name__}.{name}"
                 
-        print(f"[Hijacker] 2. Attached {func_count} SHADOW JIT Trampolines to '{module.__name__}'.\n")
+                # Ask Orchestrator to wrap it (uses the correct modern 'wrap' API)
+                trampoline = self.orchestrator.wrap(target_fqn, obj)
+                
+                if trampoline:
+                    # A. Patch the immediate module
+                    setattr(module, name, trampoline)
+                    
+                    # B. GLOBAL MRO HACK: Search all loaded modules for stale aliases
+                    # This ensures things like 'from networkx import pagerank' are also accelerated
+                    for mod_name, mod in list(sys.modules.items()):
+                        if mod and mod_name != module.__name__:
+                            try:
+                                # Look for attributes that point to the original object
+                                for attr_name, attr_obj in inspect.getmembers(mod):
+                                    if attr_obj is obj:
+                                        setattr(mod, attr_name, trampoline)
+                                        # print(f"      [Global Patch] Swapped {attr_name} in {mod_name}")
+                            except Exception:
+                                pass
+                
+        print(f"[Hijacker] 2. Attached SHADOW JIT Trampolines to '{module.__name__}'.\n")
 
 class PolyKernelFinder(MetaPathFinder):
     def __init__(self, target_package: str, orchestrator: LazyCallManager):

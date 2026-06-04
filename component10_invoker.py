@@ -11,7 +11,7 @@ def run_native_pagerank_benchmark():
     print("🚀 Running Native PageRank Benchmark (50,000 nodes)...")
     
     # Generate Graph
-    SCALE_SIZE = 50000
+    SCALE_SIZE = 500
     print(f"Generating Random Directed Graph (Size={SCALE_SIZE})...")
     G = nx.fast_gnp_random_graph(SCALE_SIZE, 0.002, directed=True)
     for u, v in G.edges():

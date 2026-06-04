@@ -1,17 +1,20 @@
 import torch
 import torch_mlir
-from torch_mlir.fx import export_and_import
 from typing import Callable, Tuple
 
 def trace_to_base_mlir(func: torch.nn.Module, sample_args: Tuple[torch.Tensor, ...]) -> str:
     """
     Generalized Tracer: Captures ANY Python/Torch function into MLIR.
-    Now using the source-built torch-mlir library with the stable FX path.
+    UPGRADED: Using torch.jit.trace for superior stability with Sparse Tensors.
     """
-    # This is the exact entry point we verified successful on your Mac!
-    module = export_and_import(
-        func, 
-        *sample_args, 
+    # 1. Capture via JIT Trace (Handles Sparse CSR perfectly)
+    # We use a wrapper to ensure the output is returned correctly for the tracer
+    scripted_module = torch.jit.trace(func, sample_args)
+    
+    # 2. Lower to MLIR (Linalg-on-Tensors)
+    module = torch_mlir.compile(
+        scripted_module, 
+        sample_args, 
         output_type="linalg-on-tensors"
     )
     return str(module)

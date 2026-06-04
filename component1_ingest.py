@@ -43,12 +43,32 @@ def get_arg_info(func_code):
         return 0, {}, {}
 
 def normalize_fqn(module_path: str, func_name: str) -> str:
-    # Strip absolute paths and 'site-packages'
-    if "site-packages/" in module_path:
-        module_path = module_path.split("site-packages/")[1]
+    """
+    Surgically generates clean FQNs by stripping machine-specific paths.
+    Matches Python's __module__ + __qualname__ identity.
+    """
+    # Use absolute path to ensure consistent splitting
+    abs_path = os.path.abspath(module_path)
     
-    # Convert path slashes to dots and remove .py
-    clean_module = module_path.replace(".py", "").replace("/", ".")
+    if "site-packages/" in abs_path:
+        # Handle library code
+        clean_module = abs_path.split("site-packages/")[1]
+    else:
+        # Handle local project code
+        clean_module = os.path.relpath(abs_path, os.getcwd())
+    
+    # Convert to dot notation
+    clean_module = clean_module.replace(".py", "").replace("/", ".")
+    # Remove leading dots or common artifacts
+    if clean_module.startswith("."): clean_module = clean_module[1:]
+    
+    # STRIP __INIT__: Match Python's runtime module reporting
+    if clean_module.endswith(".__init__"):
+        clean_module = clean_module[:-9]
+    elif clean_module == "__init__":
+        clean_module = ""
+    
+    if not clean_module: return func_name
     return f"{clean_module}.{func_name}"
 
 def process_file(file_path, forced_module_name=None):
@@ -59,30 +79,11 @@ def process_file(file_path, forced_module_name=None):
     class_query = PY_LANGUAGE.query("(class_definition name: (identifier) @class.name) @class.node")
     func_query = PY_LANGUAGE.query("(function_definition name: (identifier) @func.name) @func.node")
     
+    # Calculate base module name using same logic as FQN
     if forced_module_name:
         module_name = forced_module_name
     else:
-        # Generic FQN Generation: Find the package root (closest directory with __init__.py or site-packages)
-        abs_path = os.path.abspath(file_path)
-        parts = abs_path.split(os.sep)
-        
-        # 1. Check if inside site-packages
-        if "site-packages" in parts:
-            idx = parts.index("site-packages")
-            rel_parts = parts[idx+1:]
-        else:
-            # 2. Walk up to find the project root (no more __init__.py)
-            package_root_idx = len(parts) - 1
-            for i in range(len(parts) - 1, 0, -1):
-                temp_path = os.sep.join(parts[:i])
-                if not os.path.exists(os.path.join(temp_path, "__init__.py")):
-                    package_root_idx = i
-                    break
-            rel_parts = parts[package_root_idx:]
-
-        module_name = ".".join(rel_parts).replace('.py', '')
-        if module_name.endswith('.__init__'):
-            module_name = module_name[:-9]
+        module_name = normalize_fqn(file_path, "").rstrip(".")
     
     with driver.session() as session:
         session.run("""
