@@ -36,6 +36,105 @@ def log_oracle_interaction(stage: str, prompt: str, response: str):
     print(f"\n<<< FULL RESPONSE FROM GEMINI:\n{response}")
     print("="*80 + "\n")
 
+async def generate_cpp_fsm(python_code: str) -> str:
+    """
+    Generates a high-performance C++ Finite State Machine or Byte Parser.
+    """
+    prompt = f"""
+    Translate this Python string/byte manipulation logic into a high-performance C++ Finite State Machine or byte parser.
+    Use switch statements, character-by-character scanning, and direct pointer manipulation for speed.
+    
+    RULES:
+    1. Signature MUST be: `extern "C" void _mlir_ciface_main(const char* data, size_t len, float* out)`.
+    2. Use `extern "C"` to prevent name mangling.
+    3. No external dependencies (no std::string, no std::vector). Use raw pointers.
+    4. Write the results directly into the `out` buffer.
+    
+    PYTHON LOGIC:
+    {python_code}
+    """
+    try:
+        response = await client.aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        res_text = response.text
+        log_oracle_interaction("fsm_synthesis", prompt, res_text)
+        match = re.search(r"```cpp\n(.*?)\n```", res_text, re.DOTALL)
+        if match: return match.group(1)
+        return res_text
+    except Exception as e:
+        print(f"[Oracle] Failed to generate FSM: {e}")
+        return ""
+
+async def compile_function_logic(python_code: str, execution_track: str):
+    """The Call 1 Poly-Kernel Router"""
+    
+    if execution_track == "MATH":
+        print("[Oracle] 🧮 Math Track: Generating PyTorch/DPS Module...")
+        return await generate_traceable_wrapper(python_code)
+        
+    elif execution_track == "FSM":
+        print("[Oracle] 🧵 FSM Track: Generating C++ Byte Parser...")
+        return await generate_cpp_fsm(python_code)
+        
+    elif execution_track == "TABULAR":
+        print("[Oracle] 🗄️ Tabular Track: Generating C++ Apple Silicon Engine...")
+        prompt = f"""
+        Translate this ORM logic into a Zero-Copy C++ Kernel optimized for Apple Silicon (ARM64).
+        RULES:
+        1. Input is a Struct-of-Arrays (e.g., `const float* col1`, `const float* col2`).
+        2. Use generic, auto-vectorizable C++ or ARM NEON intrinsics. Do NOT use x86 immintrin.h.
+        3. Write directly to `float* out_buffer`.
+        4. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
+        
+        PYTHON LOGIC:
+        {python_code}
+        """
+        try:
+            response = await client.aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            res_text = response.text
+            log_oracle_interaction("tabular_synthesis", prompt, res_text)
+            match = re.search(r"```cpp\n(.*?)\n```", res_text, re.DOTALL)
+            return match.group(1) if match else res_text
+        except Exception as e:
+            print(f"[Oracle] Tabular synthesis failed: {e}")
+            return ""
+        
+    elif execution_track == "BRANCHING":
+        print("[Oracle] 🌳 Branching Track: Generating MLIR SCF Dialect...")
+        prompt = f"""
+        Translate this nested rule engine into MLIR Structured Control Flow (scf) and Control Flow (cf) dialects.
+        RULES:
+        1. Use `scf.if` and `scf.yield`.
+        2. Do NOT use Python runtime dependencies.
+        3. Aim for branch-optimized assembly.
+        4. FATAL ERROR WARNING: You MUST enclose the entire code in a `module {{ ... }}` block.
+        5. Every `scf.if` that returns a value MUST use the `-> (type)` syntax.
+        6. OUTPUT AS JSON: You MUST output a single JSON object with a key "mlir" containing the raw MLIR string.
+        
+        PYTHON LOGIC:
+        {python_code}
+        """
+        try:
+            response = await client.aio.models.generate_content(
+                model='gemini-2.5-flash', 
+                config={'response_mime_type': 'application/json'},
+                contents=prompt
+            )
+            res_text = response.text
+            log_oracle_interaction("branching_synthesis", prompt, res_text)
+            try:
+                data = json.loads(res_text)
+                return data.get("mlir", res_text)
+            except json.JSONDecodeError:
+                match = re.search(r"```mlir\n(.*?)\n```", res_text, re.DOTALL)
+                return match.group(1) if match else res_text
+        except Exception as e:
+            print(f"[Oracle] Branching synthesis failed: {e}")
+            return ""
+        
+    elif execution_track == "CRYPTO":
+        print("[Oracle] 🔐 Crypto Track: Bypassing AI. Linking Native libsodium...")
+        return "USE_NATIVE_LIBSODIUM"
+
 async def generate_traceable_wrapper(python_code: str) -> str:
     """
     Uses Gemini to synthesize a torch.nn.Module wrapper for the provided Python logic.
@@ -85,6 +184,7 @@ async def generate_traceable_wrapper(python_code: str) -> str:
     3. NO DATA-DEPENDENT CONTROL FLOW.
     4. STRICT TENSOR SIGNATURE: `forward` must take ONLY standard `torch.Tensor` (dense or sparse) or scalars. 
     5. STATELESS MODULE: The `__init__` method MUST NOT take any arguments.
+    6. NO CONVERSATION OR COMMENTS: Output ONLY the code block starting with ```python.
     """
     
     try:
@@ -152,8 +252,9 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
     
     STRICT RULES:
     1. Output ONLY a Python dictionary string.
-    2. EVERY entry MUST be a `torch.tensor()`. NO naked floats or ints.
-    3. Provide raw `crow_indices`, `col_indices`, and `values` as dense 1D tensors.
+    2. FATAL ERROR WARNING: Do NOT return a list of dictionaries or multiple test cases. You MUST return exactly ONE flat dictionary representing ONE execution frame.
+    3. EVERY entry MUST be a `torch.tensor()`. NO naked floats or ints.
+    4. Provide raw `crow_indices`, `col_indices`, and `values` as dense 1D tensors.
     """
     
     try:

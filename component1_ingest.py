@@ -16,6 +16,67 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 PY_LANGUAGE = Language(tspython.language())
 parser = Parser(PY_LANGUAGE)
 
+class SemanticClassifier(ast.NodeVisitor):
+    def __init__(self):
+        self.scores = {"MATH": 0, "FSM": 0, "TABULAR": 0, "BRANCHING": 0, "CRYPTO": 0}
+        self.crypto_keywords = {'hashlib', 'hmac', 'jwt', 'bcrypt', 'AES', 'encrypt', 'verify'}
+
+    def visit_Call(self, node):
+        func_name = ""
+        # Check for crypto keywords in the entire call chain
+        call_str = ast.unparse(node.func).lower()
+        if any(crypto in call_str for crypto in self.crypto_keywords):
+            self.scores["CRYPTO"] += 100
+            
+        if isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+            # FSM Heuristics: String/Byte manipulation
+            if func_name in ['split', 'replace', 'encode', 'decode', 'loads', 'dumps']:
+                self.scores["FSM"] += 5
+            # Tabular/ORM Heuristics: Database queries
+            elif func_name in ['filter', 'all', 'query', 'execute', 'fetch', 'select', 'where']:
+                self.scores["TABULAR"] += 5
+        
+        self.generic_visit(node)
+
+    def visit_ListComp(self, node):
+        # Tabular Heuristics: Filtering collections
+        self.scores["TABULAR"] += 2
+        self.generic_visit(node)
+
+    def visit_If(self, node):
+        # Branching Heuristics: High density of control flow
+        self.scores["BRANCHING"] += 2
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        # Math/Tabular Heuristics: Heavy looping
+        self.scores["MATH"] += 1
+        self.scores["TABULAR"] += 1
+        self.generic_visit(node)
+
+    def visit_BinOp(self, node):
+        # Math Heuristics: Dense arithmetic
+        if isinstance(node.op, (ast.Mult, ast.MatMult, ast.Add, ast.Sub)):
+            self.scores["MATH"] += 2
+        self.generic_visit(node)
+
+def determine_execution_track(func_code: str) -> str:
+    """Call 0: The Automated Hotspot Extractor"""
+    try:
+        tree = ast.parse(func_code)
+        classifier = SemanticClassifier()
+        classifier.visit(tree)
+        
+        # Win conditions
+        if classifier.scores["CRYPTO"] >= 100: return "CRYPTO"
+        
+        # Return the track with the highest heuristic score, default to MATH
+        best_track = max(classifier.scores, key=classifier.scores.get)
+        return best_track if classifier.scores[best_track] > 0 else "MATH"
+    except SyntaxError:
+        return "FSM" # Fallback for non-standard syntax
+
 def get_arg_info(func_code):
     """
     Extracts number of arguments, type hints, and string-to-enum mappings.
@@ -130,6 +191,7 @@ def process_file(file_path, forced_module_name=None):
                             method_fqn = normalize_fqn(file_path, f"{class_name}.{method_name}")
                             method_body = source_code[child.start_byte:child.end_byte]
                             arg_count, hints, enum_map = get_arg_info(method_body)
+                            track = determine_execution_track(method_body)
                             arg_names = [a.split('=')[0].strip() for a in method_params.strip("() ").split(',') if a.strip()]
 
                             session.run("""
@@ -141,12 +203,13 @@ def process_file(file_path, forced_module_name=None):
                                     f.type_hints = $hints, 
                                     f.enum_map = $enums, 
                                     f.signature = $sig,
+                                    f.execution_track = $track,
                                     f.base_mlir_path = "",
                                     f.ai_transform_script_path = "",
                                     f.optimized_dylib_path = "",
                                     f.needs_recompile = true
                                 MERGE (c)-[:HAS_METHOD]->(f)
-                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map), sig=json.dumps(arg_names))
+                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map), sig=json.dumps(arg_names), track=track)
                     elif child.type == "block":
                         find_methods(child)
             find_methods(class_info["node"])
@@ -172,6 +235,7 @@ def process_file(file_path, forced_module_name=None):
             
             arg_names = [a.split('=')[0].strip() for a in f_params.strip("() ").split(',') if a.strip()]
             arg_count, hints, _ = get_arg_info(f_code)
+            track = determine_execution_track(f_code)
             # USE NORMALIZED FQN
             fqn = normalize_fqn(file_path, f_name)
             
@@ -182,12 +246,13 @@ def process_file(file_path, forced_module_name=None):
                     f.code = $code, 
                     f.arg_count = $count, 
                     f.signature = $sig,
+                    f.execution_track = $track,
                     f.base_mlir_path = "",
                     f.ai_transform_script_path = "",
                     f.optimized_dylib_path = "",
                     f.needs_recompile = true
                 MERGE (m)-[:CONTAINS]->(f)
-            """, module=module_name, fqn=fqn, name=f_name, code=f_code, count=arg_count, sig=json.dumps(arg_names))
+            """, module=module_name, fqn=fqn, name=f_name, code=f_code, count=arg_count, sig=json.dumps(arg_names), track=track)
 
     print(f"✅ Ingested: {file_path}")
 

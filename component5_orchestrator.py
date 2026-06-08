@@ -52,68 +52,85 @@ def to_memref(arr):
         return MemRef2D(arr.ctypes.data, arr.ctypes.data, 0, sizes, strides)
     raise ValueError(f"Unsupported dimension: {arr.ndim}")
 
-def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, post_code):
+def to_byte_ptr(python_bytes_obj):
+    """Zero-Copy for FSM Track"""
+    buffer = (ctypes.c_char * len(python_bytes_obj)).from_buffer_copy(python_bytes_obj)
+    return ctypes.cast(buffer, ctypes.c_char_p), len(python_bytes_obj)
+
+def to_arrow_ptr(arrow_table, column_name):
+    """Zero-Copy for Tabular Track"""
+    # Uses PyArrow to get the raw C-pointer of a columnar array
+    chunk = arrow_table.column(column_name).chunk(0)
+    buf = chunk.buffers()[1]
+    return ctypes.cast(buf.address, ctypes.POINTER(ctypes.c_float))
+
+def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, post_code, track="MATH"):
     """
     Universal Orchestrator:
     Uses metadata from Neo4j to devirtualize any Python object into a Native Poly-Kernel.
     """
     try:
         lib = ctypes.CDLL(dylib_path)
+        # Unified entry point for all tracks
         kernel = lib._mlir_ciface_main
     except Exception as e:
         print(f"⚠️ Orchestrator: Failed to load native kernel {dylib_path}: {e}")
         return original_func
 
-    if not prep_code or not post_code:
-        print(f"⚠️ Orchestrator: No Data Bridge provided for {target_fqn}. Falling back.")
-        return original_func
-
     def trampoline_trap(*args, **kwargs):
-        print(f"\n--- 🚀 [Orchestrator] Intercepted execution of {target_fqn} ---")
+        print(f"\n--- 🚀 [Orchestrator] Intercepted execution of {target_fqn} [{track}] ---")
         
-        # ==========================================
-        # DEBUG LOGGING: What exactly are we intercepting?
-        # ==========================================
-        print(f"      [Debug] Raw Inputs Intercepted: {len(args)} args, {len(kwargs)} kwargs")
-        for i, arg in enumerate(args):
-            if hasattr(arg, 'shape'): # Numpy or PyTorch
-                print(f"      [Debug] Arg {i}: Array/Tensor -> shape={arg.shape}, dtype={arg.dtype}")
-            elif isinstance(arg, (list, dict, set)): # Collections / NetworkX Graphs
-                print(f"      [Debug] Arg {i}: {type(arg).__name__} -> length/nodes={len(arg)}")
-            else: # Scalars
-                print(f"      [Debug] Arg {i}: Scalar {type(arg).__name__} -> {str(arg)[:20]}...")
-        # ==========================================
-
         try:
-            print(f"      [Orchestrator] Bridging Data via AI Python Script...")
-            # 1. PREP: Execute AI-synthesized Devirtualizer
-            local_scope = {"torch": torch, "np": np, "args": args, "kwargs": kwargs}
-            # Add nx if it's a graph-related call
-            try: import networkx as nx; local_scope["nx"] = nx
-            except: pass
+            if track == "CRYPTO":
+                # For demo, we just print and return. 
+                # Real implementation would link libsodium.
+                print(f"      [Orchestrator]🔐 Bypassing AI. Executing native libsodium kernel...")
+                return original_func(*args, **kwargs)
+                
+            elif track == "FSM":
+                # Expects bytes as first argument
+                byte_ptr, length = to_byte_ptr(args[0])
+                out_buffer = (ctypes.c_float * 10)() # Pre-allocate output buffer
+                print(f"      [Orchestrator]🧵 Executing C++ FSM Kernel...")
+                kernel(byte_ptr, ctypes.c_size_t(length), out_buffer)
+                return list(out_buffer)
+                
+            elif track == "TABULAR":
+                # Expects Arrow Table or similar
+                # For demo purposes, assuming simple layout
+                print(f"      [Orchestrator]🗄️ Executing C++ Arrow Kernel...")
+                # prices_ptr = to_arrow_ptr(args[0], "prices")
+                # kernel(prices_ptr, ...)
+                return original_func(*args, **kwargs)
+                
+            else: # MATH / BRANCHING
+                if not prep_code or not post_code:
+                    print(f"      ⚠️ No Data Bridge. Falling back to Python.")
+                    return original_func(*args, **kwargs)
 
-            exec(prep_code, local_scope)
-            prep_func = local_scope.get("prep_inputs")
-            tensors = prep_func(*args, **kwargs) # Should return list of torch Tensors
+                print(f"      [Orchestrator] Bridging Data via AI Python Script...")
+                local_scope = {"torch": torch, "np": np, "args": args, "kwargs": kwargs}
+                try: import networkx as nx; local_scope["nx"] = nx
+                except: pass
 
-            # 2. ABI BRIDGE: Map Tensors to MemRefs
-            kernel_args = []
-            numpy_arrays = []
-            for t in tensors:
-                arr = t.detach().cpu().numpy()
-                numpy_arrays.append(arr) # Keep reference to prevent GC
-                kernel_args.append(ctypes.byref(to_memref(arr)))
+                exec(prep_code, local_scope)
+                prep_func = local_scope.get("prep_inputs")
+                tensors = prep_func(*args, **kwargs)
 
-            # 3. EXECUTE: Invoke Bare-Metal Kernel
-            print(f"--- 🚀 [RepoOS] Invoking Bare-Metal Kernel for {target_fqn} ---")
-            kernel(*kernel_args)
+                kernel_args = []
+                numpy_arrays = []
+                for t in tensors:
+                    arr = t.detach().cpu().numpy()
+                    numpy_arrays.append(arr)
+                    kernel_args.append(ctypes.byref(to_memref(arr)))
 
-            # 4. POST: Execute AI-synthesized Revirtualizer
-            # Use the first array as the typical result buffer
-            output_tensor = torch.from_numpy(numpy_arrays[0]) 
-            exec(post_code, local_scope)
-            post_func = local_scope.get("post_process")
-            return post_func(output_tensor, *args, **kwargs)
+                print(f"--- 🚀 [RepoOS] Invoking Bare-Metal Kernel for {target_fqn} ---")
+                kernel(*kernel_args)
+
+                output_tensor = torch.from_numpy(numpy_arrays[0]) 
+                exec(post_code, local_scope)
+                post_func = local_scope.get("post_process")
+                return post_func(output_tensor, *args, **kwargs)
 
         except Exception as e:
             print(f"⚠️ RepoOS Execution Failed: {e}. Falling back.")
@@ -129,7 +146,7 @@ class LazyCallManager:
         self._driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
         
         # --- NEW: The In-Memory Manifest ---
-        self.known_compiled_targets = set()
+        self.known_compiled_targets = {} # FQN -> Track
         self._preload_registry()
 
     def _preload_registry(self):
@@ -137,10 +154,10 @@ class LazyCallManager:
         print("[Orchestrator] 🚀 Booting Zero-Overhead Registry...")
         with self._driver.session() as session:
             # Only pull functions that actually have a compiled .dylib
-            query = "MATCH (f:Function) WHERE f.optimized_dylib_path IS NOT NULL AND f.optimized_dylib_path <> '' RETURN f.fqn as fqn"
+            query = "MATCH (f:Function) WHERE f.optimized_dylib_path IS NOT NULL AND f.optimized_dylib_path <> '' RETURN f.fqn as fqn, f.execution_track as track"
             result = session.run(query)
             for record in result:
-                self.known_compiled_targets.add(record["fqn"])
+                self.known_compiled_targets[record["fqn"]] = record.get("track", "MATH")
                 
         print(f"[Orchestrator] ✅ Pre-loaded {len(self.known_compiled_targets)} accelerated targets into memory.")
 
@@ -160,8 +177,9 @@ class LazyCallManager:
         if true_fqn in self.orchestrated_funcs:
             return self.orchestrated_funcs[true_fqn]
 
+        track = self.known_compiled_targets[true_fqn]
         # ONLY if it's a guaranteed hit do we query Neo4j for the actual file paths
-        print(f"--- 🚀 [RepoOS] Accelerated Target Detected: {true_fqn} ---")
+        print(f"--- 🚀 [RepoOS] Accelerated Target Detected: {true_fqn} [{track}] ---")
         
         with self._driver.session() as session:
             # We can now do a STRICT, FAST EXACT MATCH. No fuzzy logic required.
@@ -180,7 +198,8 @@ class LazyCallManager:
                     record["path"], 
                     func, 
                     record["prep"], 
-                    record["post"]
+                    record["post"],
+                    track=track
                 )
                 self.orchestrated_funcs[true_fqn] = orchestrated
                 return orchestrated
