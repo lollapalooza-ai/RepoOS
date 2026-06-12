@@ -6,7 +6,7 @@ import time
 from google import genai
 
 # Vertex AI Configuration
-PROJECT_ID = "911836544224"
+PROJECT_ID = "dotted-signer-491802-m7"
 LOCATION = "us-central1"
 
 # Primary Client: Vertex AI (GA)
@@ -76,12 +76,12 @@ async def compile_function_logic(python_code: str, execution_track: str):
         return await generate_cpp_fsm(python_code)
         
     elif execution_track == "TABULAR":
-        print("[Oracle] 🗄️ Tabular Track: Generating C++ Apple Silicon Engine...")
+        print("[Oracle] 🗄️ Tabular Track: Generating C++ x86_64 Linux Engine...")
         prompt = f"""
-        Translate this ORM logic into a Zero-Copy C++ Kernel optimized for Apple Silicon (ARM64).
+        Translate this ORM logic into a Zero-Copy C++ Kernel optimized for x86_64 Linux.
         RULES:
         1. Input is a Struct-of-Arrays (e.g., `const float* col1`, `const float* col2`).
-        2. Use generic, auto-vectorizable C++ or ARM NEON intrinsics. Do NOT use x86 immintrin.h.
+        2. Use generic, auto-vectorizable C++ or x86 AVX2/AVX-512 intrinsics. 
         3. Write directly to `float* out_buffer`.
         4. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
         
@@ -268,13 +268,13 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
         print(f"[Oracle] Failed to generate sample inputs: {e}")
         return "{}"
 
-async def generate_transform_script(base_mlir_text: str, target_arch: str = "ARM64 / Apple Silicon") -> str:
+async def generate_transform_script(base_mlir_text: str, target_arch: str = "x86_64 Linux") -> str:
     """
     Acts as the Compiler Optimization Oracle. Generates a Transform Dialect script.
     """
     prompt = f"""
     You are an expert MLIR engineer. Write a Transform Dialect script for the following baseline MLIR.
-    Focus on Cache tiling, unrolling, and NEON vectorization.
+    Focus on Cache tiling, unrolling, and AVX vectorization for x86_64 Linux.
     
     BASELINE MLIR:
     ```mlir

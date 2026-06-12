@@ -177,3 +177,9 @@ The `repoos.sh` script is the primary entry point for the RepoOS drop-in agent. 
 
 ### Benchmark (Uses Dynamic FFI to execute the kernel and compare vs NumPy)
 ./build_venv/bin/python3 component8-pagerank-v2-benchmark.py
+
+### Ubuntu OS Run Command
+To run the AOT compilation pipeline on Ubuntu:
+```bash
+export PYTHONPATH=/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 component9_aot.py test_tracks
+```
