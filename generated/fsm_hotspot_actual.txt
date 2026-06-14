@@ -1,0 +1,74 @@
+# --- DATA BRIDGE ---
+def prep_inputs(*args, **kwargs):
+    import torch
+    import requests
+    import json
+
+    # 1. Fetch massive payload from the legacy shop API
+    # In a real-world scenario, the API endpoint might be passed via kwargs
+    response = requests.get("http://127.0.0.1:8080/api/v1/orders")
+    orders = response.json()
+    
+    # 2. Extract the target values for summation
+    values_list = [order["cart"]["total_value"] for order in orders]
+    num_nodes = len(values_list)
+
+    # 3. Create the 'node_vals' tensor (shape [N, 1])
+    # This contains the actual values to be summed.
+    node_vals = torch.tensor(values_list, dtype=torch.float32).unsqueeze(1)
+
+    # 4. Create the sparse 'adj_csr' tensor (shape [1, N]) to perform summation.
+    # This is a sparse representation of a single row vector of all ones: [1, 1, ..., 1].
+    # Multiplying this by the column vector 'node_vals' performs a sum.
+    crow_indices = torch.tensor([0, num_nodes], dtype=torch.int64)
+    col_indices = torch.arange(num_nodes, dtype=torch.int64)
+    values = torch.ones(num_nodes, dtype=torch.float32)
+    adj_csr = torch.sparse_csr_tensor(crow_indices, col_indices, values, size=(1, num_nodes))
+
+    # 5. Create the pre-allocated dense output tensor as required by the kernel.
+    out = torch.zeros((1, 1), dtype=torch.float32)
+
+    # 6. Return a list of tensors matching the 'forward' signature.
+    return [adj_csr, node_vals, out]
+
+def post_process(tensor_output, *args, **kwargs):
+    import torch
+
+    # The kernel's output is a tensor of shape [1, 1] containing the final sum.
+    # The .item() method extracts the scalar value from the tensor.
+    final_sum = tensor_output.item()
+
+    return final_sum
+
+# --- ACTUAL KERNEL ---
+import torch
+import torch.nn as nn
+
+class GeneratedModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, adj_csr: torch.Tensor, node_vals: torch.Tensor, out: torch.Tensor):
+        """
+        Calculates the sum of node_vals by interpreting it as a sparse matrix multiplication.
+        The input 'adj_csr' is assumed to be a sparse matrix of shape [1, N]
+        containing all ones, which, when multiplied by the 'node_vals' tensor of shape
+        [N, 1], effectively sums the values in 'node_vals'.
+        
+        Args:
+            adj_csr (torch.Tensor): A sparse CSR tensor of shape [1, num_nodes].
+            node_vals (torch.Tensor): A dense tensor of shape [num_nodes, 1] 
+                                      containing the values to be summed.
+            out (torch.Tensor): A pre-allocated dense tensor of shape [1, 1] to
+                                store the final result.
+        
+        Returns:
+            torch.Tensor: The mutated 'out' tensor containing the sum.
+        """
+        # Perform the sparse matrix-vector product to sum the values.
+        res = torch.sparse.mm(adj_csr, node_vals)
+        
+        # Write the result into the pre-allocated output buffer.
+        torch.add(res, 0, out=out)
+        
+        return out

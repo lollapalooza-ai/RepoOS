@@ -1,0 +1,23 @@
+module {
+  func.func @branching_hotspot(%arg0: i32) -> i32 {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %c100 = arith.constant 100 : i32
+    %c200 = arith.constant 200 : i32
+
+    %cond0 = arith.cmpi sgt, %arg0, %c100 : i32
+    %result = scf.if %cond0 -> (i32) {
+      %cond1 = arith.cmpi slt, %arg0, %c200 : i32
+      %inner_result = scf.if %cond1 -> (i32) {
+        scf.yield %c1 : i32
+      } else {
+        scf.yield %c2 : i32
+      }
+      scf.yield %inner_result : i32
+    } else {
+      scf.yield %c0 : i32
+    }
+    func.return %result : i32
+  }
+}

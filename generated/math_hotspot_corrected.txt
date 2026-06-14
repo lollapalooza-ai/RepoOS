@@ -1,0 +1,10 @@
+import torch
+import torch.nn as nn
+
+class GeneratedModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, adj_csr: torch.Tensor, node_vals: torch.Tensor):
+        # FIX: Return directly to bypass 'Preserve Memory Format' tracer error
+        return torch.sparse.mm(adj_csr, node_vals) + 0.15

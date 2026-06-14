@@ -1,0 +1,28 @@
+--- STAGE: branching_synthesis ---
+--- PROMPT ---
+
+        Translate this nested rule engine into MLIR Structured Control Flow (scf) and Control Flow (cf) dialects.
+        RULES:
+        1. Use `scf.if` and `scf.yield`.
+        2. Do NOT use Python runtime dependencies.
+        3. Aim for branch-optimized assembly.
+        4. FATAL ERROR WARNING: You MUST enclose the entire code in a `module { ... }` block.
+        5. Every `scf.if` that returns a value MUST use the `-> (type)` syntax.
+        6. OUTPUT AS JSON: You MUST output a single JSON object with a key "mlir" containing the raw MLIR string.
+        
+        PYTHON LOGIC:
+        def branching_hotspot(val):
+    # Rule engine style
+    if val > 100:
+        if val < 200:
+            return 1
+        else:
+            return 2
+    else:
+        return 0
+        
+
+--- RESPONSE ---
+{
+  "mlir": "module {\n  func.func @branching_hotspot(%arg0: i32) -> i32 {\n    %c0 = arith.constant 0 : i32\n    %c1 = arith.constant 1 : i32\n    %c2 = arith.constant 2 : i32\n    %c100 = arith.constant 100 : i32\n    %c200 = arith.constant 200 : i32\n\n    // if val > 100:\n    %cond0 = arith.cmpi sgt, %arg0, %c100 : i32\n    %result = scf.if %cond0 -> (i32) {\n      // then block for val > 100\n      //   if val < 200:\n      %cond1 = arith.cmpi slt, %arg0, %c200 : i32\n      %inner_result = scf.if %cond1 -> (i32) {\n        //     return 1\n        scf.yield %c1 : i32\n      } else {\n        //   else:\n        //     return 2\n        scf.yield %c2 : i32\n      }\n      scf.yield %inner_result : i32\n    } else {\n      // else block for val <= 100:\n      //   return 0\n      scf.yield %c0 : i32\n    }\n    func.return %result : i32\n  }\n}"
+}

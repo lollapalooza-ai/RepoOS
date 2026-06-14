@@ -12,9 +12,10 @@ def trace_to_base_mlir(func: torch.nn.Module, sample_args: Tuple[torch.Tensor, .
     scripted_module = torch.jit.trace(func, sample_args)
     
     # 2. Lower to MLIR (Linalg-on-Tensors)
+    # UPDATED: Use the correct entry point for modern torch-mlir
     module = torch_mlir.compile(
         scripted_module, 
         sample_args, 
-        output_type="linalg-on-tensors"
+        output_type=torch_mlir.OutputType.LINALG_ON_TENSORS
     )
     return str(module)

@@ -1,0 +1,79 @@
+--- STAGE: tabular_synthesis ---
+--- PROMPT ---
+
+        Translate this ORM logic into a Zero-Copy C++ Kernel optimized for x86_64 Linux.
+        RULES:
+        1. Input is a Struct-of-Arrays (e.g., `const float* col1`, `const float* col2`).
+        2. Use clean, standard C++ loops. The compiler will auto-vectorize with -O3 -march=native. 
+        3. Do NOT use hardware intrinsics (e.g. __m256) as they are error-prone in generation.
+        4. Write directly to `float* out_buffer`.
+        5. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
+        
+        PYTHON LOGIC:
+        def tabular_hotspot():
+    # ORM style
+    # In a real Django app this would be User.objects.filter(...)
+    # We simulate it with keywords the classifier looks for
+    results = ["user1", "user2"]
+    return [r for r in results if "user" in r]
+        
+
+--- RESPONSE ---
+```cpp
+#include <cstdint> // Required for int64_t
+
+// Define a constant for the "hotspot" value in col1.
+// This value is chosen to conceptually represent a "keyword" or "category" match
+// similar to "user" in the Python example's string filtering logic.
+// For instance, if '1.0f' represents the "user" category ID.
+const float HOTSPOT_COL1_VALUE = 1.0f;
+
+/**
+ * @brief Zero-Copy C++ Kernel for filtering data based on a hotspot in col1.
+ *
+ * This kernel processes two input float arrays (`col1`, `col2`) of a given `length`.
+ * It implements a filtering logic similar in concept to the provided Python example,
+ * but adapted for float arrays. If an element in `col1` matches a predefined
+ * `HOTSPOT_COL1_VALUE`, the corresponding element from `col2` is written to
+ * the `out_buffer`. Otherwise, a default value (0.0f) is written.
+ *
+ * The output buffer `out_buffer` will have the same `length` as the input arrays,
+ * containing filtered values at matching indices and zeros elsewhere.
+ * This approach respects the zero-copy rule by writing directly to `out_buffer`
+ * and handles variable filter counts gracefully within a fixed-size output.
+ *
+ * @param length The number of elements in each array.
+ * @param col1 A pointer to the constant float array representing the first column
+ *             (e.g., categorical IDs or filter criteria).
+ * @param col2 A pointer to the constant float array representing the second column
+ *             (e.g., data to be collected if col1 is a hotspot).
+ * @param out_buffer A pointer to the float array where the filtered results will be written.
+ *                   This buffer is assumed to be pre-allocated with at least `length` elements.
+ */
+extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer) {
+    // Iterate over the elements of the arrays from index 0 up to `length - 1`.
+    // This is a clean, standard C++ loop. Modern compilers (like GCC/Clang with
+    // optimization flags like -O3 -march=native) are highly capable of
+    // automatically vectorizing such loops for x86_64 architectures, converting
+    // the conditional logic into efficient masked operations where possible.
+    for (int64_t i = 0; i < length; ++i) {
+        // Apply the filtering logic:
+        // Check if the current element in `col1` matches the predefined `HOTSPOT_COL1_VALUE`.
+        // This conceptually simulates the Python `if "user" in r` part, looking for
+        // a specific 'tag' or 'category' within the data.
+        if (col1[i] == HOTSPOT_COL1_VALUE) {
+            // If it's a 'hotspot' (i.e., `col1[i]` matches the criterion),
+            // write the corresponding value from `col2` to the `out_buffer`.
+            // This simulates collecting the data (`r`) for which the condition was true.
+            out_buffer[i] = col2[i];
+        } else {
+            // If it's not a 'hotspot', write a default/sentinel value (0.0f) to `out_buffer`.
+            // This ensures that the `out_buffer` is fully populated with `length` elements,
+            // maintaining the array's original shape. This is a common pattern for
+            // zero-copy kernel outputs when the exact number of filtered results might
+            // vary and cannot be directly communicated via the `void` function signature.
+            out_buffer[i] = 0.0f;
+        }
+    }
+}
+```

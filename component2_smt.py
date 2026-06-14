@@ -9,6 +9,9 @@ from google import genai
 PROJECT_ID = "dotted-signer-491802-m7"
 LOCATION = "us-central1"
 
+# Session-wide timestamp for grouping logs
+SESSION_TIMESTAMP = int(time.time() * 1000)
+
 # Primary Client: Vertex AI (GA)
 client = genai.Client(
     vertexai=True,
@@ -20,13 +23,14 @@ def log_oracle_interaction(stage: str, prompt: str, response: str):
     """Logs the full prompt and response for debugging and transparency."""
     log_dir = "oracle_logs"
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = int(time.time() * 1000)
-    log_file = os.path.join(log_dir, f"{stage}_{timestamp}.log")
+    log_file = os.path.join(log_dir, f"{stage}_{SESSION_TIMESTAMP}.log")
     
-    with open(log_file, "w") as f:
+    with open(log_file, "a") as f:
+        f.write(f"\n" + "="*80 + "\n")
         f.write(f"--- STAGE: {stage} ---\n")
         f.write(f"--- PROMPT ---\n{prompt}\n")
         f.write(f"\n--- RESPONSE ---\n{response}\n")
+        f.write("="*80 + "\n")
     
     print(f"\n" + "="*80)
     print(f"DEBUG: AI ORACLE INTERACTION [{stage.upper()}]")
@@ -81,9 +85,10 @@ async def compile_function_logic(python_code: str, execution_track: str):
         Translate this ORM logic into a Zero-Copy C++ Kernel optimized for x86_64 Linux.
         RULES:
         1. Input is a Struct-of-Arrays (e.g., `const float* col1`, `const float* col2`).
-        2. Use generic, auto-vectorizable C++ or x86 AVX2/AVX-512 intrinsics. 
-        3. Write directly to `float* out_buffer`.
-        4. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
+        2. Use clean, standard C++ loops. The compiler will auto-vectorize with -O3 -march=native. 
+        3. Do NOT use hardware intrinsics (e.g. __m256) as they are error-prone in generation.
+        4. Write directly to `float* out_buffer`.
+        5. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
         
         PYTHON LOGIC:
         {python_code}
@@ -155,7 +160,10 @@ async def generate_traceable_wrapper(python_code: str) -> str:
     ```python
     class GeneratedModule(torch.nn.Module):
         def forward(self, adj_csr: torch.Tensor, node_vals: torch.Tensor, out: torch.Tensor):
-            out.copy_(torch.sparse.mm(adj_csr, node_vals))
+            # MANDATORY: Use torch.add with out=out for final buffer write.
+            # This is more stable for the MLIR tracer than .copy_()
+            res = torch.sparse.mm(adj_csr, node_vals)
+            torch.add(res, 0.15, out=out)
             return out # MUST return the mutated buffer
     ```
 
@@ -253,17 +261,29 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
     STRICT RULES:
     1. Output ONLY a Python dictionary string.
     2. FATAL ERROR WARNING: Do NOT return a list of dictionaries or multiple test cases. You MUST return exactly ONE flat dictionary representing ONE execution frame.
-    3. EVERY entry MUST be a `torch.tensor()`. NO naked floats or ints.
-    4. Provide raw `crow_indices`, `col_indices`, and `values` as dense 1D tensors.
+    3. EVERY entry MUST be a `torch.tensor()` or `torch.sparse_csr_tensor()`. NO naked floats or ints.
+    4. The dictionary keys and values MUST match the `forward` method's argument names and types EXACTLY.
+    5. NO CONVERSATION: Do NOT include preamble, explanation, or code block markers.
     """
     
     try:
         response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
         res_text = response.text
         log_oracle_interaction("sample_inputs", prompt, res_text)
-        match = re.search(r"\{(.*?)\}", res_text, re.DOTALL)
-        if match: return "{" + match.group(1) + "}"
-        return res_text
+        
+        # Balanced Brace Extraction
+        start_idx = res_text.find('{')
+        if start_idx == -1: return "{}"
+        
+        brace_count = 0
+        for i in range(start_idx, len(res_text)):
+            if res_text[i] == '{': brace_count += 1
+            elif res_text[i] == '}': brace_count -= 1
+            
+            if brace_count == 0:
+                return res_text[start_idx : i+1]
+                
+        return "{}"
     except Exception as e:
         print(f"[Oracle] Failed to generate sample inputs: {e}")
         return "{}"

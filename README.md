@@ -183,3 +183,19 @@ To run the AOT compilation pipeline on Ubuntu:
 ```bash
 export PYTHONPATH=/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 component9_aot.py test_tracks
 ```
+
+### Benchmarking and Validation
+We provide a specialized tool, `run_mlir.py`, to compare the AI's raw output against fixed/corrected versions.
+
+**Usage:**
+```bash
+./build_venv/bin/python3 run_mlir.py <function_name>
+```
+Example: `./build_venv/bin/python3 run_mlir.py fsm_hotspot`
+
+**Folder: `generated/`**
+This folder contains the code fragments used for comparison:
+*   `<func>_actual.txt`: The raw code synthesized by the AI (extracted from oracle logs).
+*   `<func>_corrected.txt`: The manually or programmatically fixed version that resolves tracing or syntax issues.
+
+The `run_mlir.py` script automatically identifies the track (Torch, C++, or MLIR), executes both versions, and displays a comparison table showing execution time and the returned response.

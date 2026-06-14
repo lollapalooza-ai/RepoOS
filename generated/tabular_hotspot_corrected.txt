@@ -1,0 +1,11 @@
+#include <cstdint>
+
+extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer) {
+    for (int64_t i = 0; i < length; ++i) {
+        if (col1[i] > col2[i]) {
+            out_buffer[i] = col1[i];
+        } else {
+            out_buffer[i] = 0.0f;
+        }
+    }
+}

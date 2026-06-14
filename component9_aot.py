@@ -266,7 +266,17 @@ async def aot_compile_all(module_filter: str = ""):
                     exec(wrapper_code, local_scope)
                     module_class = local_scope.get("GeneratedModule")
                     module = module_class()
-                    sample_inputs_dict = eval(sample_inputs_code, {"torch": torch})
+                    
+                    # Robustly clean sample inputs code
+                    cleaned_inputs_code = sample_inputs_code.strip()
+                    if cleaned_inputs_code.startswith("```"):
+                        # Strip start block
+                        cleaned_inputs_code = "\n".join(cleaned_inputs_code.split("\n")[1:])
+                        # Strip end block
+                        if cleaned_inputs_code.endswith("```"):
+                            cleaned_inputs_code = cleaned_inputs_code[:-3]
+                    
+                    sample_inputs_dict = eval(cleaned_inputs_code, {"torch": torch})
                     sample_args = tuple(sample_inputs_dict.values())
                     
                     print(f"      Tracing Module...")
