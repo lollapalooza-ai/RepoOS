@@ -139,6 +139,63 @@ async def compile_function_logic(python_code: str, execution_track: str):
     elif execution_track == "CRYPTO":
         print("[Oracle] 🔐 Crypto Track: Bypassing AI. Linking Native libsodium...")
         return "USE_NATIVE_LIBSODIUM"
+        
+    elif execution_track == "INFERENCE":
+        print("[Oracle] 🧠 Inference Track: Acting as MLIR Tiling Strategist...")
+        # Note: This is handled separately by generate_inference_transforms
+        return "INFERENCE_TRACK_ACTIVE"
+
+async def generate_inference_transforms(base_mlir_text: str, target_gpu: str) -> list[str]:
+    """
+    Deep Learning Auto-Tuner Oracle.
+    Input: Programmatically generated MLIR.
+    Output: 3 distinct Transform Dialect memory layouts.
+    """
+    prompt = f"""
+    You are a GPU Compiler Architect. I am providing you with a programmatically lowered, mathematically verified MLIR `linalg` graph representing an AI inference workload.
+    
+    BASELINE LINALG MLIR:
+    ```mlir
+    {base_mlir_text}
+    ```
+    
+    TASK:
+    Generate exactly 3 DIFFERENT MLIR Transform Dialect scripts to optimize this graph for `{target_gpu}`.
+    We will benchmark all three in parallel and keep the fastest binary. Do NOT generate any math operations, only the `transform.named_sequence` blocks.
+    
+    VARIANTS REQUIRED:
+    1. Variant 1 (Compute Heavy): Focus on massive loop unrolling and `transform.structured.tile_using_forall` with large tile sizes (e.g., [128, 128]).
+    2. Variant 2 (Memory Bound): Focus on Operator Fusion and smaller, cache-aligned tile sizes (e.g., [64, 64]).
+    3. Variant 3 (Balanced): Standard vectorization and intermediate tiling.
+    
+    CRITICAL SYNTAX RULES:
+    - Output MUST be a valid JSON array of 3 strings.
+    - Each string must be valid MLIR Transform Dialect.
+    - Do NOT wrap the JSON in markdown blocks like ```json. Output raw JSON.
+    - FATAL ERROR: NEVER use explicit type labels on the LEFT side of an assignment (e.g., `%op: !type = ...` is BANNED).
+    - FATAL ERROR: You MUST enclose array attributes in curly braces.
+    - FATAL ERROR: Every `transform.structured.match` MUST end with a functional type signature: `: (!transform.any_op) -> !transform.any_op`
+    - EXACT CORRECT SYNTAX: `%op = transform.structured.match ops{{["linalg.generic"]}} in %root : (!transform.any_op) -> !transform.any_op`
+    - ROOT SEQUENCE: Every script MUST start exactly with `transform.named_sequence @__transform_main(%root: !transform.any_op) {{` and end with `}}`.
+    - Do NOT wrap the script in an outer `module` block.
+    """
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro', 
+            config={'response_mime_type': 'application/json'},
+            contents=prompt
+        )
+        res_text = response.text
+        log_oracle_interaction("inference_transform_search", prompt, res_text)
+        
+        schedules = json.loads(res_text)
+        if isinstance(schedules, list):
+            return schedules
+        return [res_text] # Fallback if JSON parses but isn't a list
+    except Exception as e:
+        print(f"[Oracle] Failed to generate inference schedules: {e}")
+        return []
 
 async def generate_traceable_wrapper(python_code: str) -> str:
     """
@@ -361,7 +418,12 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     
     TASK:
     Analyze the compiler error and fix the syntax in the script. 
-    Output ONLY the corrected ```mlir block. Do not include apologies or explanations.
+    
+    STRICT RULES FOR FIXING:
+    - Every `transform.structured.match` MUST end with a functional type signature: `: (!transform.any_op) -> !transform.any_op`
+    - NEVER use explicit type labels on the LEFT side of an assignment (e.g., `%op: !type = ...` is BANNED).
+    - You MUST enclose array attributes in curly braces, e.g., `ops{["linalg.generic"]}`.
+    - Output ONLY the corrected ```mlir block. Do not include apologies or explanations.
     """
     
     try:

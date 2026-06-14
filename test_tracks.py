@@ -21,6 +21,11 @@ def fsm_hotspot():
         
     return total
 
+def inference_hotspot(x):
+    # Deep Learning style math (y = x * 2.0 + 1.0)
+    import torch
+    return x * 2.0 + 1.0
+
 # def tabular_hotspot():
 #     # ORM style
 #     # In a real Django app this would be User.objects.filter(...)
