@@ -27,7 +27,7 @@ def test_inference_pipeline():
     
     # Execute the returned callable
     result = optimized_fn(example_input)
-    
+    print("[Test] Inference executed successfully. Result shape:", result.shape)
     assert result is not None
     print("\n✅ Test Passed: Inference track logic executed successfully and isolated.")
 

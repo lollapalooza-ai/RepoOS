@@ -300,10 +300,13 @@ async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code:
     Safely executes an AI Python schedule and lowers to GPU PTX/NVVM.
     Uses the RepoOSSchedule builder to guarantee valid MLIR syntax.
     """
-    clean_base_path = "temp_gpu_base.mlir"
-    payload_path = "temp_gpu_payload.mlir"
-    optimized_path = "temp_gpu_optimized.mlir"
-    final_llvm_path = "temp_gpu_final.mlir"
+    ARTIFACTS_DIR = "build_artifacts"
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    
+    clean_base_path = os.path.join(ARTIFACTS_DIR, "inference_base.mlir")
+    payload_path = os.path.join(ARTIFACTS_DIR, "inference_payload.mlir")
+    optimized_path = os.path.join(ARTIFACTS_DIR, "inference_optimized.mlir")
+    final_llvm_path = os.path.join(ARTIFACTS_DIR, "inference_final.mlir")
     
     with open(clean_base_path, "w") as f: f.write(base_mlir)
     target_mlir = clean_base_path
