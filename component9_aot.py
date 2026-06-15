@@ -12,6 +12,79 @@ NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
 CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache")
 
+class RepoOSSchedule:
+    """
+    The Python Builder API for MLIR Transform Dialect.
+    Ensures 100% syntactically valid MLIR generation.
+    """
+    def __init__(self):
+        self.instructions = []
+        self.var_counter = 0
+
+    def _next_var(self) -> str:
+        """Safely tracks SSA variables so the AI never has to guess % numbers."""
+        self.var_counter += 1
+        return f"%v{self.var_counter}"
+
+    def match(self, target_op: str) -> str:
+        """Finds operations in the graph. E.g., 'linalg.generic'"""
+        out_var = self._next_var()
+        # Notice we hardcode the strict MLIR syntax rules here
+        self.instructions.append(
+            f"    {out_var} = transform.structured.match ops{{[\"{target_op}\"]}} in %root : (!transform.any_op) -> !transform.any_op"
+        )
+        return out_var
+
+    def tile_to_blocks(self, target_var: str, tile_sizes: list[int]) -> str:
+        """Maps an operation to GPU Thread Blocks using direct mapping attributes."""
+        tiled_op = self._next_var()
+        grid_var = self._next_var()
+        sizes_str = ", ".join(map(str, tile_sizes))
+        
+        # We use the mapping attribute directly in tile_using_forall
+        mapping = "[#gpu.block<x>, #gpu.block<y>]"
+        self.instructions.append(
+            f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+        )
+        return tiled_op
+
+    def tile_to_threads(self, target_var: str, tile_sizes: list[int], block_dims: list[int] = None) -> str:
+        """Maps an operation to internal GPU Threads using direct mapping attributes."""
+        tiled_op = self._next_var()
+        thread_var = self._next_var()
+        sizes_str = ", ".join(map(str, tile_sizes))
+        
+        # We use the thread mapping attribute directly
+        mapping = "[#gpu.thread<x>, #gpu.thread<y>]"
+        self.instructions.append(
+            f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+        )
+        return tiled_op
+
+    def vectorize(self, target_var: str):
+        """Vectorizes the inner loops."""
+        self.instructions.append(
+            f"    transform.structured.vectorize {target_var} : !transform.any_op"
+        )
+
+    def lower_to_nvvm(self, target_chip: str = "sm_90"):
+        """
+        Forces the safe transition to GPU PTX memory space.
+        Note: OneShotBufferize is called on the root to transform the whole module.
+        """
+        after_gpu = self._next_var()
+        self.instructions.append(
+            f"    {after_gpu} = transform.bufferization.one_shot_bufferize %root {{ bufferize_function_boundaries = true }} : (!transform.any_op) -> !transform.any_op"
+        )
+        self.instructions.append(f"    // Lowering to NVVM handled by deterministic backend passes")
+
+    def build_mlir(self) -> str:
+        """Compiles the Python instructions into the final MLIR string."""
+        header = "transform.named_sequence @__transform_main(%root: !transform.any_op) {\n"
+        body = "\n".join(self.instructions)
+        footer = "\n    transform.yield\n}"
+        return header + body + footer
+
 # Compiler Paths
 MLIR_DIR = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin"
 MLIR_OPT = os.path.join(MLIR_DIR, "mlir-opt")
@@ -222,13 +295,11 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
     except subprocess.CalledProcessError as e:
         print(f"[Compiler] ❌ Final Lowering failed: {e}")
 
-async def apply_gpu_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str) -> bool:
+async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code: str, output_dylib: str) -> bool:
     """
-    Safely applies an AI Transform script and lowers to GPU PTX/NVVM.
-    Includes a 3-attempt self-healing loop to correct hallucinated syntax.
+    Safely executes an AI Python schedule and lowers to GPU PTX/NVVM.
+    Uses the RepoOSSchedule builder to guarantee valid MLIR syntax.
     """
-    from component2_smt import fix_transform_syntax_with_ai
-    
     clean_base_path = "temp_gpu_base.mlir"
     payload_path = "temp_gpu_payload.mlir"
     optimized_path = "temp_gpu_optimized.mlir"
@@ -237,41 +308,60 @@ async def apply_gpu_transform_and_compile(base_mlir: str, transform_mlir: str, o
     with open(clean_base_path, "w") as f: f.write(base_mlir)
     target_mlir = clean_base_path
     
-    # STAGE 1: AI Schedule Application (3-Attempt Self-Healing Loop)
-    if transform_mlir.strip():
-        current_transform = transform_mlir
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
-            with open(payload_path, "w") as f:
-                f.write(base_mlir + "\n" + current_transform)
+    # STAGE 1: AI Schedule Generation (Python DSL -> MLIR)
+    if transform_python_code.strip():
+        try:
+            print(f"      [Compiler] Executing AI Python Schedule...")
+            schedule = RepoOSSchedule()
+            local_scope = {"schedule": schedule}
+            
+            # Execute the AI's Python code
+            exec(transform_python_code, {}, local_scope)
+            
+            # If the AI wrapped it in apply_schedule, call it
+            if "apply_schedule" in local_scope:
+                local_scope["apply_schedule"](schedule)
                 
-            try:
-                print(f"      [Compiler] Applying AI Schedule (Attempt {attempt+1}/{max_attempts})...")
-                subprocess.run([
-                    MLIR_OPT, payload_path,
-                    "--transform-interpreter",
-                    "-o", optimized_path
-                ], check=True, capture_output=True)
+            transform_mlir = schedule.build_mlir()
+            
+            # Ensure the module has the necessary attribute for named sequences
+            module_idx = base_mlir.find("module")
+            if module_idx != -1:
+                brace_idx = base_mlir.find("{", module_idx)
+                attr_idx = base_mlir.find("attributes", module_idx)
                 
-                target_mlir = optimized_path
-                print(f"      [Compiler] ✅ AI Schedule Compiled Successfully.")
-                break # Success!
-            except subprocess.CalledProcessError as e:
-                error_log = e.stderr.decode()
-                print(f"\n      " + "!"*40)
-                print(f"      [Compiler] ⚠️ SYNTAX ERROR in Variant Schedule")
-                print(f"      [Compiler] ATTEMPT: {attempt+1}/{max_attempts}")
-                print(f"      [Compiler] PAYLOAD: {payload_path}")
-                print(f"      [Compiler] ERROR:\n{error_log}")
-                print("      " + "!"*40 + "\n")
-                
-                if attempt < max_attempts - 1:
-                    print(f"      [Compiler] 🔄 Triggering AI Self-Healing Loop...")
-                    current_transform = await fix_transform_syntax_with_ai(current_transform, error_log)
+                if attr_idx != -1 and attr_idx < brace_idx:
+                    # Already has attributes, insert ours
+                    tagged_base_mlir = base_mlir[:attr_idx+12] + "transform.with_named_sequence, " + base_mlir[attr_idx+12:]
                 else:
-                    print(f"      [Compiler] ❌ All {max_attempts} attempts failed for this variant. Dropping schedule.")
-                    return False
+                    # No attributes, insert them
+                    tagged_base_mlir = base_mlir[:module_idx+6] + " attributes {transform.with_named_sequence} " + base_mlir[module_idx+6:]
+                
+                # CRITICAL: The transform.named_sequence MUST be inside the module.
+                # We find the last closing brace of the module and insert the transform script before it.
+                last_brace_idx = tagged_base_mlir.rfind("}")
+                final_payload = tagged_base_mlir[:last_brace_idx] + "\n" + transform_mlir + "\n}"
+            else:
+                # Fallback if no module found (unlikely for torch-mlir)
+                final_payload = base_mlir + "\n" + transform_mlir
+            
+            with open(payload_path, "w") as f:
+                f.write(final_payload)
+                
+            subprocess.run([
+                MLIR_OPT, payload_path,
+                "--transform-interpreter",
+                "-o", optimized_path
+            ], check=True, capture_output=True)
+            
+            target_mlir = optimized_path
+            print(f"      [Compiler] ✅ AI Python Schedule applied successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"      [Compiler] ❌ MLIR Transform Error:\n{e.stderr.decode()}")
+            return False
+        except Exception as e:
+            print(f"      [Compiler] ❌ AI Python Schedule failed: {e}")
+            return False
 
     # STAGE 2: GPU Bare-Metal Lowering (Deterministic)
     try:

@@ -145,39 +145,71 @@ async def compile_function_logic(python_code: str, execution_track: str):
         # Note: This is handled separately by generate_inference_transforms
         return "INFERENCE_TRACK_ACTIVE"
 
-async def generate_inference_transforms(base_mlir_text: str, target_gpu: str) -> list[str]:
+async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "sm_90") -> list[str]:
     """
-    Deep Learning Auto-Tuner Oracle.
-    Input: Programmatically generated MLIR.
-    Output: 3 distinct Transform Dialect memory layouts.
+    The Python-DSL Oracle.
+    Prompts the AI to generate Python scheduling scripts using the RepoOS API.
     """
-    prompt = f"""
-    You are a GPU Compiler Architect. I am providing you with a programmatically lowered, mathematically verified MLIR `linalg` graph representing an AI inference workload.
     
-    BASELINE LINALG MLIR:
+    prompt = f"""
+    You are an elite Deep Learning Compiler Architect optimizing a neural network for an NVIDIA GPU ({target_gpu}).
+    
+    Below is the mathematically verified, programmatically lowered Linalg MLIR graph of the workload:
+    
+    === BASELINE MLIR ===
     ```mlir
     {base_mlir_text}
     ```
+    === END BASELINE MLIR ===
     
     TASK:
-    Generate exactly 3 DIFFERENT MLIR Transform Dialect scripts to optimize this graph for `{target_gpu}`.
-    We will benchmark all three in parallel and keep the fastest binary. Do NOT generate any math operations, only the `transform.named_sequence` blocks.
-    
-    VARIANTS REQUIRED:
-    1. Variant 1 (Compute Heavy): Focus on massive loop unrolling and `transform.structured.tile_using_forall` with large tile sizes (e.g., [128, 128]).
-    2. Variant 2 (Memory Bound): Focus on Operator Fusion and smaller, cache-aligned tile sizes (e.g., [64, 64]).
-    3. Variant 3 (Balanced): Standard vectorization and intermediate tiling.
-    
-    CRITICAL SYNTAX RULES:
-    - Output MUST be a valid JSON array of 3 strings.
-    - Each string must be valid MLIR Transform Dialect.
-    - Do NOT wrap the JSON in markdown blocks like ```json. Output raw JSON.
-    - FATAL ERROR: NEVER use explicit type labels on the LEFT side of an assignment (e.g., `%op: !type = ...` is BANNED).
-    - FATAL ERROR: You MUST enclose array attributes in curly braces.
-    - FATAL ERROR: Every `transform.structured.match` MUST end with a functional type signature: `: (!transform.any_op) -> !transform.any_op`
-    - EXACT CORRECT SYNTAX: `%op = transform.structured.match ops{{["linalg.generic"]}} in %root : (!transform.any_op) -> !transform.any_op`
-    - ROOT SEQUENCE: Every script MUST start exactly with `transform.named_sequence @__transform_main(%root: !transform.any_op) {{` and end with `}}`.
-    - Do NOT wrap the script in an outer `module` block.
+    You must generate exactly 3 DIFFERENT optimization schedules for this graph:
+    1. Compute-Heavy (Aggressive unrolling)
+    2. Memory-Bound (Cache-aligned tiles)
+    3. Balanced (Standard tiling and vectorization)
+
+    IMPORTANT PERFORMANCE GUIDELINES:
+    - The problem size is often small (e.g. 10x10). Your tiles MUST be smaller than or equal to the workload.
+    - `schedule.match("linalg.generic")` returns a handle to ALL matching operations. 
+    - `schedule.vectorize(target)` only works if the tiled dimensions are a multiple of 4 or 8. Do NOT call vectorize on 1x1 or odd-sized tiles.
+    - CRITICAL: To perform nested tiling (Blocks -> Threads), you MUST re-match the op inside the loop.
+
+    CRITICAL API CONSTRAINTS:
+    You are FORBIDDEN from writing raw MLIR text. You must write a Python function named `apply_schedule(schedule)` using ONLY the following methods from the `RepoOSSchedule` API:
+
+    - `schedule.match(op_name: str) -> str` 
+      (Finds an operation. Example op_names: "linalg.generic", "linalg.matmul", "linalg.conv_2d_nchw_fchw")
+    - `schedule.tile_to_blocks(target_var: str, tile_sizes: list[int]) -> str`
+      (Tiles the operation across GPU Thread Blocks. Returns the tiled operation.)
+    - `schedule.tile_to_threads(target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str`
+      (Tiles the inner loops across GPU Threads within a block.)
+    - `schedule.vectorize(target_var: str) -> str`
+      (Applies SIMD vectorization to the innermost loop.)
+    - `schedule.lower_to_nvvm(target_chip: str)`
+      (Mandatory final step: lowers the bufferized graph to PTX/NVVM.)
+
+    FEW-SHOT EXAMPLE OF A VALID PYTHON SCRIPT:
+    def apply_schedule(schedule):
+        # 1. Match all math ops
+        math_ops = schedule.match("linalg.generic")
+        
+        # 2. Tile for GPU Blocks
+        # (Using 8x8 for a 10x10 problem)
+        block_tiled = schedule.tile_to_blocks(math_ops, tile_sizes=[8, 8])
+        
+        # 3. Match again to get a fresh handle for the next level
+        inner_math = schedule.match("linalg.generic")
+        
+        # 4. Tile for GPU Threads (1x1 tile per thread)
+        thread_tiled = schedule.tile_to_threads(inner_math, tile_sizes=[1, 1])
+        
+        # 5. Final Lowering
+        schedule.lower_to_nvvm(target_chip="{target_gpu}")
+
+    OUTPUT FORMAT:
+    You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
+    DO NOT wrap the JSON in markdown formatting like ```json.
+    DO NOT import any external libraries.
     """
     
     try:
@@ -187,15 +219,27 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str) ->
             contents=prompt
         )
         res_text = response.text
-        log_oracle_interaction("inference_transform_search", prompt, res_text)
         
+        # Log the interaction for telemetry and observability
+        log_oracle_interaction("python_schedule_generation", prompt, res_text)
+        
+        # Parse the JSON payload containing the 3 Python scripts
         schedules = json.loads(res_text)
+        
         if isinstance(schedules, list):
             return schedules
-        return [res_text] # Fallback if JSON parses but isn't a list
+        else:
+            raise ValueError("AI did not return a JSON list.")
+            
     except Exception as e:
-        print(f"[Oracle] Failed to generate inference schedules: {e}")
-        return []
+        print(f"[Oracle] ⚠️ Failed to generate Python schedules: {e}")
+        # Safe Deterministic Fallback: Return a single, highly conservative Python schedule
+        fallback_script = f"""
+def apply_schedule(schedule):
+    target = schedule.match("linalg.generic")
+    schedule.lower_to_nvvm(target_chip="{target_gpu}")
+"""
+        return [fallback_script]
 
 async def generate_traceable_wrapper(python_code: str) -> str:
     """

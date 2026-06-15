@@ -462,3 +462,239 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str) ->
         return [TRANSFORM_TEMPLATE.format(
             grid_tiles="[64, 64]", thread_tiles="[1, 64]", block_dims="[64, 1, 1]"
         )]
+
+## Milestone 7.4 : The Python Scheduling Architecture
+End-to-End Implementation of RepoOSSchedule
+Here is exactly how this works under the hood in component9_aot.py.
+
+Step 3A: The Builder Class (component9_aot.py)
+This class is the "translation engine." It accepts high-level Python commands and safely constructs the highly volatile MLIR syntax.
+
+Python
+class RepoOSSchedule:
+    """
+    The Python Builder API for MLIR Transform Dialect.
+    Ensures 100% syntactically valid MLIR generation.
+    """
+    def __init__(self):
+        self.instructions = []
+        self.var_counter = 0
+
+    def _next_var(self) -> str:
+        """Safely tracks SSA variables so the AI never has to guess % numbers."""
+        self.var_counter += 1
+        return f"%v{self.var_counter}"
+
+    def match(self, target_op: str) -> str:
+        """Finds operations in the graph. E.g., 'linalg.generic'"""
+        out_var = self._next_var()
+        # Notice we hardcode the strict MLIR syntax rules here
+        self.instructions.append(
+            f"    {out_var} = transform.structured.match ops{{[\"{target_op}\"]}} in %root : (!transform.any_op) -> !transform.any_op"
+        )
+        return out_var
+
+    def tile_to_blocks(self, target_var: str, tile_sizes: list[int]) -> str:
+        """Maps an operation to GPU Thread Blocks."""
+        if not isinstance(tile_sizes, list):
+            raise TypeError("tile_sizes must be a list of integers")
+            
+        tiled_op = self._next_var()
+        grid_var = self._next_var()
+        sizes_str = ", ".join(map(str, tile_sizes))
+        
+        self.instructions.append(
+            f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} {{ tile_sizes = [{sizes_str}] }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+        )
+        self.instructions.append(
+            f"    transform.gpu.map_forall_to_blocks {grid_var} {{ grid_dims = [1, 1, 1] }} : (!transform.any_op) -> !transform.any_op"
+        )
+        return tiled_op
+
+    def tile_to_threads(self, target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str:
+        """Maps an operation to internal GPU Threads."""
+        tiled_op = self._next_var()
+        thread_var = self._next_var()
+        sizes_str = ", ".join(map(str, tile_sizes))
+        dims_str = ", ".join(map(str, block_dims))
+        
+        self.instructions.append(
+            f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} {{ tile_sizes = [{sizes_str}] }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+        )
+        self.instructions.append(
+            f"    transform.gpu.map_nested_forall_to_threads {thread_var} {{ block_dims = [{dims_str}] }} : (!transform.any_op) -> !transform.any_op"
+        )
+        return tiled_op
+
+    def vectorize(self, target_var: str):
+        """Vectorizes the inner loops."""
+        out_var = self._next_var()
+        self.instructions.append(
+            f"    {out_var} = transform.structured.vectorize {target_var} : !transform.any_op"
+        )
+        return out_var
+
+    def lower_to_nvvm(self, target_chip: str = "sm_90"):
+        """Forces the safe transition to GPU PTX memory space."""
+        after_gpu = self._next_var()
+        gpu_mod = self._next_var()
+        self.instructions.append(
+            f"    {after_gpu} = transform.bufferization.one_shot_bufferize %root {{ bufferize_function_boundaries = true }} : (!transform.any_op) -> !transform.any_op"
+        )
+        self.instructions.append(
+            f"    {gpu_mod} = transform.gpu.lower_to_nvvm {after_gpu} {{ chip = \"{target_chip}\" }} : (!transform.any_op) -> !transform.any_op"
+        )
+
+    def build_mlir(self) -> str:
+        """Compiles the Python instructions into the final MLIR string."""
+        header = "transform.named_sequence @__transform_main(%root: !transform.any_op) {\n"
+        body = "\n".join(self.instructions)
+        footer = "\n    transform.yield\n}"
+        return header + body + footer
+Step 3B: How the AI Interacts With It (component2_smt.py)
+Now, instead of asking Gemini for raw MLIR, you ask it to write a simple Python function called apply_schedule.
+
+The AI's Output (Pure Python):
+
+Python
+def apply_schedule(schedule):
+    # 1. AI safely targets the matrix math
+    matmul = schedule.match("linalg.generic")
+    
+    # 2. AI decides to break it into 128x128 blocks for the GPU
+    block_tiled = schedule.tile_to_blocks(matmul, tile_sizes=[128, 128])
+    
+    # 3. AI decides to map inner loops to threads
+    thread_tiled = schedule.tile_to_threads(block_tiled, tile_sizes=[1, 128], block_dims=[128, 1, 1])
+    
+    # 4. AI vectorizes the remainder and lowers
+    schedule.vectorize(thread_tiled)
+    schedule.lower_to_nvvm(target_chip="sm_90")
+Step 3C: The Execution Loop (component10_dynamo.py / component9_aot.py)
+When RepoOS receives that Python text from the AI, it uses Python's native exec() sandbox to generate the MLIR dynamically.
+
+Python
+# 1. Initialize our safe builder
+my_schedule = RepoOSSchedule()
+
+# 2. Execute the AI's Python code in a safe local dictionary
+local_scope = {}
+try:
+    # ai_generated_python_code is the string from Step 3B
+    exec(ai_generated_python_code, {}, local_scope)
+    
+    # 3. Call the AI's function, passing in our builder
+    local_scope["apply_schedule"](my_schedule)
+    
+    # 4. Extract the mathematically perfect MLIR!
+    perfect_mlir_string = my_schedule.build_mlir()
+    
+    print("Successfully generated MLIR without syntax errors!")
+    
+except Exception as e:
+    # If the AI hallucinates a bad Python command (e.g., schedule.make_it_fast()),
+    # it is caught instantly right here as a standard Python error.
+    print(f"AI Schedule rejected: {e}")
+
+
+
+Implementing the DSL-Constrained System Prompt in component2_smt.py
+
+Architectural Directive:
+We are upgrading the Oracle to output a JSON array of Python scripts. Each script will represent a distinct hardware optimization schedule (Compute-Heavy, Memory-Bound, Balanced) using our custom RepoOSSchedule Python API.
+
+Replace the generate_inference_transforms function in component2_smt.py with the following implementation.
+
+Python
+import json
+import asyncio
+from google import genai
+
+async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "sm_90") -> list[str]:
+    """
+    The Python-DSL Oracle.
+    Prompts the AI to generate Python scheduling scripts using the RepoOS API.
+    """
+    
+    prompt = f"""
+    You are an elite Deep Learning Compiler Architect optimizing a neural network for an NVIDIA GPU ({target_gpu}).
+    
+    Below is the mathematically verified, programmatically lowered Linalg MLIR graph of the workload:
+    
+    === BASELINE MLIR ===
+```mlir
+    {base_mlir_text}
+    ```
+    === END BASELINE MLIR ===
+    
+    TASK:
+    You must generate exactly 3 DIFFERENT optimization schedules for this graph:
+    1. Compute-Heavy (Large tile sizes, aggressive unrolling)
+    2. Memory-Bound (Smaller, cache-aligned tiles, aggressive operator fusion)
+    3. Balanced (Standard tiling and vectorization)
+
+    CRITICAL API CONSTRAINTS:
+    You are FORBIDDEN from writing raw MLIR text. You must write a Python function named `apply_schedule(schedule)` using ONLY the following methods from the `RepoOSSchedule` API:
+
+    - `schedule.match(op_name: str) -> str` 
+      (Finds an operation. Example op_names: "linalg.generic", "linalg.matmul", "linalg.conv_2d_nchw_fchw")
+    - `schedule.fuse(producer_var: str, consumer_var: str) -> str`
+      (Fuses two operations together to save VRAM bandwidth)
+    - `schedule.tile_to_blocks(target_var: str, tile_sizes: list[int]) -> str`
+      (Tiles the operation across GPU Thread Blocks. Returns the tiled operation.)
+    - `schedule.tile_to_threads(target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str`
+      (Tiles the inner loops across GPU Threads within a block.)
+    - `schedule.vectorize(target_var: str) -> str`
+      (Applies SIMD vectorization to the innermost loop.)
+    - `schedule.lower_to_nvvm(target_chip: str)`
+      (Mandatory final step: lowers the bufferized graph to PTX/NVVM.)
+
+    FEW-SHOT EXAMPLE OF A VALID PYTHON SCRIPT:
+    def apply_schedule(schedule):
+        # 1. Match the core math
+        matmul = schedule.match("linalg.generic")
+        
+        # 2. Tile for L2 Cache / GPU Blocks
+        block_tiled = schedule.tile_to_blocks(matmul, tile_sizes=[128, 128])
+        
+        # 3. Tile for L1 Cache / GPU Threads
+        thread_tiled = schedule.tile_to_threads(block_tiled, tile_sizes=[1, 128], block_dims=[128, 1, 1])
+        
+        # 4. Vectorize and Lower
+        schedule.vectorize(thread_tiled)
+        schedule.lower_to_nvvm(target_chip="{target_gpu}")
+
+    OUTPUT FORMAT:
+    You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
+    DO NOT wrap the JSON in markdown formatting like ```json.
+    DO NOT import any external libraries.
+    """
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro', 
+            config={'response_mime_type': 'application/json'},
+            contents=prompt
+        )
+        res_text = response.text
+        
+        # Log the interaction for telemetry and observability
+        log_oracle_interaction("python_schedule_generation", prompt, res_text)
+        
+        # Parse the JSON payload containing the 3 Python scripts
+        schedules = json.loads(res_text)
+        
+        if isinstance(schedules, list):
+            return schedules
+        else:
+            raise ValueError("AI did not return a JSON list.")
+            
+    except Exception as e:
+        print(f"[Oracle] ⚠️ Failed to generate Python schedules: {e}")
+        # Safe Deterministic Fallback: Return a single, highly conservative Python schedule
+        fallback_script = f"""
+def apply_schedule(schedule):
+    target = schedule.match("linalg.generic")
+    schedule.lower_to_nvvm(target_chip="{target_gpu}")
+"""
+        return [fallback_script]

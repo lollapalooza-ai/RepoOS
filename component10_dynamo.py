@@ -35,7 +35,7 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
     # Ensure the programmatic "Algorithm" is valid before asking for a "Schedule"
     print("[Dynamo] 🛡️ Verifying base programmatic MLIR compilability...")
     base_success = await apply_gpu_transform_and_compile(
-        base_mlir_text, transform_mlir="", output_dylib=base_dylib_path
+        base_mlir_text, "", base_dylib_path
     )
     
     if not base_success:
