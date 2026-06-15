@@ -17,7 +17,7 @@ class SimpleModel(torch.nn.Module):
 def test_inference_pipeline():
     print("--- 🧪 Testing RepoOS INFERENCE Track (Isolated) ---")
     model = SimpleModel()
-    example_input = torch.randn(10, 10)
+    example_input = torch.randn(20, 20)
     
     # Trigger the Dynamo backend
     # Note: In a real scenario, we use torch.compile(model, backend=repoos_inference_backend)
@@ -27,6 +27,11 @@ def test_inference_pipeline():
     
     # Execute the returned callable
     result = optimized_fn(example_input)
+    
+    # Dynamo backends return a list of tensors
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+        
     print("[Test] Inference executed successfully. Result shape:", result.shape)
     assert result is not None
     print("\n✅ Test Passed: Inference track logic executed successfully and isolated.")

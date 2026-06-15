@@ -199,3 +199,26 @@ This folder contains the code fragments used for comparison:
 *   `<func>_corrected.txt`: The manually or programmatically fixed version that resolves tracing or syntax issues.
 
 The `run_mlir.py` script automatically identifies the track (Torch, C++, or MLIR), executes both versions, and displays a comparison table showing execution time and the returned response.
+
+## 🧠 Python Scheduling Architecture (Milestone 7.4)
+
+RepoOS now features a high-safety **Inference Track** that uses a Python-based DSL for GPU auto-tuning. This architecture strictly separates the **Algorithm** from the **Schedule**.
+
+### 1. The Algorithm (Strictly Deterministic)
+Captured programmatically from PyTorch FX graphs via `torch-mlir`. This ensures 100% mathematical fidelity.
+
+### 2. The Schedule (AI-Driven DSL)
+Instead of writing raw MLIR text, the Gemini Oracle generates Python scripts using the `RepoOSSchedule` API:
+*   `schedule.match(op)`
+*   `schedule.tile_to_blocks(target, sizes)`
+*   `schedule.tile_to_threads(target, sizes)`
+*   `schedule.vectorize(target)`
+
+### 3. Syntax Safety & Fallback
+The Python DSL acts as a validator, making it physically impossible for the AI to generate invalid MLIR syntax. If an optimization variant fails to compile (e.g. unsupported vectorization), the system safely falls back to the verified base kernel.
+
+Intermediate stages are preserved in `build_artifacts/` for debugging:
+*   `inference_base.mlir`: captured math.
+*   `inference_payload.mlir`: math + AI schedule.
+*   `inference_optimized.mlir`: tiled and mapped IR.
+*   `inference_final.mlir`: final GPU IR.

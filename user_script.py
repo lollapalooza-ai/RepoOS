@@ -1,14 +1,25 @@
-# user_script.py
+import torch
 
-# 1. Boot the OS layer
-from component6_hijacker import boot_poly_kernel
-boot_poly_kernel("legacy_shop")
+class FastModel(torch.nn.Module):
+    def forward(self, a, b):
+        return (a * b) + 2.0
 
-# 2. Standard Developer Code
-import legacy_shop.utils
+def main():
+    print("[User Script] Initializing Model...")
+    model = FastModel()
+    
+    # Enable the RepoOS Inference Backend
+    # The 'repoos_inference_backend' is registered via the CLI wrapper
+    model = torch.compile(model, backend='repoos_inference_backend')
+    
+    a = torch.ones(10, 10)
+    b = torch.ones(10, 10)
+    
+    print("[User Script] Running first inference (this triggers compilation)...")
+    result = model(a, b)
+    
+    print(f"[User Script] Result captured. Shape: {result.shape}")
+    print(f"[User Script] Result Snippet: {result[0, 0]}")
 
-print("Developer: Calling legacy_shop.utils.dynamic_pricing(10.0, 1.5)")
-# 10.0 * 1.5 = 15.0
-result = legacy_shop.utils.dynamic_pricing(10.0, 1.5)
-
-print(f"Developer: The final result is {result}")
+if __name__ == "__main__":
+    main()
