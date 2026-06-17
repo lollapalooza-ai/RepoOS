@@ -1,5 +1,5 @@
 #map = affine_map<(d0, d1) -> (d0, d1)>
-module {
+module attributes {transform.with_named_sequence} {
   func.func @main(%arg0: tensor<4096x4096xf32>, %arg1: tensor<4096x4096xf32>, %arg2: tensor<4096x4096xf32>) -> tensor<4096x4096xf32> {
     %cst = arith.constant 2.000000e+00 : f32
     %0 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel"]} ins(%arg0, %arg1 : tensor<4096x4096xf32>, tensor<4096x4096xf32>) outs(%arg2 : tensor<4096x4096xf32>) {
@@ -14,5 +14,13 @@ module {
     } -> tensor<4096x4096xf32>
     return %1 : tensor<4096x4096xf32>
   }
-}
 
+transform.named_sequence @__transform_main(%root: !transform.any_op) {
+    %v1 = transform.structured.match in %root { ops = ["linalg.generic"] } : (!transform.any_op) -> !transform.any_op
+    %v3, %v2 = transform.structured.tile_using_forall %v1 tile_sizes [32, 32] { mapping = [#gpu.block<x>, #gpu.block<y>] } : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %v4 = transform.structured.match in %root { ops = ["linalg.generic"] } : (!transform.any_op) -> !transform.any_op
+    %v6, %v5 = transform.structured.tile_using_forall %v4 tile_sizes [4, 8] { mapping = [#gpu.thread<x>, #gpu.thread<y>] } : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    // Hardware lowering (Bufferization/Vectorization) handled by deterministic backend passes
+    transform.yield
+}
+}

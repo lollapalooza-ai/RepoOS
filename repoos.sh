@@ -15,6 +15,7 @@ if [ "$1" == "inference" ]; then
     
     PROJECT_ROOT=$(pwd)
     export REPOOS_CACHE_DIR="./.poly_cache"
+    export REPOOS_INFERENCE="1"
     export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PROJECT_ROOT"
     
     echo "--- 🧠 RepoOS: Inference Track (Programmatic Dynamo Capture) ---"

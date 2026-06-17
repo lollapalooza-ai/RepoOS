@@ -29,9 +29,9 @@ class RepoOSSchedule:
     def match(self, target_op: str) -> str:
         """Finds operations in the graph. E.g., 'linalg.generic'"""
         out_var = self._next_var()
-        # Notice we hardcode the strict MLIR syntax rules here
+        # The 'ops' attribute must be inside curly braces, and 'in %root' comes first
         self.instructions.append(
-            f"    {out_var} = transform.structured.match ops{{[\"{target_op}\"]}} in %root : (!transform.any_op) -> !transform.any_op"
+            f"    {out_var} = transform.structured.match in %root {{ ops = [\"{target_op}\"] }} : (!transform.any_op) -> !transform.any_op"
         )
         return out_var
 
@@ -41,7 +41,8 @@ class RepoOSSchedule:
         grid_var = self._next_var()
         sizes_str = ", ".join(map(str, tile_sizes))
         
-        # We use the mapping attribute directly in tile_using_forall
+        # In modern Transform Dialect, tile_sizes is a static parameter list
+        # mapping is an attribute
         mapping = "[#gpu.block<x>, #gpu.block<y>]"
         self.instructions.append(
             f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
@@ -54,7 +55,6 @@ class RepoOSSchedule:
         thread_var = self._next_var()
         sizes_str = ", ".join(map(str, tile_sizes))
         
-        # We use the thread mapping attribute directly
         mapping = "[#gpu.thread<x>, #gpu.thread<y>]"
         self.instructions.append(
             f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
@@ -69,14 +69,10 @@ class RepoOSSchedule:
 
     def lower_to_nvvm(self, target_chip: str = "sm_90"):
         """
-        Forces the safe transition to GPU PTX memory space.
-        Note: OneShotBufferize is called on the root to transform the whole module.
+        Signals the transition to hardware lowering.
+        Bufferization and vector lowering are handled by the deterministic backend passes.
         """
-        after_gpu = self._next_var()
-        self.instructions.append(
-            f"    {after_gpu} = transform.bufferization.one_shot_bufferize %root {{ bufferize_function_boundaries = true }} : (!transform.any_op) -> !transform.any_op"
-        )
-        self.instructions.append(f"    // Lowering to NVVM handled by deterministic backend passes")
+        self.instructions.append(f"    // Hardware lowering (Bufferization/Vectorization) handled by deterministic backend passes")
 
     def build_mlir(self) -> str:
         """Compiles the Python instructions into the final MLIR string."""
@@ -133,23 +129,37 @@ def extract_first_module(content: str) -> str:
 
 def prune_abi_to_void(mlir_text: str) -> str:
     """
-    Surgically removes tensor return signatures to guarantee a C-compatible void kernel.
-    As specified by the Principal Engineer. Handles multiple returns and complex submodule paths.
+    Surgically removes return signatures to guarantee a C-compatible void kernel.
+    Handles tensor, memref, and multi-value returns.
     """
-    # 1. Strip the return type from the function signature (including multiple returns)
+    # 1. Strip the return type (anything after ->) before the opening brace
     mlir_text = re.sub(
-        r"(func\.func\s+@[a-zA-Z0-9_\./]+\(.*?\))\s*->\s*(\(.*?\)|tensor<[^>]+>)\s*\{",
+        r"(func\.func\s+@[a-zA-Z0-9_\./]+\(.*?\))\s*->\s*[^\{]+\{",
         r"\1 {",
         mlir_text
     )
     
-    # 2. Strip the return operand (including multiple operands)
+    # 2. Strip the return operand
     mlir_text = re.sub(
         r"return\s+[%a-zA-Z0-9_, ]+\s*:\s*.*",
         r"return",
         mlir_text
     )
     
+    return mlir_text
+
+def strip_transform_dialect(mlir_text: str) -> str:
+    """
+    Removes the transform.named_sequence block from the MLIR.
+    mlir-translate fails if this is present.
+    """
+    # Remove the transform.named_sequence block and its contents
+    mlir_text = re.sub(
+        r"transform\.named_sequence\s+@__transform_main.*?transform\.yield\s*\}",
+        "",
+        mlir_text,
+        flags=re.DOTALL
+    )
     return mlir_text
 
 async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False):
@@ -185,10 +195,32 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         
         current_transform = transform_mlir
         for attempt in range(2): # 1 initial + 1 self-heal retry
+            with open(linalg_tensors_path, "r") as bf:
+                base_mlir = bf.read()
+            
+            # Ensure the module has the necessary attribute for named sequences
+            module_idx = base_mlir.find("module")
+            if module_idx != -1:
+                # Use a more robust regex-based injection for the attribute
+                if "attributes {" in base_mlir[module_idx:module_idx+100]:
+                    tagged_base_mlir = re.sub(
+                        r"(module\s+attributes\s+\{)",
+                        r"\1transform.with_named_sequence, ",
+                        base_mlir, count=1
+                    )
+                else:
+                    # Robustly inject attributes into a bare module
+                    tagged_base_mlir = base_mlir.replace("module {", "module attributes {transform.with_named_sequence} {", 1)
+                
+                # CRITICAL: The transform.named_sequence MUST be inside the module.
+                # Find the last closing brace of the module and insert the transform script before it.
+                last_brace_idx = tagged_base_mlir.rfind("}")
+                final_payload = tagged_base_mlir[:last_brace_idx] + "\n" + current_transform + "\n}"
+            else:
+                final_payload = base_mlir + "\n" + current_transform
+
             with open(payload_path, "w") as f:
-                with open(linalg_tensors_path, "r") as bf: f.write(bf.read())
-                f.write("\n")
-                f.write(current_transform)
+                f.write(final_payload)
             
             try:
                 print(f"[Compiler] Stage 2: Applying AI Transform Schedule (Attempt {attempt+1})...")
@@ -199,8 +231,6 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
                 ], check=True, capture_output=True)
                 print("[Compiler] ✅ AI Transform Successful.")
                 
-                optimized_module = extract_first_module(open(optimized_tensors_path).read())
-                with open(optimized_tensors_path, "w") as f: f.write(optimized_module)
                 target_mlir = optimized_tensors_path
                 break
             except subprocess.CalledProcessError as e:
@@ -217,6 +247,14 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
     intermediate_memref_path = "temp_lowered_memref.mlir"
     final_machine_code_path = "final_machine_code.mlir"
     
+    # THE FIX: We must prune the return type from func.func to match the void return
+    # required by the Destination-Passing Style (DPS). This must be done for 
+    # the target_mlir (whether it's the optimized or the baseline path).
+    dps_text = open(target_mlir).read()
+    dps_text = prune_abi_to_void(dps_text)
+    dps_text = strip_transform_dialect(dps_text)
+    with open(target_mlir, "w") as f: f.write(dps_text)
+
     try:
         if is_gpu:
             print("[Compiler] Stage 3: Lowering to GPU Dialect (NVVM/PTX)...")
@@ -245,52 +283,42 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
                 with open(output_dylib, "w") as f: f.write("/* GPU NVVM/PTX Dylib Placeholder */")
             
         else:
-            print("[Compiler] Stage 3A: Bufferization to MemRefs...")
+            print("[Compiler] Stage 3A: Bufferization to MemRefs (DPS)...")
             subprocess.run([
                 MLIR_OPT, target_mlir,
-                # --- THE SPARSE LOWERING BLOCK (Architecture V2 Sparse) ---
-                "--sparse-assembler",
-                "--sparsification",
-                "--sparse-tensor-conversion",
-                # --- END SPARSE BLOCK ---
-
                 "--empty-tensor-to-alloc-tensor",
-                # THE FIX: Force flat C-arrays
                 "--one-shot-bufferize=bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map",
-                "--lower-vector-multi-reduction",
-                "-convert-linalg-to-loops",
-                "--expand-strided-metadata",
-                "--lower-affine",
-                "--convert-vector-to-scf",
-                "--convert-scf-to-cf",
-                "--convert-arith-to-llvm",
-                "--convert-complex-to-standard", 
-                "--convert-math-to-llvm",
-                "--convert-math-to-libm",
-                "--convert-index-to-llvm",
-                "--convert-vector-to-llvm",
-                "--convert-ub-to-llvm",
-                "--convert-bufferization-to-memref",
                 "-o", intermediate_memref_path
             ], check=True)
 
-            print("[Compiler] Stage 3B: Applying Bare Pointer ABI...")
-            subprocess.run([
-                MLIR_OPT, intermediate_memref_path,
-                # FINAL LOWERING: Ensure NO high-level dialects remain before translation
-                "--pass-pipeline=builtin.module(convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},convert-cf-to-llvm,convert-arith-to-llvm,finalize-memref-to-llvm,reconcile-unrealized-casts)",
-                "-o", final_machine_code_path
-            ], check=True)
+            # THE FIX: Prune the ABI to void AFTER bufferization, so we don't trigger Dead Code Elimination.
+            memref_text = open(intermediate_memref_path).read()
+            memref_text = prune_abi_to_void(memref_text)
+            with open(intermediate_memref_path, "w") as f: f.write(memref_text)
 
-            subprocess.run([MLIR_TRANSLATE, "-mlir-to-llvmir", final_machine_code_path, "-o", "kernel.ll"], check=True)
-            
-            # Sanitization
-            ll_ir = open("kernel.ll").read()
-            sanitized_ir = ll_ir.replace("captures(none)", "")
-            with open("kernel.ll", "w") as f: f.write(sanitized_ir)
+        print("[Compiler] Stage 3B: Applying Bare Pointer ABI...")
+        subprocess.run([
+            MLIR_OPT, intermediate_memref_path,
+            # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
+            "--pass-pipeline=builtin.module(convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
+            "-o", final_machine_code_path
+        ], check=True)
 
-            subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib], check=True)
-            print(f"[Compiler] ✅ Native library generated: {output_dylib}")
+        subprocess.run([MLIR_TRANSLATE, "-mlir-to-llvmir", final_machine_code_path, "-o", "kernel.ll"], check=True)
+        
+        # Sanitization: Fix version mismatches between MLIR-LLVM and System Clang
+        ll_ir = open("kernel.ll").read()
+        
+        # 1. Remove newer LLVM attributes not supported by older Clang
+        sanitized_ir = ll_ir.replace("captures(none)", "")
+        
+        # 2. Fix getelementptr syntax (Clang 18 does not support 'nuw' on GEP)
+        sanitized_ir = re.sub(r"getelementptr\s+inbounds\s+nuw", "getelementptr inbounds", sanitized_ir)
+        
+        with open("kernel.ll", "w") as f: f.write(sanitized_ir)
+
+        subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib], check=True)
+        print(f"[Compiler] ✅ Native library generated: {output_dylib}")
 
     except subprocess.CalledProcessError as e:
         print(f"[Compiler] ❌ Final Lowering failed: {e}")
@@ -330,22 +358,22 @@ async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code:
             # Ensure the module has the necessary attribute for named sequences
             module_idx = base_mlir.find("module")
             if module_idx != -1:
-                brace_idx = base_mlir.find("{", module_idx)
-                attr_idx = base_mlir.find("attributes", module_idx)
-                
-                if attr_idx != -1 and attr_idx < brace_idx:
-                    # Already has attributes, insert ours
-                    tagged_base_mlir = base_mlir[:attr_idx+12] + "transform.with_named_sequence, " + base_mlir[attr_idx+12:]
+                # Use a more robust regex-based injection for the attribute
+                if "attributes {" in base_mlir[module_idx:module_idx+100]:
+                    tagged_base_mlir = re.sub(
+                        r"(module\s+attributes\s+\{)",
+                        r"\1transform.with_named_sequence, ",
+                        base_mlir, count=1
+                    )
                 else:
-                    # No attributes, insert them
-                    tagged_base_mlir = base_mlir[:module_idx+6] + " attributes {transform.with_named_sequence} " + base_mlir[module_idx+6:]
+                    # Robustly inject attributes into a bare module
+                    tagged_base_mlir = base_mlir.replace("module {", "module attributes {transform.with_named_sequence} {", 1)
                 
                 # CRITICAL: The transform.named_sequence MUST be inside the module.
-                # We find the last closing brace of the module and insert the transform script before it.
+                # Find the last closing brace of the module and insert the transform script before it.
                 last_brace_idx = tagged_base_mlir.rfind("}")
                 final_payload = tagged_base_mlir[:last_brace_idx] + "\n" + transform_mlir + "\n}"
             else:
-                # Fallback if no module found (unlikely for torch-mlir)
                 final_payload = base_mlir + "\n" + transform_mlir
             
             with open(payload_path, "w") as f:
