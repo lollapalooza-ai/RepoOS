@@ -3,6 +3,7 @@ import torch_mlir
 import os
 import asyncio
 import ctypes
+import re
 from typing import Callable
 from component2_smt import generate_inference_transforms
 from component9_aot import apply_ai_transform_and_compile
@@ -23,6 +24,37 @@ def repoos_inference_backend(gm: torch.fx.GraphModule, example_inputs: list) -> 
     """
     return asyncio.run(_repoos_inference_backend_async(gm, example_inputs))
 
+def to_true_dps(mlir_text: str) -> str:
+    """
+    Surgically transforms a standard functional MLIR module into True DPS.
+    1. Adds an output tensor as the LAST argument.
+    2. Replaces the internal tensor.empty() with that argument.
+    """
+    # Find the main function signature
+    match = re.search(r"func.func @main\((.*?)\)\s*->\s*(tensor<.*?>)", mlir_text)
+    if not match: return mlir_text
+    
+    args = match.group(1)
+    ret_type = match.group(2)
+    
+    # Determine the next argument index
+    arg_count = len(re.findall(r"%arg\d+", args))
+    out_arg = f"%arg{arg_count}"
+    
+    # Update signature: add out_arg
+    new_args = args + f", {out_arg}: {ret_type}"
+    mlir_text = mlir_text.replace(f"func.func @main({args})", f"func.func @main({new_args})")
+    
+    # Replace internal tensor.empty with the out_arg
+    # We use tensor.cast to bridge the argument to the existing SSA name
+    mlir_text = re.sub(
+        r"(%[a-zA-Z0-9_]+) = tensor\.empty\(\) : (tensor<.*?>)", 
+        fr"\1 = tensor.cast {out_arg} : \2 to \2", 
+        mlir_text
+    )
+    
+    return mlir_text
+
 async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inputs: list) -> Callable:
     print(f"\n[Dynamo] 🧠 Intercepted Graph. Target Device: {TARGET_DEVICE}")
     
@@ -32,7 +64,7 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
         gm, *example_inputs, 
         output_type="linalg-on-tensors"
     )
-    base_mlir_text = str(base_mlir_module)
+    base_mlir_text = to_true_dps(str(base_mlir_module))
     
     kernel_id = abs(hash(base_mlir_text))
     base_dylib_path = os.path.join(CACHE_DIR, f"kernel_{kernel_id}_base.so")
@@ -53,25 +85,23 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
     # 3. THE SCHEDULE (AI Heuristics)
     transform_scripts = await generate_inference_transforms(base_mlir_text, TARGET_DEVICE)
     
-    # 4. BENCHMARKING SEARCH & SAFE FALLBACK
-    best_dylib = base_dylib_path
-    from component9_aot import RepoOSSchedule
+    # 4. BENCHMARKING SEARCH (EQUALITY SATURATION)
+    from component9_aot import safe_execute_schedule, RepoOSSchedule
+    import time
+    
+    compiled_dylibs = []
     
     # Try all AI-generated schedules
     for idx, transform_script in enumerate(transform_scripts):
         variant_dylib = os.path.join(CACHE_DIR, f"kernel_{kernel_id}_v{idx}.so")
         print(f"[Dynamo] Compiling AI Schedule Variant {idx+1}/{len(transform_scripts)}...")
         
-        # TRANSLATION: Convert Python DSL to MLIR Transform Dialect
         try:
             schedule = RepoOSSchedule()
-            local_scope = {"schedule": schedule}
-            exec(transform_script, {}, local_scope)
-            if "apply_schedule" in local_scope:
-                local_scope["apply_schedule"](schedule)
+            safe_execute_schedule(transform_script, schedule)
             transform_mlir = schedule.build_mlir()
         except Exception as e:
-            print(f"[Dynamo] ⚠️ Failed to build MLIR from AI Python script: {e}")
+            print(f"[Dynamo] ⚠️ Sandbox rejected AI script: {e}")
             continue
 
         await apply_ai_transform_and_compile(
@@ -79,28 +109,63 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
         )
         
         if os.path.exists(variant_dylib):
-            best_dylib = variant_dylib
-            print(f"[Dynamo] ✅ Variant {idx+1} successfully compiled and selected.")
-            break 
+            compiled_dylibs.append(variant_dylib)
+            print(f"[Dynamo] ✅ Variant {idx+1} successfully compiled.")
 
-    # 5. THE BARE-METAL FFI BRIDGE (Safe Implementation)
-    kernel_func = None
-    try:
-        lib = ctypes.CDLL(best_dylib)
-        # Try both naming conventions for maximum compatibility
-        if hasattr(lib, "_mlir_ciface_main"):
-            kernel_func = lib._mlir_ciface_main
-        elif hasattr(lib, "main"):
-            kernel_func = lib.main
-        else:
-            raise AttributeError("Neither '_mlir_ciface_main' nor 'main' symbol found in dylib.")
-        
-        # CRITICAL: For Bare-Pointer ABI, the kernel might return a pointer 
-        # (if it allocates memory internally). We must ensure ctypes doesn't truncate it.
-        kernel_func.restype = ctypes.c_void_p
+    # Fallback if AI totally failed
+    if not compiled_dylibs:
+        print("[Dynamo] ⚠️ All AI schedules failed bufferization. Falling back to programmatic base.")
+        compiled_dylibs.append(base_dylib_path)
+
+    # 5. MICRO-BENCHMARK THE SURVIVORS
+    print(f"[Dynamo] 🏁 Racing {len(compiled_dylibs)} compiled kernels to find the Speed of Light (SoL)...")
+    
+    best_dylib = compiled_dylibs[0]
+    best_time = float('inf')
+    best_kernel_func = None
+    
+    for dylib in compiled_dylibs:
+        try:
+            lib = ctypes.CDLL(dylib)
+            k_func = lib._mlir_ciface_main if hasattr(lib, "_mlir_ciface_main") else lib.main
+            k_func.restype = ctypes.c_void_p
             
-    except Exception as e:
-        print(f"[Dynamo] ⚠️ FFI Binding failed: {e}")
+            # Prepare bare-pointer args for the micro-benchmark
+            kernel_args = []
+            numpy_arrays = []
+            for arg in example_inputs:
+                if not isinstance(arg, torch.Tensor): continue
+                arr = arg.detach().cpu().numpy()
+                numpy_arrays.append(arr)
+                kernel_args.append(arr.ctypes.data_as(ctypes.c_void_p))
+            
+            # THE FIX: Also pass the output buffer for the benchmark
+            bench_res = torch.zeros_like(example_inputs[0])
+            bench_arr = bench_res.detach().cpu().numpy()
+            numpy_arrays.append(bench_arr)
+            kernel_args.append(bench_arr.ctypes.data_as(ctypes.c_void_p))
+                
+            # Warmup
+            k_func(*kernel_args)
+            
+            # Benchmark (10 iterations)
+            start_time = time.perf_counter()
+            for _ in range(10):
+                k_func(*kernel_args)
+            avg_time = (time.perf_counter() - start_time) / 10.0
+            
+            print(f"      🏎️  {os.path.basename(dylib)}: {avg_time*1000:.4f} ms")
+            
+            if avg_time < best_time:
+                best_time = avg_time
+                best_dylib = dylib
+                best_kernel_func = k_func
+                
+        except Exception as e:
+            print(f"      ❌ Benchmark failed for {dylib}: {e}")
+
+    print(f"[Dynamo] 🏆 Winner: {os.path.basename(best_dylib)} ({best_time*1000:.4f} ms)")
+    kernel_func = best_kernel_func
 
     def optimized_forward(*args):
         is_prod = os.getenv("REPOOS_ENV") == "prod"
@@ -120,25 +185,29 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
             
             # THE FIX: Destination-Passing Style (DPS)
             # We pre-allocate the output buffer in Python and pass it to the kernel.
-            # PyTorch Dynamo results usually expect the first argument to be the output for DPS.
+            # In our 'to_true_dps', we added it as the LAST argument.
             kernel_args = []
             numpy_arrays = []
             
-            # Prepare descriptors for all arguments (Inputs + Output)
+            # 1. Prepare Input Tensors
             for arg in args:
                 if not isinstance(arg, torch.Tensor): continue
-                # Detach and keep a reference
                 arr = arg.detach().cpu().numpy()
                 numpy_arrays.append(arr)
-                # Pass raw pointer (Bare-Pointer ABI)
                 kernel_args.append(arr.ctypes.data_as(ctypes.c_void_p))
+            
+            # 2. Allocate and Prepare Output Tensor
+            # (Assuming the output shape matches the first input for this demo)
+            res_torch = torch.zeros_like(args[0])
+            res_arr = res_torch.detach().cpu().numpy()
+            numpy_arrays.append(res_arr)
+            kernel_args.append(res_arr.ctypes.data_as(ctypes.c_void_p))
 
-            # Execute machine code
-            # Note: We assume the kernel is 'void main(ptr out, ptr in1, ptr in2...)'
+            # 3. Execute machine code
             kernel_func(*kernel_args)
 
-            # In DPS, the result is now in the first numpy array
-            res = torch.from_numpy(numpy_arrays[0])
+            # 4. Sync result back to PyTorch
+            res = torch.from_numpy(res_arr)
             return [res]
 
         except Exception as e:

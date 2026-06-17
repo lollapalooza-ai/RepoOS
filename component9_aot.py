@@ -12,37 +12,58 @@ NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
 CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache")
 
+import ast
+
+class SecurityError(Exception):
+    pass
+
+class SafeScheduleValidator(ast.NodeVisitor):
+    """
+    Strict AST Walker. Rejects anything that isn't a basic function definition,
+    variable assignment, or method call. Ensures the AI cannot break the sandbox.
+    """
+    ALLOWED_NODES = {
+        ast.Module, ast.FunctionDef, ast.arguments, ast.arg,
+        ast.Expr, ast.Call, ast.Attribute, ast.Name,
+        ast.Load, ast.Store, ast.Assign, ast.Constant, ast.List,
+        ast.keyword
+    }
+
+    def generic_visit(self, node):
+        if type(node) not in self.ALLOWED_NODES:
+            raise SecurityError(f"FATAL: AI generated unauthorized Python syntax: {type(node).__name__}")
+        
+        # Prevent accessing private methods (e.g., schedule._next_var())
+        if isinstance(node, ast.Attribute) and node.attr.startswith('_'):
+            raise SecurityError(f"FATAL: AI attempted to access private attribute: {node.attr}")
+            
+        super().generic_visit(node)
+
 class RepoOSSchedule:
     """
     The Python Builder API for MLIR Transform Dialect.
-    Ensures 100% syntactically valid MLIR generation.
+    Shift 1: The AI Sandbox (Policy Only). No memory management allowed.
     """
     def __init__(self):
         self.instructions = []
         self.var_counter = 0
 
     def _next_var(self) -> str:
-        """Safely tracks SSA variables so the AI never has to guess % numbers."""
         self.var_counter += 1
         return f"%v{self.var_counter}"
 
+    # === SECTION 1: AI SANDBOX (Public API) ===
     def match(self, target_op: str) -> str:
-        """Finds operations in the graph. E.g., 'linalg.generic'"""
         out_var = self._next_var()
-        # The 'ops' attribute must be inside curly braces, and 'in %root' comes first
         self.instructions.append(
             f"    {out_var} = transform.structured.match in %root {{ ops = [\"{target_op}\"] }} : (!transform.any_op) -> !transform.any_op"
         )
         return out_var
 
     def tile_to_blocks(self, target_var: str, tile_sizes: list[int]) -> str:
-        """Maps an operation to GPU Thread Blocks using direct mapping attributes."""
         tiled_op = self._next_var()
         grid_var = self._next_var()
         sizes_str = ", ".join(map(str, tile_sizes))
-        
-        # In modern Transform Dialect, tile_sizes is a static parameter list
-        # mapping is an attribute
         mapping = "[#gpu.block<x>, #gpu.block<y>]"
         self.instructions.append(
             f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
@@ -50,11 +71,9 @@ class RepoOSSchedule:
         return tiled_op
 
     def tile_to_threads(self, target_var: str, tile_sizes: list[int], block_dims: list[int] = None) -> str:
-        """Maps an operation to internal GPU Threads using direct mapping attributes."""
         tiled_op = self._next_var()
         thread_var = self._next_var()
         sizes_str = ", ".join(map(str, tile_sizes))
-        
         mapping = "[#gpu.thread<x>, #gpu.thread<y>]"
         self.instructions.append(
             f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
@@ -62,24 +81,33 @@ class RepoOSSchedule:
         return tiled_op
 
     def vectorize(self, target_var: str):
-        """Vectorizes the inner loops."""
-        self.instructions.append(
-            f"    transform.structured.vectorize {target_var} : !transform.any_op"
-        )
+        self.instructions.append(f"    transform.structured.vectorize {target_var} : !transform.any_op")
 
-    def lower_to_nvvm(self, target_chip: str = "sm_90"):
-        """
-        Signals the transition to hardware lowering.
-        Bufferization and vector lowering are handled by the deterministic backend passes.
-        """
-        self.instructions.append(f"    // Hardware lowering (Bufferization/Vectorization) handled by deterministic backend passes")
-
+    # === SECTION 2: THE CONCRETE CHUTE (Private API) ===
+    # Notice we REMOVED `lower_to_nvvm` from the AI's vocabulary.
+    
     def build_mlir(self) -> str:
-        """Compiles the Python instructions into the final MLIR string."""
         header = "transform.named_sequence @__transform_main(%root: !transform.any_op) {\n"
         body = "\n".join(self.instructions)
-        footer = "\n    transform.yield\n}"
+        # Shift 2: Concrete Chute forces the DPS bufferization passes implicitly
+        footer = "\n    // Memory management is locked to the orchestrator.\n    transform.yield\n}"
         return header + body + footer
+
+def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoOSSchedule):
+    """Safely parses and executes the AI schedule via AST whitelist."""
+    tree = ast.parse(ai_generated_python_code)
+    
+    validator = SafeScheduleValidator()
+    validator.visit(tree) # Will raise SecurityError if illegal syntax is found
+    
+    local_scope = {}
+    compiled_code = compile(tree, filename="<ast>", mode="exec")
+    exec(compiled_code, {}, local_scope)
+    
+    if "apply_schedule" not in local_scope:
+        raise ValueError("AI failed to generate 'apply_schedule' function.")
+        
+    local_scope["apply_schedule"](schedule_builder)
 
 # Compiler Paths
 MLIR_DIR = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin"
@@ -153,14 +181,12 @@ def strip_transform_dialect(mlir_text: str) -> str:
     Removes the transform.named_sequence block from the MLIR.
     mlir-translate fails if this is present.
     """
-    # Remove the transform.named_sequence block and its contents
-    mlir_text = re.sub(
-        r"transform\.named_sequence\s+@__transform_main.*?transform\.yield\s*\}",
-        "",
-        mlir_text,
-        flags=re.DOTALL
-    )
-    return mlir_text
+    idx = mlir_text.find("transform.named_sequence")
+    if idx == -1: return mlir_text
+    
+    # The transform block is typically at the end of the module.
+    # We strip from its start until the end, then ensure the module is closed.
+    return mlir_text[:idx].rstrip() + "\n}\n"
 
 async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False):
     """
@@ -247,14 +273,6 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
     intermediate_memref_path = "temp_lowered_memref.mlir"
     final_machine_code_path = "final_machine_code.mlir"
     
-    # THE FIX: We must prune the return type from func.func to match the void return
-    # required by the Destination-Passing Style (DPS). This must be done for 
-    # the target_mlir (whether it's the optimized or the baseline path).
-    dps_text = open(target_mlir).read()
-    dps_text = prune_abi_to_void(dps_text)
-    dps_text = strip_transform_dialect(dps_text)
-    with open(target_mlir, "w") as f: f.write(dps_text)
-
     try:
         if is_gpu:
             print("[Compiler] Stage 3: Lowering to GPU Dialect (NVVM/PTX)...")
@@ -292,17 +310,31 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             ], check=True)
 
             # THE FIX: Prune the ABI to void AFTER bufferization, so we don't trigger Dead Code Elimination.
+            # We also strip the transform dialect here.
             memref_text = open(intermediate_memref_path).read()
+            
+            # HACK: Convert memref.copy to linalg.copy so it can be lowered to loops.
+            # We use a greedy match until ' to ' to capture nested brackets in strided memrefs.
+            memref_text = re.sub(r"memref\.copy\s+(%[a-zA-Z0-9_]+),\s+(%[a-zA-Z0-9_]+)\s*:\s*(memref<.*>)\s+to\s+memref<.*>", 
+                                 r"linalg.copy ins(\1 : \3) outs(\2 : \3)", memref_text)
+            
             memref_text = prune_abi_to_void(memref_text)
+            memref_text = strip_transform_dialect(memref_text)
             with open(intermediate_memref_path, "w") as f: f.write(memref_text)
 
         print("[Compiler] Stage 3B: Applying Bare Pointer ABI...")
         subprocess.run([
             MLIR_OPT, intermediate_memref_path,
             # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
-            "--pass-pipeline=builtin.module(convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
+            # We use convert-linalg-to-loops to lower our newly created linalg.copy
+            "--pass-pipeline=builtin.module(convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
+
+        # Final safety check: Strip any lingering transform blocks from the machine code
+        final_text = open(final_machine_code_path).read()
+        final_text = strip_transform_dialect(final_text)
+        with open(final_machine_code_path, "w") as f: f.write(final_text)
 
         subprocess.run([MLIR_TRANSLATE, "-mlir-to-llvmir", final_machine_code_path, "-o", "kernel.ll"], check=True)
         
@@ -342,16 +374,11 @@ async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code:
     # STAGE 1: AI Schedule Generation (Python DSL -> MLIR)
     if transform_python_code.strip():
         try:
-            print(f"      [Compiler] Executing AI Python Schedule...")
+            print(f"      [Compiler] Executing AI Python Schedule via AST Sandbox...")
             schedule = RepoOSSchedule()
-            local_scope = {"schedule": schedule}
             
-            # Execute the AI's Python code
-            exec(transform_python_code, {}, local_scope)
-            
-            # If the AI wrapped it in apply_schedule, call it
-            if "apply_schedule" in local_scope:
-                local_scope["apply_schedule"](schedule)
+            # Use our new secure executor
+            safe_execute_schedule(transform_python_code, schedule)
                 
             transform_mlir = schedule.build_mlir()
             

@@ -3,8 +3,7 @@ import ctypes
 import numpy as np
 import torch
 import asyncio
-from component9_aot import RepoOSSchedule, apply_ai_transform_and_compile
-from component5_orchestrator import to_memref
+from component9_aot import RepoOSSchedule, apply_ai_transform_and_compile, safe_execute_schedule
 
 # 1. BASE MATH MLIR (Updated to true Destination-Passing Style)
 # We pass the 'out' tensor as an argument to avoid internal mallocs.
@@ -28,25 +27,22 @@ module {
 }
 """
 
-# 2. EXACT AI OUTPUT
+# 2. EXACT AI OUTPUT (Cleaned of legacy lowering calls)
 AI_PYTHON_SCRIPT = """
 def apply_schedule(schedule):
     ops = schedule.match("linalg.generic")
     block_tiled = schedule.tile_to_blocks(ops, tile_sizes=[32, 32])
     inner_op = schedule.match("linalg.generic")
     thread_tiled = schedule.tile_to_threads(inner_op, tile_sizes=[4, 8])
-    schedule.lower_to_nvvm(target_chip="x86_64 Linux")
 """
 
 async def verify():
     print("--- 🔍 Isolated AI Schedule Verification (True DPS) ---")
     
     # Step A: Translate Python DSL to MLIR Transform
-    print("[1/4] Translating AI Python DSL...")
+    print("[1/4] Translating AI Python DSL via AST Sandbox...")
     schedule = RepoOSSchedule()
-    local_scope = {"schedule": schedule}
-    exec(AI_PYTHON_SCRIPT, {}, local_scope)
-    local_scope["apply_schedule"](schedule)
+    safe_execute_schedule(AI_PYTHON_SCRIPT, schedule)
     transform_mlir = schedule.build_mlir()
     
     # Step B: Compile

@@ -180,13 +180,11 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
     - `schedule.match(op_name: str) -> str` 
       (Finds an operation. Example op_names: "linalg.generic", "linalg.matmul", "linalg.conv_2d_nchw_fchw")
     - `schedule.tile_to_blocks(target_var: str, tile_sizes: list[int]) -> str`
-      (Tiles the operation across GPU Thread Blocks. Returns the tiled operation.)
+      (Tiles the operation across GPU Thread Blocks. Returns the tiled operation handle.)
     - `schedule.tile_to_threads(target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str`
       (Tiles the inner loops across GPU Threads within a block.)
     - `schedule.vectorize(target_var: str) -> str`
       (Applies SIMD vectorization to the innermost loop.)
-    - `schedule.lower_to_nvvm(target_chip: str)`
-      (Mandatory final step: lowers the bufferized graph to PTX/NVVM.)
 
     FEW-SHOT EXAMPLE OF A VALID PYTHON SCRIPT:
     def apply_schedule(schedule):
@@ -202,9 +200,6 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
         
         # 4. Tile for GPU Threads (1x1 tile per thread)
         thread_tiled = schedule.tile_to_threads(inner_math, tile_sizes=[1, 1])
-        
-        # 5. Final Lowering
-        schedule.lower_to_nvvm(target_chip="{target_gpu}")
 
     OUTPUT FORMAT:
     You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
@@ -234,10 +229,9 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
     except Exception as e:
         print(f"[Oracle] ⚠️ Failed to generate Python schedules: {e}")
         # Safe Deterministic Fallback: Return a single, highly conservative Python schedule
-        fallback_script = f"""
+        fallback_script = """
 def apply_schedule(schedule):
     target = schedule.match("linalg.generic")
-    schedule.lower_to_nvvm(target_chip="{target_gpu}")
 """
         return [fallback_script]
 
