@@ -222,3 +222,8 @@ Intermediate stages are preserved in `build_artifacts/` for debugging:
 *   `inference_payload.mlir`: math + AI schedule.
 *   `inference_optimized.mlir`: tiled and mapped IR.
 *   `inference_final.mlir`: final GPU IR.
+
+
+## Inference Benchmark
+*   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 test_inference.py`
+*   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 benchmark_variants.py`

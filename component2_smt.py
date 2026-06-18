@@ -176,11 +176,11 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
         # 1. Isolate the mathematical hotspot
-        math_ops = schedule.match("linalg.generic")
+        math_ops = schedule.match("linalg.matmul")
         
         # 2. Tile to fit inside CPU Cache bounds
         # Save the returned handle to interact with the inner loops
-        tiled_inner_ops = schedule.tile(math_ops, tile_sizes=[32, 32])
+        tiled_inner_ops = schedule.tile(math_ops, tile_sizes=[32, 32, 32])
         
         # 3. Vectorize the inner loops for AVX/NEON SIMD execution
         schedule.vectorize(tiled_inner_ops)

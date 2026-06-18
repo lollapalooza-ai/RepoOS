@@ -5,7 +5,7 @@ import psutil
 
 class FastModel(torch.nn.Module):
     def forward(self, a, b):
-        return (a * b) + 2.0
+        return torch.matmul(a, b)
 
 def get_metrics():
     process = psutil.Process(os.getpid())
@@ -48,9 +48,9 @@ def main():
     print("--- 🧠 RepoOS INFERENCE Track: End-to-End User Benchmark ---")
     model = FastModel()
     
-    # Scaling up to 4096x4096 to cross the crossover point
-    a = torch.ones(4096, 4096)
-    b = torch.ones(4096, 4096)
+    # Scaling up to 512x512 to cross the crossover point for matmul
+    a = torch.ones(512, 512)
+    b = torch.ones(512, 512)
     
     # 1. Native Python Run
     native_time, native_mem, native_cpu, native_res = run_benchmark("NATIVE PYTHON", model, [a, b])

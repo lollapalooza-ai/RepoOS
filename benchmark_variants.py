@@ -14,7 +14,7 @@ from component10_dynamo import to_true_dps, CACHE_DIR
 # We use the same simple workload
 class FastModel(torch.nn.Module):
     def forward(self, a, b):
-        return (a * b) + 2.0
+        return torch.matmul(a, b)
 
 def measure_isolated_execution(dylib_path: str):
     """
@@ -25,8 +25,8 @@ def measure_isolated_execution(dylib_path: str):
     process = psutil.Process(os.getpid())
     
     # 2. Setup inputs
-    a = torch.ones((4096, 4096), dtype=torch.float32)
-    b = torch.ones((4096, 4096), dtype=torch.float32)
+    a = torch.ones((512, 512), dtype=torch.float32)
+    b = torch.ones((512, 512), dtype=torch.float32)
     out = torch.zeros_like(a)
     
     a_arr = a.detach().cpu().numpy()
@@ -46,7 +46,7 @@ def measure_isolated_execution(dylib_path: str):
     
     # 4. Warmup & Correctness Check
     k_func(*args)
-    is_correct = bool(torch.allclose(torch.from_numpy(out_arr), torch.tensor(3.0)))
+    is_correct = bool(torch.allclose(torch.from_numpy(out_arr), torch.tensor(512.0)))
     
     # 5. Benchmark loop (100 iterations)
     # Reset CPU counter
@@ -67,8 +67,8 @@ async def compile_variants():
     """Generates and compiles all variants ahead-of-time."""
     print("--- [AOT Compilation Phase] ---")
     model = FastModel()
-    a = torch.ones((4096, 4096), dtype=torch.float32)
-    b = torch.ones((4096, 4096), dtype=torch.float32)
+    a = torch.ones((512, 512), dtype=torch.float32)
+    b = torch.ones((512, 512), dtype=torch.float32)
     
     from torch_mlir.fx import export_and_import
     gm = torch.fx.symbolic_trace(model)

@@ -1,56 +1,40 @@
-#map = affine_map<(d0) -> (d0 * 64)>
+#map = affine_map<(d0) -> (d0 * 16)>
 #map1 = affine_map<(d0) -> (d0 * 8)>
+#map2 = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map3 = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map4 = affine_map<(d0, d1, d2) -> (d0, d1)>
 module attributes {transform.with_named_sequence} {
-  func.func @main(%arg0: tensor<4096x4096xf32>, %arg1: tensor<4096x4096xf32>, %arg2: tensor<4096x4096xf32>) -> tensor<4096x4096xf32> {
-    %cst = arith.constant 2.000000e+00 : f32
-    %0 = scf.forall (%arg3, %arg4) in (64, 512) shared_outs(%arg5 = %arg2) -> (tensor<4096x4096xf32>) {
-      %2 = affine.apply #map(%arg3)
-      %3 = affine.apply #map1(%arg4)
-      %extracted_slice = tensor.extract_slice %arg0[%2, %3] [64, 8] [1, 1] : tensor<4096x4096xf32> to tensor<64x8xf32>
-      %extracted_slice_0 = tensor.extract_slice %arg1[%2, %3] [64, 8] [1, 1] : tensor<4096x4096xf32> to tensor<64x8xf32>
-      %extracted_slice_1 = tensor.extract_slice %arg5[%2, %3] [64, 8] [1, 1] : tensor<4096x4096xf32> to tensor<64x8xf32>
-      %c64 = arith.constant 64 : index
-      %c8 = arith.constant 8 : index
-      %c0 = arith.constant 0 : index
-      %4 = ub.poison : f32
-      %5 = vector.transfer_read %extracted_slice[%c0, %c0], %4 : tensor<64x8xf32>, vector<64x8xf32>
-      %6 = ub.poison : f32
-      %7 = vector.transfer_read %extracted_slice_0[%c0, %c0], %6 : tensor<64x8xf32>, vector<64x8xf32>
-      %8 = ub.poison : f32
-      %9 = vector.transfer_read %extracted_slice_1[%c0, %c0], %8 : tensor<64x8xf32>, vector<64x8xf32>
-      %10 = arith.mulf %5, %7 : vector<64x8xf32>
-      %c0_2 = arith.constant 0 : index
-      %11 = vector.transfer_write %10, %extracted_slice_1[%c0_2, %c0_2] : vector<64x8xf32>, tensor<64x8xf32>
+  func.func @main(%arg0: tensor<512x512xf32>, %arg1: tensor<512x512xf32>, %arg2: tensor<512x512xf32>) -> tensor<512x512xf32> {
+    %0 = ub.poison : f32
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant dense<0.000000e+00> : vector<512x512xf32>
+    %1 = vector.transfer_write %cst, %arg2[%c0, %c0] {in_bounds = [true, true]} : vector<512x512xf32>, tensor<512x512xf32>
+    %2 = scf.forall (%arg3, %arg4, %arg5) in (32, 32, 64) shared_outs(%arg6 = %1) -> (tensor<512x512xf32>) {
+      %3 = affine.apply #map(%arg3)
+      %4 = affine.apply #map(%arg4)
+      %extracted_slice = tensor.extract_slice %arg6[%3, %4] [16, 16] [1, 1] : tensor<512x512xf32> to tensor<16x16xf32>
+      %5 = affine.apply #map(%arg3)
+      %6 = affine.apply #map1(%arg5)
+      %7 = vector.transfer_read %arg0[%5, %6], %0 {in_bounds = [true, true]} : tensor<512x512xf32>, vector<16x8xf32>
+      %8 = affine.apply #map1(%arg5)
+      %9 = affine.apply #map(%arg4)
+      %10 = vector.transfer_read %arg1[%8, %9], %0 {in_bounds = [true, true]} : tensor<512x512xf32>, vector<8x16xf32>
+      %11 = affine.apply #map(%arg3)
+      %12 = affine.apply #map(%arg4)
+      %13 = vector.transfer_read %arg6[%11, %12], %0 {in_bounds = [true, true]} : tensor<512x512xf32>, vector<16x16xf32>
+      %14 = vector.contract {indexing_maps = [#map2, #map3, #map4], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %7, %10, %13 : vector<16x8xf32>, vector<8x16xf32> into vector<16x16xf32>
+      %15 = vector.transfer_write %14, %extracted_slice[%c0, %c0] {in_bounds = [true, true]} : vector<16x16xf32>, tensor<16x16xf32>
       scf.forall.in_parallel {
-        tensor.parallel_insert_slice %11 into %arg5[%2, %3] [64, 8] [1, 1] : tensor<64x8xf32> into tensor<4096x4096xf32>
+        tensor.parallel_insert_slice %15 into %arg6[%3, %4] [16, 16] [1, 1] : tensor<16x16xf32> into tensor<512x512xf32>
       }
     }
-    %1 = scf.forall (%arg3, %arg4) in (64, 512) shared_outs(%arg5 = %arg2) -> (tensor<4096x4096xf32>) {
-      %2 = affine.apply #map(%arg3)
-      %3 = affine.apply #map1(%arg4)
-      %extracted_slice = tensor.extract_slice %0[%2, %3] [64, 8] [1, 1] : tensor<4096x4096xf32> to tensor<64x8xf32>
-      %extracted_slice_0 = tensor.extract_slice %arg5[%2, %3] [64, 8] [1, 1] : tensor<4096x4096xf32> to tensor<64x8xf32>
-      %c64 = arith.constant 64 : index
-      %c8 = arith.constant 8 : index
-      %c0 = arith.constant 0 : index
-      %4 = ub.poison : f32
-      %5 = vector.transfer_read %extracted_slice[%c0, %c0], %4 : tensor<64x8xf32>, vector<64x8xf32>
-      %6 = ub.poison : f32
-      %7 = vector.transfer_read %extracted_slice_0[%c0, %c0], %6 : tensor<64x8xf32>, vector<64x8xf32>
-      %cst_1 = arith.constant dense<2.000000e+00> : vector<64x8xf32>
-      %8 = arith.addf %5, %cst_1 : vector<64x8xf32>
-      %c0_2 = arith.constant 0 : index
-      %9 = vector.transfer_write %8, %extracted_slice_0[%c0_2, %c0_2] : vector<64x8xf32>, tensor<64x8xf32>
-      scf.forall.in_parallel {
-        tensor.parallel_insert_slice %9 into %arg5[%2, %3] [64, 8] [1, 1] : tensor<64x8xf32> into tensor<4096x4096xf32>
-      }
-    }
-    return %1 : tensor<4096x4096xf32>
+    return %2 : tensor<512x512xf32>
   }
   transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
-    %tiled_op, %forall_op = transform.structured.tile_using_forall %0 tile_sizes [64, 8] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.structured.vectorize %tiled_op : !transform.any_op
+    %0 = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %tiled_op, %forall_op = transform.structured.tile_using_forall %0 tile_sizes [16, 16, 8] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %1 = transform.structured.match ops{["func.func"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    %2 = transform.structured.vectorize_children_and_apply_patterns %1 : (!transform.any_op) -> !transform.any_op
     transform.yield 
   }
 }
