@@ -41,58 +41,53 @@ class SafeScheduleValidator(ast.NodeVisitor):
 
 class RepoOSSchedule:
     """
-    The Python Builder API for MLIR Transform Dialect.
-    Shift 1: The AI Sandbox (Policy Only). No memory management allowed.
+    The Upgraded CPU-Native Builder API for MLIR Transform Dialect.
+    Permanently eliminates GPU mapping overhead for CPU targets.
     """
     def __init__(self):
         self.instructions = []
         self.var_counter = 0
 
     def _next_var(self) -> str:
+        """Safely tracks SSA variables to insulate the AI from % numbering rules."""
         self.var_counter += 1
         return f"%v{self.var_counter}"
 
-    # === SECTION 1: AI SANDBOX (Public API) ===
     def match(self, target_op: str) -> str:
+        """Finds mathematical instructions inside the baseline graph."""
         out_var = self._next_var()
         self.instructions.append(
             f"    {out_var} = transform.structured.match in %root {{ ops = [\"{target_op}\"] }} : (!transform.any_op) -> !transform.any_op"
         )
         return out_var
 
-    def tile_to_blocks(self, target_var: str, tile_sizes: list[int]) -> str:
+    def tile(self, target_var: str, tile_sizes: list[int]) -> str:
+        """
+        Generates standard, sequential scf.for loops. 
+        Safe for bare-metal CPU execution without OpenMP.
+        """
         tiled_op = self._next_var()
-        grid_var = self._next_var()
+        loop_handles = self._next_var()
         sizes_str = ", ".join(map(str, tile_sizes))
-        mapping = "[#gpu.block<x>, #gpu.block<y>]"
+        
+        # Uses tile_using_forall without mapping to generate CPU-safe loops
+        # and match the exactly 2 return handles signature.
         self.instructions.append(
-            f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+            f"    {loop_handles}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
         )
-        # THE FIX: Return the loop handle (grid_var) instead of the inner ops handle.
-        # This allows nested tiling and vectorization to automatically recurse into the loops.
-        return grid_var
-
-    def tile_to_threads(self, target_var: str, tile_sizes: list[int], block_dims: list[int] = None) -> str:
-        tiled_op = self._next_var()
-        thread_var = self._next_var()
-        sizes_str = ", ".join(map(str, tile_sizes))
-        mapping = "[#gpu.thread<x>, #gpu.thread<y>]"
-        self.instructions.append(
-            f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
-        )
-        return thread_var
+        return tiled_op
 
     def vectorize(self, target_var: str):
-        self.instructions.append(f"    transform.structured.vectorize {target_var} : !transform.any_op")
+        """Vectorizes the inner loop bounds to exploit native SIMD extensions."""
+        self.instructions.append(
+            f"    transform.structured.vectorize {target_var} : !transform.any_op"
+        )
 
-    # === SECTION 2: THE CONCRETE CHUTE (Private API) ===
-    # Notice we REMOVED `lower_to_nvvm` from the AI's vocabulary.
-    
     def build_mlir(self) -> str:
+        """Compiles the Python instructions into a valid Transform Dialect block."""
         header = "transform.named_sequence @__transform_main(%root: !transform.any_op) {\n"
         body = "\n".join(self.instructions)
-        # Shift 2: Concrete Chute forces the DPS bufferization passes implicitly
-        footer = "\n    // Memory management is locked to the orchestrator.\n    transform.yield\n}"
+        footer = "\n    transform.yield\n}"
         return header + body + footer
 
 def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoOSSchedule):
@@ -329,7 +324,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             MLIR_OPT, intermediate_memref_path,
             # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
             # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
-            "--pass-pipeline=builtin.module(memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
+            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 
@@ -356,6 +351,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
 
     except subprocess.CalledProcessError as e:
         print(f"[Compiler] ❌ Final Lowering failed: {e}")
+        raise RuntimeError(f"Final MLIR to LLVM lowering failed: {e}")
 
 async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code: str, output_dylib: str) -> bool:
     """

@@ -145,16 +145,11 @@ async def compile_function_logic(python_code: str, execution_track: str):
         # Note: This is handled separately by generate_inference_transforms
         return "INFERENCE_TRACK_ACTIVE"
 
-async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "sm_90") -> list[str]:
-    """
-    The Python-DSL Oracle.
-    Prompts the AI to generate Python scheduling scripts using the RepoOS API.
-    """
-    
+async def generate_inference_transforms(base_mlir_text: str, target_device: str = "x86_64 Linux") -> list[str]:
     prompt = f"""
-    You are an elite Deep Learning Compiler Architect optimizing a neural network for an NVIDIA GPU ({target_gpu}).
+    You are an elite Systems Performance Engineer optimizing a dense tensor codebase for a modern CPU architecture ({target_device}).
     
-    Below is the mathematically verified, programmatically lowered Linalg MLIR graph of the workload:
+    Below is the baseline, mathematically verified Linalg MLIR graph of the workload:
     
     === BASELINE MLIR ===
     ```mlir
@@ -163,45 +158,36 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
     === END BASELINE MLIR ===
     
     TASK:
-    You must generate exactly 3 DIFFERENT optimization schedules for this graph:
-    1. Compute-Heavy (Aggressive unrolling)
-    2. Memory-Bound (Cache-aligned tiles)
-    3. Balanced (Standard tiling and vectorization)
-
-    IMPORTANT PERFORMANCE GUIDELINES:
-    - The problem size is often small (e.g. 10x10). Your tiles MUST be smaller than or equal to the workload.
-    - `schedule.match("linalg.generic")` returns a handle to ALL matching operations. 
-    - `schedule.vectorize(target)` only works if the tiled dimensions are a multiple of 4 or 8. Do NOT call vectorize on 1x1 or odd-sized tiles.
+    You must generate exactly 3 DIFFERENT optimization strategy scripts for this CPU target:
+    1. L1 Cache Optimized (Aggressive deep tiling into very small blocks to fit entirely in L1, followed by vectorization).
+    2. L2 Cache Optimized (Moderate tiling sizes, prioritizing continuous memory scans).
+    3. SIMD-Optimized (Tile the innermost loops to a multiple of 4 or 8, then vectorize the resulting inner loops. NEVER vectorize untiled loops, as it will crash the compiler).
 
     CRITICAL API CONSTRAINTS:
-    You are FORBIDDEN from writing raw MLIR text. You must write a Python function named `apply_schedule(schedule)` using ONLY the following methods from the `RepoOSSchedule` API:
+    You must output a pure Python function named `apply_schedule(schedule)` using ONLY these API options:
 
     - `schedule.match(op_name: str) -> str` 
-      (Finds an operation. Example op_names: "linalg.generic", "linalg.matmul", "linalg.conv_2d_nchw_fchw")
-    - `schedule.tile_to_blocks(target_var: str, tile_sizes: list[int]) -> str`
-      (Tiles the operation across GPU Thread Blocks. CRITICAL: This returns a handle to the NEWLY TILED inner operations.)
-    - `schedule.tile_to_threads(target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str`
-      (Tiles the inner loops across GPU Threads within a block.)
-    - `schedule.vectorize(target_var: str) -> str`
-      (Applies SIMD vectorization to the innermost loop.)
+      (Finds a target operation handle).
+    - `schedule.tile(target_var: str, tile_sizes: list[int]) -> str` 
+      (Tiles the loop. CRITICAL: This returns a handle to the NEWLY TILED inner operations).
+    - `schedule.vectorize(target_var: str)` 
+      (Forces SIMD vectorization. Apply this to the handle returned by schedule.tile).
 
-    FEW-SHOT EXAMPLE OF A VALID PYTHON SCRIPT:
+    FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
-        # 1. Match all math ops
+        # 1. Isolate the mathematical hotspot
         math_ops = schedule.match("linalg.generic")
         
-        # 2. Tile for GPU Blocks. 
-        # Save the returned handle! It points directly to the inner loops.
-        block_tiled_ops = schedule.tile_to_blocks(math_ops, tile_sizes=[8, 8])
+        # 2. Tile to fit inside CPU Cache bounds
+        # Save the returned handle to interact with the inner loops
+        tiled_inner_ops = schedule.tile(math_ops, tile_sizes=[32, 32])
         
-        # 3. Pass the returned handle directly to thread tiling. 
-        # DO NOT call schedule.match() again!
-        thread_tiled_ops = schedule.tile_to_threads(block_tiled_ops, tile_sizes=[1, 1], block_dims=[8, 8])
+        # 3. Vectorize the inner loops for AVX/NEON SIMD execution
+        schedule.vectorize(tiled_inner_ops)
 
     OUTPUT FORMAT:
     You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
-    DO NOT wrap the JSON in markdown formatting like ```json.
-    DO NOT import any external libraries.
+    DO NOT wrap the JSON in markdown code blocks like ```json.
     """
     
     try:

@@ -17,10 +17,8 @@ module attributes {transform.with_named_sequence} {
 
 transform.named_sequence @__transform_main(%root: !transform.any_op) {
     %v1 = transform.structured.match in %root { ops = ["linalg.generic"] } : (!transform.any_op) -> !transform.any_op
-    %v3, %v2 = transform.structured.tile_using_forall %v1 tile_sizes [32, 32] { mapping = [#gpu.block<x>, #gpu.block<y>] } : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %v5, %v4 = transform.structured.tile_using_forall %v3 tile_sizes [2, 4] { mapping = [#gpu.thread<x>, #gpu.thread<y>] } : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.structured.vectorize %v5 : !transform.any_op
-    // Memory management is locked to the orchestrator.
+    %v3, %v2 = transform.structured.tile_using_forall %v1 tile_sizes [64, 8] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.structured.vectorize %v3 : !transform.any_op
     transform.yield
 }
 }
