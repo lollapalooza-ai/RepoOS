@@ -68,7 +68,9 @@ class RepoOSSchedule:
         self.instructions.append(
             f"    {grid_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
         )
-        return tiled_op
+        # THE FIX: Return the loop handle (grid_var) instead of the inner ops handle.
+        # This allows nested tiling and vectorization to automatically recurse into the loops.
+        return grid_var
 
     def tile_to_threads(self, target_var: str, tile_sizes: list[int], block_dims: list[int] = None) -> str:
         tiled_op = self._next_var()
@@ -78,7 +80,7 @@ class RepoOSSchedule:
         self.instructions.append(
             f"    {thread_var}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] {{ mapping = {mapping} }} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
         )
-        return tiled_op
+        return thread_var
 
     def vectorize(self, target_var: str):
         self.instructions.append(f"    transform.structured.vectorize {target_var} : !transform.any_op")
@@ -265,9 +267,9 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
                 if attempt == 0:
                     current_transform = await fix_transform_syntax_with_ai(current_transform, error_msg)
                 else:
-                    print(f"[Compiler] Self-heal failed. Degrading to Baseline.")
+                    print(f"[Compiler] Self-heal failed.")
                     print(f"--- [DEBUG] FINAL COMPILER ERROR ---\n{error_msg}")
-                    target_mlir = linalg_tensors_path
+                    raise RuntimeError(f"AI Transform failed after self-heal: {error_msg}")
 
     # --- STAGE 3: Bufferization & Bare-Metal Lowering ---
     intermediate_memref_path = "temp_lowered_memref.mlir"
@@ -326,8 +328,8 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         subprocess.run([
             MLIR_OPT, intermediate_memref_path,
             # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
-            # We use convert-linalg-to-loops to lower our newly created linalg.copy
-            "--pass-pipeline=builtin.module(convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
+            # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
+            "--pass-pipeline=builtin.module(memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 

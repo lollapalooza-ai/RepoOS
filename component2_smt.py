@@ -172,7 +172,6 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
     - The problem size is often small (e.g. 10x10). Your tiles MUST be smaller than or equal to the workload.
     - `schedule.match("linalg.generic")` returns a handle to ALL matching operations. 
     - `schedule.vectorize(target)` only works if the tiled dimensions are a multiple of 4 or 8. Do NOT call vectorize on 1x1 or odd-sized tiles.
-    - CRITICAL: To perform nested tiling (Blocks -> Threads), you MUST re-match the op inside the loop.
 
     CRITICAL API CONSTRAINTS:
     You are FORBIDDEN from writing raw MLIR text. You must write a Python function named `apply_schedule(schedule)` using ONLY the following methods from the `RepoOSSchedule` API:
@@ -180,7 +179,7 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
     - `schedule.match(op_name: str) -> str` 
       (Finds an operation. Example op_names: "linalg.generic", "linalg.matmul", "linalg.conv_2d_nchw_fchw")
     - `schedule.tile_to_blocks(target_var: str, tile_sizes: list[int]) -> str`
-      (Tiles the operation across GPU Thread Blocks. Returns the tiled operation handle.)
+      (Tiles the operation across GPU Thread Blocks. CRITICAL: This returns a handle to the NEWLY TILED inner operations.)
     - `schedule.tile_to_threads(target_var: str, tile_sizes: list[int], block_dims: list[int]) -> str`
       (Tiles the inner loops across GPU Threads within a block.)
     - `schedule.vectorize(target_var: str) -> str`
@@ -191,15 +190,13 @@ async def generate_inference_transforms(base_mlir_text: str, target_gpu: str = "
         # 1. Match all math ops
         math_ops = schedule.match("linalg.generic")
         
-        # 2. Tile for GPU Blocks
-        # (Using 8x8 for a 10x10 problem)
-        block_tiled = schedule.tile_to_blocks(math_ops, tile_sizes=[8, 8])
+        # 2. Tile for GPU Blocks. 
+        # Save the returned handle! It points directly to the inner loops.
+        block_tiled_ops = schedule.tile_to_blocks(math_ops, tile_sizes=[8, 8])
         
-        # 3. Match again to get a fresh handle for the next level
-        inner_math = schedule.match("linalg.generic")
-        
-        # 4. Tile for GPU Threads (1x1 tile per thread)
-        thread_tiled = schedule.tile_to_threads(inner_math, tile_sizes=[1, 1])
+        # 3. Pass the returned handle directly to thread tiling. 
+        # DO NOT call schedule.match() again!
+        thread_tiled_ops = schedule.tile_to_threads(block_tiled_ops, tile_sizes=[1, 1], block_dims=[8, 8])
 
     OUTPUT FORMAT:
     You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
