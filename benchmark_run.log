@@ -1,69 +1,17 @@
 🚀 Starting Isolated Benchmarking Suite...
---- [AOT Compilation Phase] ---
-/usr/lib/python3.12/copyreg.py:99: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
-  return cls.__new__(cls, *args)
-1. Querying AI for 3 Scheduling Variants...
 
-================================================================================
-DEBUG: AI ORACLE INTERACTION [PYTHON_SCHEDULE_GENERATION]
-LOG FILE: oracle_logs/python_schedule_generation_1781811014903.log
-================================================================================
+--- [Matrix Multiplication Benchmark Run] ---
+Variant Name    | Speed (ms) | CPU Time (ms) | Memory (MB)  | Output (Expected: 512.0)
+-------------------------------------------------------------------------------------
+Baseline        |   105.3129 |      105.3072 |       379.84 | 512.0 (Match)
+Variant 1       |    50.3816 |       50.3796 |       379.69 | 512.0 (Match)
+Variant 2       |    99.2501 |       99.2442 |       379.76 | 512.0 (Match)
+Variant 3       |    47.6796 |       47.6787 |       379.66 | 512.0 (Match)
 
->>> FULL PROMPT SENT TO GEMINI:
-...
-<<< FULL RESPONSE FROM GEMINI:
-[
-  "def apply_schedule(schedule):\n    # 1. L1 Cache Optimized: Aggressive tiling for L1 data cache residency.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Tile into small 16x16x16 blocks. The working set for these tiles\n    # fits comfortably within a typical 32KB-64KB L1 data cache.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[16, 16, 16])\n    \n    # Vectorize the innermost loop of the tiled, cache-resident operation.\n    schedule.vectorize(tiled_inner_matmul)",
-  "def apply_schedule(schedule):\n    # 2. L2 Cache Optimized: Moderate tiling to fit in L2 and enable continuous memory scans.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Use larger tile sizes like 128x128x64. This working set fits well in\n    # modern L2 caches (e.g., 1-2MB), improving locality for larger data chunks.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[128, 128, 64])\n    \n    # Vectorize the inner loops to leverage SIMD on the L2-cache-resident data.\n    schedule.vectorize(tiled_inner_matmul)",
-  "def apply_schedule(schedule):\n    # 3. SIMD-Optimized: Tile inner loops to match vector register width.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Tile the 'N' dimension to 8, matching the number of f32 elements in a 256-bit\n    # AVX register. Small tile sizes for 'M' and 'K' create a compact micro-kernel.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[6, 8, 16])\n    \n    # Vectorize the resulting inner loop, which is now perfectly sized for SIMD execution.\n    schedule.vectorize(tiled_inner_matmul)"
-]
-================================================================================
-
-
-2. Compiling Baseline MLIR...
-[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...
-[Compiler] Stage 3A: Bufferization to MemRefs (DPS)...
-[Compiler] Stage 3B: Applying Bare Pointer ABI...
-warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverride-module]
-1 warning generated.
-[Compiler] ✅ Native library generated: ./.poly_cache/bench_base.so
-
-3. Compiling Variant 1...
-[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...
-[Compiler] Stage 2: Applying AI Transform Schedule (Attempt 1)...
-[Compiler] ✅ AI Transform Successful.
-[Compiler] Stage 3A: Bufferization to MemRefs (DPS)...
-[Compiler] Stage 3B: Applying Bare Pointer ABI...
-warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverride-module]
-1 warning generated.
-[Compiler] ✅ Native library generated: ./.poly_cache/bench_v1.so
-
-3. Compiling Variant 2...
-[Compiler Debug] Vectorization requested with large tile sizes [128, 128, 64]. Capping to [16, 16, 16] to prevent compilation hang.
-[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...
-[Compiler] Stage 2: Applying AI Transform Schedule (Attempt 1)...
-[Compiler] ✅ AI Transform Successful.
-[Compiler] Stage 3A: Bufferization to MemRefs (DPS)...
-[Compiler] Stage 3B: Applying Bare Pointer ABI...
-warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverride-module]
-1 warning generated.
-[Compiler] ✅ Native library generated: ./.poly_cache/bench_v2.so
-
-3. Compiling Variant 3...
-[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...
-[Compiler] Stage 2: Applying AI Transform Schedule (Attempt 1)...
-[Compiler] ✅ AI Transform Successful.
-[Compiler] Stage 3A: Bufferization to MemRefs (DPS)...
-[Compiler] Stage 3B: Applying Bare Pointer ABI...
-warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverride-module]
-1 warning generated.
-[Compiler] ✅ Native library generated: ./.poly_cache/bench_v3.so
-
-
---- [Isolated Benchmarking Phase] ---
-Variant Name    | Speed (ms) | CPU (%)    | Memory (MB)  | Output[0,0] (Expected: 2048.0)
---------------------------------------------------------------------------------
-Baseline        | 38840.7141 |     100.00 |       450.83 | 2048.0 (Match)
-Variant 1       |  3835.4770 |     100.00 |       450.96 | 2048.0 (Match)
-Variant 2       |  3877.3139 |     100.00 |       450.78 | 2048.0 (Match)
-Variant 3       |  6156.0194 |     100.00 |       450.68 | 2048.0 (Match)
+--- [PageRank Benchmark Run] ---
+Variant Name    | Speed (ms) | CPU Time (ms) | Memory (MB)  | Output[0,0]
+-------------------------------------------------------------------------------------
+Baseline        |     2.8189 |        2.8185 |       464.32 | 0.000472 (Match)
+Variant 1       |     1.7834 |        1.7832 |       465.17 | 0.000472 (Match)
+Variant 2       |     1.7849 |        1.7847 |       465.25 | 0.000472 (Match)
+Variant 3       |     1.6332 |        1.6332 |       463.18 | 0.000472 (Match)

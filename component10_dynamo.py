@@ -45,11 +45,12 @@ def to_true_dps(mlir_text: str) -> str:
     new_args = args + f", {out_arg}: {ret_type}"
     mlir_text = mlir_text.replace(f"func.func @main({args})", f"func.func @main({new_args})")
     
-    # Replace internal tensor.empty with the out_arg
+    # Replace internal tensor.empty with the out_arg only if the type matches the return type
     # We use tensor.cast to bridge the argument to the existing SSA name
+    ret_type_escaped = re.escape(ret_type)
     mlir_text = re.sub(
-        r"(%[a-zA-Z0-9_]+) = tensor\.empty\(\) : (tensor<.*?>)", 
-        fr"\1 = tensor.cast {out_arg} : \2 to \2", 
+        r"(%[a-zA-Z0-9_]+) = tensor\.empty\(\) : " + ret_type_escaped, 
+        fr"\1 = tensor.cast {out_arg} : {ret_type} to {ret_type}", 
         mlir_text
     )
     

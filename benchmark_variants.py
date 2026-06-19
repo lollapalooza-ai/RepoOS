@@ -25,6 +25,7 @@ def measure_isolated_execution(dylib_path: str):
     Runs an isolated micro-benchmark inside this specific process.
     Returns (avg_time_ms, cpu_percent, memory_mb, is_correct)
     """
+    torch.set_num_threads(1)
     # 1. Measure initial memory
     process = psutil.Process(os.getpid())
     
@@ -53,19 +54,18 @@ def measure_isolated_execution(dylib_path: str):
     is_correct = bool(torch.allclose(torch.from_numpy(out_arr), torch.tensor(float(MATRIX_SIZE))))
     
     # 5. Benchmark loop (BENCHMARK_ITERATIONS iterations)
-    # Reset CPU counter
-    process.cpu_percent()
-    
     start = time.perf_counter()
+    start_cpu = time.process_time()
     for _ in range(BENCHMARK_ITERATIONS):
         k_func(*args)
     end = time.perf_counter()
+    end_cpu = time.process_time()
     
     avg_time_ms = ((end - start) / float(BENCHMARK_ITERATIONS)) * 1000.0
-    cpu_usage = process.cpu_percent()
+    avg_cpu_time_ms = ((end_cpu - start_cpu) / float(BENCHMARK_ITERATIONS)) * 1000.0
     mem_mb = process.memory_info().rss / (1024 * 1024)
     
-    return avg_time_ms, cpu_usage, mem_mb, float(out_arr[0,0]), is_correct
+    return avg_time_ms, avg_cpu_time_ms, mem_mb, float(out_arr[0,0]), is_correct
 
 async def compile_variants():
     """Generates and compiles all variants ahead-of-time."""
@@ -126,12 +126,17 @@ if __name__ == "__main__":
         print(f"🏎️  {os.path.basename(path)}")
     
     print("\n\n--- [Isolated Benchmarking Phase] ---")
-    print(f"{'Variant Name':<15} | {'Speed (ms)':<10} | {'CPU (%)':<10} | {'Memory (MB)':<12} | {f'Output (Expected: {float(MATRIX_SIZE)})'}")
-    print("-" * 80)
+    print(f"{'Variant Name':<15} | {'Speed (ms)':<10} | {'CPU Time (ms)':<13} | {'Memory (MB)':<12} | {f'Output (Expected: {float(MATRIX_SIZE)})'}")
+    print("-" * 85)
     
     for name, path in dylibs:
         # Spawn a fresh process for each library to prevent memory/state bleeding
         env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = "1"
+        env["MKL_NUM_THREADS"] = "1"
+        env["OPENBLAS_NUM_THREADS"] = "1"
+        env["VECLIB_MAXIMUM_THREADS"] = "1"
+        env["NUMEXPR_NUM_THREADS"] = "1"
         # Ensure PYTHONPATH includes torch_mlir
         cmd = [sys.executable, __file__, "--measure", path]
         res = subprocess.run(cmd, capture_output=True, text=True, env=env)
@@ -140,7 +145,7 @@ if __name__ == "__main__":
             avg_time, cpu, mem, val, is_correct = res.stdout.strip().split(",")
             is_correct_bool = is_correct.strip() == "True"
             result_str = f"{float(val):.1f} (Match)" if is_correct_bool else f"{float(val):.1f} (Mismatch)"
-            print(f"{name:<15} | {float(avg_time):10.4f} | {float(cpu):10.2f} | {float(mem):12.2f} | {result_str}")
+            print(f"{name:<15} | {float(avg_time):10.4f} | {float(cpu):13.4f} | {float(mem):12.2f} | {result_str}")
         else:
             print(f"{name:<15} | {'CRASHED':<10} | {'-':<10} | {'-':<12} | False")
             print(f"  -> Error: {res.stderr.strip()}")
