@@ -6,16 +6,16 @@
 
 ================================================================================
 DEBUG: AI ORACLE INTERACTION [PYTHON_SCHEDULE_GENERATION]
-LOG FILE: oracle_logs/python_schedule_generation_1781805594530.log
+LOG FILE: oracle_logs/python_schedule_generation_1781811014903.log
 ================================================================================
 
 >>> FULL PROMPT SENT TO GEMINI:
 ...
 <<< FULL RESPONSE FROM GEMINI:
 [
-  "def apply_schedule(schedule):\n    matmul_op = schedule.match(\"linalg.matmul\")\n    tiled_matmul = schedule.tile(matmul_op, tile_sizes=[8, 8, 8])\n    schedule.vectorize(tiled_matmul)",
-  "def apply_schedule(schedule):\n    matmul_op = schedule.match(\"linalg.matmul\")\n    tiled_matmul = schedule.tile(matmul_op, tile_sizes=[64, 64, 64])\n    schedule.vectorize(tiled_matmul)",
-  "def apply_schedule(schedule):\n    matmul_op = schedule.match(\"linalg.matmul\")\n    tiled_matmul = schedule.tile(matmul_op, tile_sizes=[4, 8, 4])\n    schedule.vectorize(tiled_matmul)"
+  "def apply_schedule(schedule):\n    # 1. L1 Cache Optimized: Aggressive tiling for L1 data cache residency.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Tile into small 16x16x16 blocks. The working set for these tiles\n    # fits comfortably within a typical 32KB-64KB L1 data cache.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[16, 16, 16])\n    \n    # Vectorize the innermost loop of the tiled, cache-resident operation.\n    schedule.vectorize(tiled_inner_matmul)",
+  "def apply_schedule(schedule):\n    # 2. L2 Cache Optimized: Moderate tiling to fit in L2 and enable continuous memory scans.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Use larger tile sizes like 128x128x64. This working set fits well in\n    # modern L2 caches (e.g., 1-2MB), improving locality for larger data chunks.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[128, 128, 64])\n    \n    # Vectorize the inner loops to leverage SIMD on the L2-cache-resident data.\n    schedule.vectorize(tiled_inner_matmul)",
+  "def apply_schedule(schedule):\n    # 3. SIMD-Optimized: Tile inner loops to match vector register width.\n    matmul_op = schedule.match(\"linalg.matmul\")\n    \n    # Tile the 'N' dimension to 8, matching the number of f32 elements in a 256-bit\n    # AVX register. Small tile sizes for 'M' and 'K' create a compact micro-kernel.\n    tiled_inner_matmul = schedule.tile(matmul_op, tile_sizes=[6, 8, 16])\n    \n    # Vectorize the resulting inner loop, which is now perfectly sized for SIMD execution.\n    schedule.vectorize(tiled_inner_matmul)"
 ]
 ================================================================================
 
@@ -39,7 +39,7 @@ warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverrid
 [Compiler] ✅ Native library generated: ./.poly_cache/bench_v1.so
 
 3. Compiling Variant 2...
-[Compiler Debug] Vectorization requested with large tile sizes [64, 64, 64]. Capping to [16, 16, 16] to prevent compilation hang.
+[Compiler Debug] Vectorization requested with large tile sizes [128, 128, 64]. Capping to [16, 16, 16] to prevent compilation hang.
 [Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...
 [Compiler] Stage 2: Applying AI Transform Schedule (Attempt 1)...
 [Compiler] ✅ AI Transform Successful.
@@ -61,9 +61,9 @@ warning: overriding the module target triple with x86_64-pc-linux-gnu [-Woverrid
 
 
 --- [Isolated Benchmarking Phase] ---
-Variant Name    | Speed (ms) | CPU (%)    | Memory (MB)  | Valid
------------------------------------------------------------------
-Baseline        |   104.8930 |     100.10 |       379.66 | True
-Variant 1       |    48.6480 |     100.30 |       379.69 | True
-Variant 2       |    55.6432 |     100.10 |       379.78 | True
-Variant 3       |    49.8879 |     100.20 |       379.71 | True
+Variant Name    | Speed (ms) | CPU (%)    | Memory (MB)  | Output[0,0] (Expected: 2048.0)
+--------------------------------------------------------------------------------
+Baseline        | 38840.7141 |     100.00 |       450.83 | 2048.0 (Match)
+Variant 1       |  3835.4770 |     100.00 |       450.96 | 2048.0 (Match)
+Variant 2       |  3877.3139 |     100.00 |       450.78 | 2048.0 (Match)
+Variant 3       |  6156.0194 |     100.00 |       450.68 | 2048.0 (Match)

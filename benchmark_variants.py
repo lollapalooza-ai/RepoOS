@@ -11,6 +11,10 @@ from component2_smt import generate_inference_transforms
 from component9_aot import apply_ai_transform_and_compile
 from component10_dynamo import to_true_dps, CACHE_DIR
 
+# Enterprise AI workload parameters
+MATRIX_SIZE = 512
+BENCHMARK_ITERATIONS = 10
+
 # We use the same simple workload
 class FastModel(torch.nn.Module):
     def forward(self, a, b):
@@ -25,8 +29,8 @@ def measure_isolated_execution(dylib_path: str):
     process = psutil.Process(os.getpid())
     
     # 2. Setup inputs
-    a = torch.ones((512, 512), dtype=torch.float32)
-    b = torch.ones((512, 512), dtype=torch.float32)
+    a = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
+    b = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
     out = torch.zeros_like(a)
     
     a_arr = a.detach().cpu().numpy()
@@ -46,29 +50,29 @@ def measure_isolated_execution(dylib_path: str):
     
     # 4. Warmup & Correctness Check
     k_func(*args)
-    is_correct = bool(torch.allclose(torch.from_numpy(out_arr), torch.tensor(512.0)))
+    is_correct = bool(torch.allclose(torch.from_numpy(out_arr), torch.tensor(float(MATRIX_SIZE))))
     
-    # 5. Benchmark loop (100 iterations)
+    # 5. Benchmark loop (BENCHMARK_ITERATIONS iterations)
     # Reset CPU counter
     process.cpu_percent()
     
     start = time.perf_counter()
-    for _ in range(100):
+    for _ in range(BENCHMARK_ITERATIONS):
         k_func(*args)
     end = time.perf_counter()
     
-    avg_time_ms = ((end - start) / 100.0) * 1000.0
+    avg_time_ms = ((end - start) / float(BENCHMARK_ITERATIONS)) * 1000.0
     cpu_usage = process.cpu_percent()
     mem_mb = process.memory_info().rss / (1024 * 1024)
     
-    return avg_time_ms, cpu_usage, mem_mb, is_correct
+    return avg_time_ms, cpu_usage, mem_mb, float(out_arr[0,0]), is_correct
 
 async def compile_variants():
     """Generates and compiles all variants ahead-of-time."""
     print("--- [AOT Compilation Phase] ---")
     model = FastModel()
-    a = torch.ones((512, 512), dtype=torch.float32)
-    b = torch.ones((512, 512), dtype=torch.float32)
+    a = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
+    b = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
     
     from torch_mlir.fx import export_and_import
     gm = torch.fx.symbolic_trace(model)
@@ -109,17 +113,21 @@ if __name__ == "__main__":
     # If called as a subprocess to measure a specific library
     if len(sys.argv) == 3 and sys.argv[1] == "--measure":
         dylib_path = sys.argv[2]
-        avg_time, cpu, mem, is_correct = measure_isolated_execution(dylib_path)
-        print(f"{avg_time},{cpu},{mem},{is_correct}")
+        avg_time, cpu, mem, val, is_correct = measure_isolated_execution(dylib_path)
+        print(f"{avg_time},{cpu},{mem},{val},{is_correct}")
         sys.exit(0)
         
     # Main orchestrator
     print("🚀 Starting Isolated Benchmarking Suite...")
     dylibs = asyncio.run(compile_variants())
     
+    print(f"\n[Dynamo] 🏁 Racing {len(dylibs)} compiled kernels to find the Speed of Light (SoL)...")
+    for name, path in dylibs:
+        print(f"🏎️  {os.path.basename(path)}")
+    
     print("\n\n--- [Isolated Benchmarking Phase] ---")
-    print(f"{'Variant Name':<15} | {'Speed (ms)':<10} | {'CPU (%)':<10} | {'Memory (MB)':<12} | {'Valid'}")
-    print("-" * 65)
+    print(f"{'Variant Name':<15} | {'Speed (ms)':<10} | {'CPU (%)':<10} | {'Memory (MB)':<12} | {f'Output (Expected: {float(MATRIX_SIZE)})'}")
+    print("-" * 80)
     
     for name, path in dylibs:
         # Spawn a fresh process for each library to prevent memory/state bleeding
@@ -129,8 +137,10 @@ if __name__ == "__main__":
         res = subprocess.run(cmd, capture_output=True, text=True, env=env)
         
         if res.returncode == 0:
-            avg_time, cpu, mem, is_correct = res.stdout.strip().split(",")
-            print(f"{name:<15} | {float(avg_time):10.4f} | {float(cpu):10.2f} | {float(mem):12.2f} | {is_correct}")
+            avg_time, cpu, mem, val, is_correct = res.stdout.strip().split(",")
+            is_correct_bool = is_correct.strip() == "True"
+            result_str = f"{float(val):.1f} (Match)" if is_correct_bool else f"{float(val):.1f} (Mismatch)"
+            print(f"{name:<15} | {float(avg_time):10.4f} | {float(cpu):10.2f} | {float(mem):12.2f} | {result_str}")
         else:
             print(f"{name:<15} | {'CRASHED':<10} | {'-':<10} | {'-':<12} | False")
             print(f"  -> Error: {res.stderr.strip()}")
