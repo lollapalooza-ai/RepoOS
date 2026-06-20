@@ -103,6 +103,44 @@ def get_arg_info(func_code):
     except:
         return 0, {}, {}
 
+def extract_domain_variables(func_code):
+    """
+    Extracts domain-specific variables like accumulators and dictionary keys.
+    """
+    try:
+        tree = ast.parse(func_code)
+        domain_vars = {"bools": set(), "floats": set()}
+        
+        for node in ast.walk(tree):
+            # Heuristic 1: If it's used in an if condition, it's a bool
+            if isinstance(node, ast.If):
+                for subnode in ast.walk(node.test):
+                    if isinstance(subnode, ast.Subscript) and isinstance(subnode.slice, ast.Constant) and isinstance(subnode.slice.value, str):
+                        domain_vars["bools"].add(subnode.slice.value)
+            
+            # Heuristic 2: If it's used in a math operation (like +=), it's a float/int
+            if isinstance(node, ast.AugAssign):
+                for subnode in ast.walk(node.value):
+                    if isinstance(subnode, ast.Subscript) and isinstance(subnode.slice, ast.Constant) and isinstance(subnode.slice.value, str):
+                        domain_vars["floats"].add(subnode.slice.value)
+
+            # Heuristic 3: Explicit initialization (e.g. total_revenue = 0.0)
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        if isinstance(node.value, ast.Constant):
+                            if isinstance(node.value.value, float):
+                                domain_vars["floats"].add(target.id)
+                            elif isinstance(node.value.value, bool):
+                                domain_vars["bools"].add(target.id)
+        
+        return {
+            "bools": list(domain_vars["bools"]),
+            "floats": list(domain_vars["floats"])
+        }
+    except:
+        return {"bools": [], "floats": []}
+
 def normalize_fqn(module_path: str, func_name: str) -> str:
     """
     Surgically generates clean FQNs by stripping machine-specific paths.
@@ -193,10 +231,16 @@ def process_file(file_path, forced_module_name=None):
                             arg_count, hints, enum_map = get_arg_info(method_body)
                             track = determine_execution_track(method_body)
                             arg_names = [a.split('=')[0].strip() for a in method_params.strip("() ").split(',') if a.strip()]
+                            domain_vars = extract_domain_variables(method_body)
 
                             session.run("""
                                 MATCH (c:Class {fqn: $class_fqn})
                                 MERGE (f:Function {fqn: $fqn})
+                                ON CREATE SET f.optimized_dylib_path = "", f.needs_recompile = true, f.base_mlir_path = "", f.ai_transform_script_path = ""
+                                ON MATCH SET f.needs_recompile = CASE WHEN f.code <> $code THEN true ELSE f.needs_recompile END,
+                                             f.optimized_dylib_path = CASE WHEN f.code <> $code THEN "" ELSE f.optimized_dylib_path END,
+                                             f.base_mlir_path = CASE WHEN f.code <> $code THEN "" ELSE f.base_mlir_path END,
+                                             f.ai_transform_script_path = CASE WHEN f.code <> $code THEN "" ELSE f.ai_transform_script_path END
                                 SET f.name = $name, 
                                     f.code = $code, 
                                     f.arg_count = $arg_count, 
@@ -204,12 +248,9 @@ def process_file(file_path, forced_module_name=None):
                                     f.enum_map = $enums, 
                                     f.signature = $sig,
                                     f.execution_track = $track,
-                                    f.base_mlir_path = "",
-                                    f.ai_transform_script_path = "",
-                                    f.optimized_dylib_path = "",
-                                    f.needs_recompile = true
+                                    f.domain_vars = $domain_vars
                                 MERGE (c)-[:HAS_METHOD]->(f)
-                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map), sig=json.dumps(arg_names), track=track)
+                            """, class_fqn=class_fqn, fqn=method_fqn, name=method_name, code=method_body, arg_count=arg_count, hints=json.dumps(hints), enums=json.dumps(enum_map), sig=json.dumps(arg_names), track=track, domain_vars=json.dumps(domain_vars))
                     elif child.type == "block":
                         find_methods(child)
             find_methods(class_info["node"])
@@ -236,23 +277,26 @@ def process_file(file_path, forced_module_name=None):
             arg_names = [a.split('=')[0].strip() for a in f_params.strip("() ").split(',') if a.strip()]
             arg_count, hints, _ = get_arg_info(f_code)
             track = determine_execution_track(f_code)
+            domain_vars = extract_domain_variables(f_code)
             # USE NORMALIZED FQN
             fqn = normalize_fqn(file_path, f_name)
             
             session.run("""
                 MATCH (m:Module {name: $module})
                 MERGE (f:Function {fqn: $fqn})
+                ON CREATE SET f.optimized_dylib_path = "", f.needs_recompile = true, f.base_mlir_path = "", f.ai_transform_script_path = ""
+                ON MATCH SET f.needs_recompile = CASE WHEN f.code <> $code THEN true ELSE f.needs_recompile END,
+                             f.optimized_dylib_path = CASE WHEN f.code <> $code THEN "" ELSE f.optimized_dylib_path END,
+                             f.base_mlir_path = CASE WHEN f.code <> $code THEN "" ELSE f.base_mlir_path END,
+                             f.ai_transform_script_path = CASE WHEN f.code <> $code THEN "" ELSE f.ai_transform_script_path END
                 SET f.name = $name, 
                     f.code = $code, 
                     f.arg_count = $count, 
                     f.signature = $sig,
                     f.execution_track = $track,
-                    f.base_mlir_path = "",
-                    f.ai_transform_script_path = "",
-                    f.optimized_dylib_path = "",
-                    f.needs_recompile = true
+                    f.domain_vars = $domain_vars
                 MERGE (m)-[:CONTAINS]->(f)
-            """, module=module_name, fqn=fqn, name=f_name, code=f_code, count=arg_count, sig=json.dumps(arg_names), track=track)
+            """, module=module_name, fqn=fqn, name=f_name, code=f_code, count=arg_count, sig=json.dumps(arg_names), track=track, domain_vars=json.dumps(domain_vars))
 
     print(f"✅ Ingested: {file_path}")
 

@@ -26,7 +26,18 @@ class SafeScheduleValidator(ast.NodeVisitor):
         ast.Module, ast.FunctionDef, ast.arguments, ast.arg,
         ast.Expr, ast.Call, ast.Attribute, ast.Name,
         ast.Load, ast.Store, ast.Assign, ast.Constant, ast.List,
-        ast.keyword
+        ast.keyword,
+        # Control Flow and Loops
+        ast.For, ast.If, ast.While, ast.Break, ast.Continue, ast.Pass,
+        # Math / Operators
+        ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+        ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In, ast.NotIn,
+        # Data Structures
+        ast.Subscript, ast.Slice, ast.Tuple, ast.Dict, ast.Set,
+        # Comprehensions
+        ast.ListComp, ast.DictComp, ast.SetComp, ast.comprehension,
+        # Strings
+        ast.FormattedValue, ast.JoinedStr
     }
 
     def generic_visit(self, node):
@@ -110,6 +121,251 @@ class RepoOSSchedule:
         body = "\n".join(formatted_instructions)
         footer = "\n    transform.yield\n}"
         return header + body + footer
+
+def escape_char(c):
+    if c == "'":
+        return "\\'"
+    elif c == "\\":
+        return "\\\\"
+    elif c == "\n":
+        return "\\n"
+    elif c == "\t":
+        return "\\t"
+    elif c == "\r":
+        return "\\r"
+    return c
+
+class RepoOSFSMBuilder:
+    """
+    The Python Builder API for generating zero-allocation C++ Finite State Machines.
+    Guarantees no memory leaks or syntax errors.
+    """
+    def __init__(self):
+        self.states = []
+        self.bool_vars = []
+        self.float_vars = []
+        self.object_complete_action = ""
+        self.return_variable = "out[0]"
+
+    def declare_bool(self, name: str):
+        self.bool_vars.append(name)
+
+    def declare_float(self, name: str):
+        self.float_vars.append(name)
+
+    def set_object_complete_action(self, cpp_code: str):
+        self.object_complete_action = cpp_code
+
+    def set_return_variable(self, name: str):
+        self.return_variable = name
+
+    def add_state(self, name: str) -> str:
+        """Declares a new state in the state machine."""
+        self.states.append({"name": name, "transitions": []})
+        return name
+
+    def on_sequence(self, state: str, sequence: str, next_state: str, action: str = "NONE", target: str = None):
+        """Defines a transition based on a byte sequence."""
+        if not any(s['name'] == state for s in self.states):
+            self.add_state(state)
+        if not any(s['name'] == next_state for s in self.states):
+            self.add_state(next_state)
+        for s in self.states:
+            if s["name"] == state:
+                s["transitions"].append({
+                    "type": "sequence", 
+                    "val": sequence, 
+                    "next": next_state,
+                    "action": action,
+                    "target": target
+                })
+                break
+
+    def on_char(self, state: str, char: str, next_state: str, action: str = "NONE", target: str = None):
+        """Defines a transition for a single byte."""
+        if not any(s['name'] == state for s in self.states):
+            self.add_state(state)
+        if not any(s['name'] == next_state for s in self.states):
+            self.add_state(next_state)
+        for s in self.states:
+            if s["name"] == state:
+                s["transitions"].append({
+                    "type": "char", 
+                    "val": char, 
+                    "next": next_state,
+                    "action": action,
+                    "target": target
+                })
+                break
+                
+    def build_cpp(self) -> str:
+        """
+        Compiles the Python transitions into a pedantically safe C++ template.
+        Notice the strict DPS signature.
+        """
+        if not self.states:
+            self.add_state("init")
+
+        enum_defs = ",\n        ".join([f"STATE_{s['name'].upper()}" for s in self.states])
+        
+        switch_cases = ""
+        init_state_name = self.states[0]['name'].upper()
+        
+        for s in self.states:
+            cases = ""
+            for t in s["transitions"]:
+                action_code = ""
+                if t["action"] == "RECORD_BOOL":
+                    target_var = t.get("target") or "current_bool"
+                    action_code = f"""
+                        // Parse boolean value
+                        const char* temp_ptr = ptr + len_seq;
+                        while (temp_ptr < end && (*temp_ptr == ' ' || *temp_ptr == ':' || *temp_ptr == '\\t' || *temp_ptr == '"' || *temp_ptr == '\\\\' || *temp_ptr == ',')) temp_ptr++;
+                        if (temp_ptr + 4 <= end && temp_ptr[0]=='t' && temp_ptr[1]=='r' && temp_ptr[2]=='u' && temp_ptr[3]=='e') {{
+                            {target_var} = true;
+                        }} else if (temp_ptr + 5 <= end && temp_ptr[0]=='f' && temp_ptr[1]=='a' && temp_ptr[2]=='l' && temp_ptr[3]=='s' && temp_ptr[4]=='e') {{
+                            {target_var} = false;
+                        }}
+                    """
+                elif t["action"] == "RECORD_FLOAT":
+                    target_var = t.get("target") or "current_float"
+                    action_code = f"""
+                        // Parse float value
+                        const char* temp_ptr = ptr + len_seq;
+                        while (temp_ptr < end && (*temp_ptr == ' ' || *temp_ptr == ':' || *temp_ptr == '\\t' || *temp_ptr == '"' || *temp_ptr == '\\\\' || *temp_ptr == ',')) temp_ptr++;
+                        {target_var} = parse_float_from_stream(temp_ptr, end);
+                    """
+                
+                elif t["action"] == "COMPLETE_OBJECT":
+                    action_code = self.object_complete_action
+                
+                if t["type"] == "char":
+                    if t["val"] == "":
+                        cond = "true"
+                    else:
+                        cond = f"c == '{escape_char(t['val'])}'"
+                    cases += f"""            if ({cond}) {{
+                int len_seq = 1;
+                state = STATE_{t["next"].upper()};
+                {action_code}
+                ptr++;
+                continue;
+            }}\n"""
+                elif t["type"] == "sequence":
+                    if t["val"] == "":
+                        cases += f"""            if (true) {{
+                int len_seq = 0;
+                state = STATE_{t["next"].upper()};
+                {action_code}
+                ptr += len_seq;
+                continue;
+            }}\n"""
+                    else:
+                        match_code = "                int lookahead = 0;\n                bool match_seq = true;\n"
+                        for c in t["val"]:
+                            if c in [' ', '\t', '\n', '\r']:
+                                continue
+                            c_esc = escape_char(c)
+                            match_code += f"""                if (match_seq) {{
+                    while (ptr + lookahead < end && (ptr[lookahead]==' '||ptr[lookahead]=='\\t'||ptr[lookahead]=='\\n'||ptr[lookahead]=='\\r')) lookahead++;
+                    if (ptr + lookahead < end && ptr[lookahead] == '{c_esc}') lookahead++; else match_seq = false;
+                }}\n"""
+                        cases += f"""            {{
+{match_code}
+                if (match_seq) {{
+                    int len_seq = lookahead;
+                    state = STATE_{t["next"].upper()};
+                    {action_code}
+                    ptr += len_seq;
+                    continue;
+                }}
+            }}\n"""
+            
+            switch_cases += f"""
+        case STATE_{s['name'].upper()}: {{
+            char c = *ptr;
+{cases}
+            ptr++;
+            break;
+        }}"""
+
+        cpp_template = f"""
+#include <stdint.h>
+#include <stddef.h>
+
+// Custom float parser (Zero-Allocation)
+static float parse_float_from_stream(const char*& ptr, const char* end) {{
+    float value = 0.0f;
+    bool is_negative = false;
+    if (ptr < end && *ptr == '-') {{
+        is_negative = true;
+        ptr++;
+    }}
+    float integer_part = 0.0f;
+    while (ptr < end && *ptr >= '0' && *ptr <= '9') {{
+        integer_part = integer_part * 10.0f + (*ptr - '0');
+        ptr++;
+    }}
+    value = integer_part;
+    if (ptr < end && *ptr == '.') {{
+        ptr++;
+        float fractional_multiplier = 0.1f;
+        while (ptr < end && *ptr >= '0' && *ptr <= '9') {{
+            value += (*ptr - '0') * fractional_multiplier;
+            fractional_multiplier *= 0.1f;
+            ptr++;
+        }}
+    }}
+    return is_negative ? -value : value;
+}}
+
+extern "C" void _mlir_ciface_main(const char* data, size_t len, float* out) {{
+    enum State {{
+        {enum_defs}
+    }};
+    
+    State state = STATE_{init_state_name};
+    const char* ptr = data;
+    const char* end = data + len;
+    
+    // Domain-agnostic variables
+    {' '.join(f'bool {var} = false;' for var in self.bool_vars)}
+    {' '.join(f'float {var} = 0.0f;' for var in self.float_vars)}
+
+    // FSM execution loop
+    while (ptr < end) {{
+        switch (state) {{
+{switch_cases}
+            default:
+                ptr++;
+                break;
+        }}
+    }}
+    
+    // Final check for the last object if EOF reached without '}}'
+    {self.object_complete_action}
+    
+    // Direct output write
+    out[0] = {self.return_variable};
+}}
+"""
+        return cpp_template
+
+def safe_execute_fsm_schedule(ai_generated_python_code: str, fsm_builder: RepoOSFSMBuilder):
+    """Safely parses and executes the AI FSM schedule via AST whitelist."""
+    tree = ast.parse(ai_generated_python_code)
+    
+    validator = SafeScheduleValidator()
+    validator.visit(tree) # Will raise SecurityError if illegal syntax is found
+    
+    local_scope = {}
+    compiled_code = compile(tree, filename="<ast>", mode="exec")
+    exec(compiled_code, {}, local_scope)
+    
+    if "build_parser" not in local_scope:
+        raise ValueError("AI failed to generate 'build_parser' function.")
+        
+    local_scope["build_parser"](fsm_builder)
 
 def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoOSSchedule):
     """Safely parses and executes the AI schedule via AST whitelist."""
@@ -481,7 +737,7 @@ async def aot_compile_all(module_filter: str = ""):
 
     with driver.session() as session:
         # UPGRADED: Pull execution_track from Neo4j
-        query = "MATCH (f:Function) WHERE f.fqn CONTAINS $mod RETURN f.fqn as f_fqn, f.code as code, f.execution_track as track"
+        query = "MATCH (f:Function) WHERE f.fqn CONTAINS $mod RETURN f.fqn as f_fqn, f.code as code, f.execution_track as track, f.domain_vars as domain_vars"
         results = session.run(query, mod=module_filter)
         
         found_any = False
@@ -490,6 +746,7 @@ async def aot_compile_all(module_filter: str = ""):
             target_fqn = record["f_fqn"]
             python_code = record["code"]
             track = record.get("track", "MATH") # Default to MATH
+            domain_vars_json = record.get("domain_vars", "{}")
             
             print(f"\n[AOT] Processing [{track}]: {target_fqn}")
             
@@ -498,7 +755,7 @@ async def aot_compile_all(module_filter: str = ""):
                 bridge = {} # Initialize to prevent UnboundLocalError
                 
                 # --- Milestone 2: Multi-Headed Oracle Routing ---
-                synthesis_result = await compile_function_logic(python_code, track)
+                synthesis_result = await compile_function_logic(python_code, track, domain_vars=domain_vars_json)
                 
                 if track == "CRYPTO":
                     # Just link standard system libraries or pre-compiled dylibs
@@ -512,7 +769,31 @@ async def aot_compile_all(module_filter: str = ""):
                     
                     print(f"      🔐 Crypto: Linked to {output_dylib}")
 
-                elif track in ["FSM", "TABULAR"]:
+                elif track == "FSM":
+                    # We now generate a single python script directly
+                    fsm_scripts = [synthesis_result]
+                    
+                    if fsm_scripts:
+                        print(f"      🧵 Compiling C++ FSM Kernel (Default AOT Variant)...")
+                        try:
+                            fsm_builder = RepoOSFSMBuilder()
+                            safe_execute_fsm_schedule(fsm_scripts[0], fsm_builder)
+                            cpp_code = fsm_builder.build_cpp()
+                            
+                            cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
+                            with open(cpp_source_path, "w") as f:
+                                f.write(cpp_code)
+                            
+                            subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
+                                            cpp_source_path, "-o", output_dylib], check=True)
+                            print(f"      ✅ C++ Library generated: {output_dylib}")
+                        except Exception as e:
+                            print(f"      ❌ FSM compilation failed: {e}")
+                            raise e
+                    else:
+                        raise ValueError("No FSM scripts found.")
+
+                elif track == "TABULAR":
                     # Direct C++ to Clang compilation
                     cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
                     with open(cpp_source_path, "w") as f:

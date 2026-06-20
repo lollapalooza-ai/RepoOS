@@ -93,6 +93,10 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                 out_buffer = (ctypes.c_float * 10)() # Pre-allocate output buffer
                 print(f"      [Orchestrator]🧵 Executing C++ FSM Kernel...")
                 kernel(byte_ptr, ctypes.c_size_t(length), out_buffer)
+                
+                sig = inspect.signature(original_func)
+                if sig.return_annotation in (float, 'float'):
+                    return float(out_buffer[0])
                 return list(out_buffer)
                 
             elif track == "TABULAR":

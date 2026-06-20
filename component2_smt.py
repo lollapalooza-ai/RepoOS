@@ -40,35 +40,94 @@ def log_oracle_interaction(stage: str, prompt: str, response: str):
     print(f"\n<<< FULL RESPONSE FROM GEMINI:\n{response}")
     print("="*80 + "\n")
 
-async def generate_cpp_fsm(python_code: str) -> str:
+async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}") -> str:
     """
-    Generates a high-performance C++ Finite State Machine or Byte Parser.
+    The FSM Optimization Oracle.
+    Prompts the AI to generate specialized byte-parsing schedules using the DSL.
     """
     prompt = f"""
-    Translate this Python string/byte manipulation logic into a high-performance C++ Finite State Machine or byte parser.
-    Use switch statements, character-by-character scanning, and direct pointer manipulation for speed.
+    You are an elite Systems Engineer building a high-performance C++ byte parser.
     
-    RULES:
-    1. Signature MUST be: `extern "C" void _mlir_ciface_main(const char* data, size_t len, float* out)`.
-    2. Use `extern "C"` to prevent name mangling.
-    3. No external dependencies (no std::string, no std::vector). Use raw pointers.
-    4. Write the results directly into the `out` buffer.
-    
-    PYTHON LOGIC:
+    PYTHON LOGIC TO REPLICATE:
     {python_code}
+    
+    DOMAIN VARIABLES EXTRACTED BY INGESTER:
+    {domain_vars}
+    
+    TASK:
+    You must generate exactly 3 DIFFERENT parsing strategies using the `RepoOSFSMBuilder`:
+    1. Eager Scanning (Aggressively check for specific character sequences).
+    2. Lazy Tokenization (Focus on structural boundaries like brackets).
+    3. Balanced (A mix of character and sequence matching).
+
+    CRITICAL API CONSTRAINTS:
+    You are FORBIDDEN from writing raw C++. You must output a pure Python function named `build_parser(fsm)` using ONLY these API options:
+    - `fsm.declare_bool(name: str)`
+    - `fsm.declare_float(name: str)`
+    - `fsm.add_state(name: str) -> str`
+    - `fsm.on_char(state: str, char: str, next_state: str, action: str = "NONE", target: str = None)`
+    - `fsm.on_sequence(state: str, sequence: str, next_state: str, action: str = "NONE", target: str = None)`
+    - `fsm.set_object_complete_action(cpp_code: str)`
+    - `fsm.set_return_variable(name: str)`
+    
+    ACTION TYPES:
+    - "RECORD_BOOL": Parses a boolean after a sequence and stores it in `target`.
+    - "RECORD_FLOAT": Parses a float after a sequence and stores it in `target`.
+    - "COMPLETE_OBJECT": Executes the C++ code defined in `set_object_complete_action`. You MUST use this on the transition that marks the end of the top-level object (e.g., when transitioning on '}}' to return to the array).
+
+    IMPORTANT CONSTRAINTS:
+    - Keep the strategy simple, but DO NOT use a flat Eager scanning strategy! The JSON objects may contain nested structures (which you must infer from the provided Python code). If you stay in a single state, the inner `}}` will prematurely trigger the end of the root object!
+    - You MUST create separate states for entering and exiting any necessary nested objects so you can safely transition back to the main state on `}}` without triggering `COMPLETE_OBJECT`.
+    - Only trigger `action="COMPLETE_OBJECT"` on the `}}` that closes the outermost top-level object being aggregated.
+    - DO NOT invent methods like `get_state`.
+    - ALL states MUST be explicitly created using `fsm.add_state(name)`. Do not transition to undefined states.
+    - Use `on_sequence` directly to match keys (e.g. `'"my_key"'`).
+    - CRITICAL: When using `RECORD_BOOL` or `RECORD_FLOAT`, you MUST attach the action DIRECTLY to the `on_sequence` transition that matches the key. DO NOT create intermediate states to wait for the value characters (e.g. do not wait for 't' or 'f' to trigger `RECORD_BOOL`). The C++ engine handles value parsing automatically.
+
+    FEW-SHOT EXAMPLE:
+    def build_parser(fsm):
+        fsm.declare_bool("is_vip")
+        fsm.declare_float("total_value")
+        fsm.declare_float("total_revenue")
+        fsm.set_return_variable("total_revenue")
+        
+        init = fsm.add_state("init")
+        in_obj = fsm.add_state("in_object")
+        
+        fsm.on_char(init, "{{", in_obj)
+        fsm.on_sequence(in_obj, '"is_vip"', "extract_vip", action="RECORD_BOOL", target="is_vip")
+        fsm.on_sequence(in_obj, '"total_value"', "extract_val", action="RECORD_FLOAT", target="total_value")
+        
+        # When the top-level object ends, trigger the action
+        fsm.on_char(in_obj, "}}", init, action="COMPLETE_OBJECT")
+        
+        fsm.set_object_complete_action(\"""
+        if (is_vip) {{
+            total_revenue += total_value;
+        }}
+        is_vip = false;
+        total_value = 0.0f;
+        \""")
+
+    OUTPUT FORMAT:
+    You MUST output a single raw Python block enclosed in ```python ... ``` containing the `build_parser(fsm)` function. Do NOT output a JSON array. DO NOT output multiple strategies. Choose the BEST strategy and output it.
     """
     try:
-        response = await client.aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         res_text = response.text
-        log_oracle_interaction("fsm_synthesis", prompt, res_text)
-        match = re.search(r"```cpp\n(.*?)\n```", res_text, re.DOTALL)
-        if match: return match.group(1)
+        log_oracle_interaction("fsm_transform_synthesis", prompt, res_text)
+        match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
+        if match:
+            return match.group(1)
         return res_text
     except Exception as e:
-        print(f"[Oracle] Failed to generate FSM: {e}")
-        return ""
+        print(f"[Oracle] Failed to generate FSM transforms: {e}")
+        return "[]"
 
-async def compile_function_logic(python_code: str, execution_track: str):
+async def compile_function_logic(python_code: str, execution_track: str, domain_vars: str = "{}"):
     """The Call 1 Poly-Kernel Router"""
     
     if execution_track == "MATH":
@@ -76,8 +135,8 @@ async def compile_function_logic(python_code: str, execution_track: str):
         return await generate_traceable_wrapper(python_code)
         
     elif execution_track == "FSM":
-        print("[Oracle] 🧵 FSM Track: Generating C++ Byte Parser...")
-        return await generate_cpp_fsm(python_code)
+        print("[Oracle] 🧵 FSM Track: Generating Structured FSM Builder Schedules...")
+        return await generate_fsm_transforms(python_code, domain_vars)
         
     elif execution_track == "TABULAR":
         print("[Oracle] 🗄️ Tabular Track: Generating C++ x86_64 Linux Engine...")

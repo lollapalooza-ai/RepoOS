@@ -23,14 +23,15 @@ def generate_payload(num_orders: int = 500000):
         orders.append(order)
     return orders
 
-def calculate_vip_revenue(orders: list) -> float:
+def calculate_vip_revenue(orders: bytes) -> float:
     """
-    The Target Logic: Sum the total cart values, but ONLY for VIP users.
-    In CPython, this causes massive dictionary hash lookups and L1 cache misses.
+    Sum the total cart values, but ONLY for VIP users.
+    Accepts raw JSON bytes directly from the network buffer.
     """
+    import json
+    data = json.loads(orders.decode('utf-8'))
     total_revenue = 0.0
-    for order in orders:
-        # 3 Dictionary Lookups per iteration!
+    for order in data:
         if order["user"]["is_vip"]:
             total_revenue += order["cart"]["total_value"]
             
