@@ -9,10 +9,11 @@ import time
 import psutil
 from component2_smt import generate_inference_transforms
 from component9_aot import apply_ai_transform_and_compile
-from component10_dynamo import to_true_dps, CACHE_DIR
+from component10_dynamo import to_true_dps, CACHE_DIR, capture_dynamic_mlir
+from component5_orchestrator import pack_tensor_to_memref
 
 # AI workload parameters
-MATRIX_SIZE = 4096
+MATRIX_SIZE = 1024
 BENCHMARK_ITERATIONS = 3
 
 # We use the same simple workload
@@ -43,11 +44,14 @@ def measure_isolated_execution(dylib_path: str):
     k_func = lib._mlir_ciface_main if hasattr(lib, "_mlir_ciface_main") else lib.main
     k_func.restype = ctypes.c_void_p
     
-    args = [
-        a_arr.ctypes.data_as(ctypes.c_void_p),
-        b_arr.ctypes.data_as(ctypes.c_void_p),
-        out_arr.ctypes.data_as(ctypes.c_void_p)
+    # Keep structs alive so ctypes.byref doesn't pass a dangling pointer
+    structs = [
+        pack_tensor_to_memref(a),
+        pack_tensor_to_memref(b),
+        pack_tensor_to_memref(out)
     ]
+    
+    args = [ctypes.byref(s) for s in structs]
     
     # 4. Warmup & Correctness Check
     k_func(*args)
@@ -96,10 +100,9 @@ async def compile_variants():
     a = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
     b = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
     
-    from torch_mlir.fx import export_and_import
     gm = torch.fx.symbolic_trace(model)
-    base_mlir_module = export_and_import(gm, a, b, output_type="linalg-on-tensors")
-    base_mlir_text = to_true_dps(str(base_mlir_module))
+    base_mlir_module_str = capture_dynamic_mlir(gm, [a, b])
+    base_mlir_text = to_true_dps(base_mlir_module_str)
     
     print("1. Querying AI for 3 Scheduling Variants...")
     scripts = await generate_inference_transforms(base_mlir_text, "x86_64 Linux")

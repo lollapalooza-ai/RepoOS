@@ -193,3 +193,146 @@ Python
     kernel_func = best_kernel_func
 
     # ... The rest of your optimized_forward logic remains exactly the same ...
+
+
+# Milestone 8.2
+ENGINEERING BRIEF: EPOCH 2 - DYNAMIC SHAPE HANDLING
+To: Senior Compiler Engineer
+From: Principal Engineering
+Subject: Upgrading Repo OS for Symbolic Tensor Dimensions (LLM Support)
+
+The Architectural Problem
+Currently, Repo OS hardcodes tensor sizes during the MLIR lowering phase. If Dynamo sees a tensor of shape [4, 128], it compiles a binary hardcoded for exactly 4 batches and 128 sequence length. If the next API request has a sequence length of 129, the execution will either crash with a Segfault or trigger a catastrophic, 10-second recompilation.
+
+To support LLMs (where prompt length changes every request), we must upgrade the system to support Symbolic Shapes (e.g., tensor<?x?xf32>).
+
+This requires three surgical updates across the codebase:
+
+The Tracing Layer: Forcing torch.export to emit symbolic bounds.
+
+The ABI Bridge: Upgrading our ctypes bare-pointer implementation to full N-Dimensional MemRef Descriptors.
+
+The Oracle Prompt: Warning the AI that it is dealing with partial boundary tiles.
+
+Step 1: Upgrading Dynamo (component10_dynamo.py)
+We must intercept the PyTorch graph before it lowers to MLIR and explicitly mark the varying dimensions (usually dimension 0 for Batch Size, and dimension 1 for Sequence Length) as "Dynamic."
+
+Replace the deterministic tracing logic in _repoos_inference_backend_async with this implementation using torch.export.Dim:
+
+Python
+import torch
+from torch.export import Dim
+from torch_mlir.extras.fx_importer import FxImporter
+
+def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list) -> str:
+    """
+    Captures the MLIR graph with strictly symbolic dynamic dimensions.
+    """
+    dynamic_shapes = {}
+    
+    # 1. Define our symbolic variables
+    # We define max bounds to help the compiler optimize memory pre-fetching
+    batch_dim = Dim("batch_size", min=1, max=2048)
+    seq_dim = Dim("seq_length", min=1, max=32768)
+    
+    # 2. Map symbolic variables to the input tensors
+    for i, arg in enumerate(example_inputs):
+        if isinstance(arg, torch.Tensor):
+            # If 2D or greater, assume Batch is dim 0, Seq is dim 1
+            if arg.ndim >= 2:
+                dynamic_shapes[i] = {0: batch_dim, 1: seq_dim}
+            # If 1D, assume it's just a sequence/batch vector
+            elif arg.ndim == 1:
+                dynamic_shapes[i] = {0: batch_dim}
+
+    # 3. Export using PyTorch 2.0+ Dynamic Shapes API
+    exported_program = torch.export.export(
+        gm, 
+        tuple(example_inputs), 
+        dynamic_shapes=dynamic_shapes
+    )
+    
+    # 4. Lower to MLIR Linalg on Tensors
+    # The output will now contain tensor<?x?xf32> instead of hardcoded sizes
+    import torch_mlir
+    mlir_module = torch_mlir.torchscript.compile(
+        exported_program.module(), 
+        example_inputs, 
+        output_type=torch_mlir.torchscript.OutputType.LINALG_ON_TENSORS
+    )
+    return str(mlir_module)
+Step 2: The MemRef ABI Bridge (component5_orchestrator.py)
+Critical Architecture Note: You cannot pass bare pointers (void*) to MLIR when shapes are dynamic. If MLIR doesn't know the shape at compile time, it must receive the shape at runtime.
+
+To do this, we must dynamically generate C-Compatible MemRef structures in Python that describe the tensor's shape, strides, and memory pointers.
+
+Add this dynamic C-Struct generator to the Orchestrator/Runtime bridge:
+
+Python
+import ctypes
+import numpy as np
+
+def make_nd_memref_struct(ndim: int, dtype):
+    """
+    Dynamically creates an MLIR-ABI compliant MemRef descriptor C-Struct 
+    for any tensor dimension at runtime.
+    """
+    c_type = ctypes.c_float # Default, map to dtype in prod
+    
+    class MemRefDescriptor(ctypes.Structure):
+        _fields_ = [
+            ("allocatedPtr", ctypes.POINTER(c_type)),
+            ("alignedPtr", ctypes.POINTER(c_type)),
+            ("offset", ctypes.c_int64),
+            ("sizes", ctypes.c_int64 * ndim),
+            ("strides", ctypes.c_int64 * ndim)
+        ]
+    return MemRefDescriptor
+
+def pack_tensor_to_memref(tensor: torch.Tensor):
+    """
+    Converts a PyTorch tensor into the C-Struct required by dynamic MLIR.
+    """
+    tensor_np = tensor.detach().cpu().numpy()
+    ndim = tensor_np.ndim
+    
+    # Generate the strict C-Struct for this specific rank
+    MemRefStruct = make_nd_memref_struct(ndim, tensor_np.dtype)
+    memref = MemRefStruct()
+    
+    # Fill the pointers
+    ptr = tensor_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    memref.allocatedPtr = ptr
+    memref.alignedPtr = ptr
+    memref.offset = 0
+    
+    # Fill dynamic sizes and strides
+    for i in range(ndim):
+        memref.sizes[i] = tensor_np.shape[i]
+        # NumPy strides are in bytes, MLIR expects elements
+        memref.strides[i] = tensor_np.strides[i] // tensor_np.itemsize
+        
+    return memref
+When executing the kernel using ctypes, you will now pass ctypes.byref(pack_tensor_to_memref(arg)) instead of raw pointers.
+
+Step 3: Upgrading the Oracle Prompt (component2_smt.py)
+Because the tensors now have ? (unknown) sizes, the AI's tiling strategy will result in "partial tiles." If the AI tiles by 32, but the sequence length is 50, the compiler will generate an affine.min bounding box to handle the remaining 18 elements.
+
+Update the AI prompt in generate_inference_transforms to add this critical hardware constraint:
+
+Plaintext
+    CRITICAL DYNAMIC SHAPE CONSTRAINTS:
+    - The baseline MLIR graph contains SYMBOLIC DYNAMIC SHAPES (tensor<?x?xf32>).
+    - When you call `schedule.tile()`, the compiler will automatically generate affine boundary checks (e.g., scf.if or affine.min) to handle uneven loop tails.
+    - DO NOT attempt to mask or pad the data manually. Let the compiler handle the boundary geometry.
+    - Prioritize cache-friendly tile sizes (e.g., 32, 64, 128) that divide cleanly into typical power-of-2 sequence lengths to minimize branch prediction penalties on the CPU.
+Principal Engineer's Final Review
+If your engineer implements these three blocks:
+
+PyTorch will gracefully export symbolic math (?).
+
+The MLIR compiler will compile the logic using algebraic bounds rather than fixed integers.
+
+The Python Orchestrator will inject the exact mathematical sizes into the .so kernel at the exact millisecond of execution via the MemRef struct.
+
+You will now be able to compile the nanoGPT Self-Attention block once, and feed it a prompt of 5 words, followed by a prompt of 500 words, and the same underlying bare-metal kernel will execute perfectly without recompiling.

@@ -1,30 +1,38 @@
-#map = affine_map<(d0) -> (d0 * 8)>
-#map1 = affine_map<(d0, d1, d2) -> (d0, d2)>
-#map2 = affine_map<(d0, d1, d2) -> (d2, d1)>
-#map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
+#map = affine_map<()[s0] -> (s0 ceildiv 8)>
+#map1 = affine_map<()[s0] -> (s0 ceildiv 16)>
+#map2 = affine_map<(d0) -> (d0 * 8)>
+#map3 = affine_map<(d0) -> (d0 * 16)>
+#map4 = affine_map<(d0)[s0] -> (-d0 + s0, 8)>
+#map5 = affine_map<(d0)[s0] -> (-d0 + s0, 16)>
 module attributes {transform.with_named_sequence} {
-  func.func @main(%arg0: memref<4096x4096xf32>, %arg1: memref<4096x4096xf32>, %arg2: memref<4096x4096xf32>) {
-    %0 = ub.poison : f32
+  func.func @main(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf32>, %arg2: memref<?x?xf32>) attributes {llvm.emit_c_interface} {
     %c0 = arith.constant 0 : index
-    %cst = arith.constant dense<0.000000e+00> : vector<4096x4096xf32>
-    vector.transfer_write %cst, %arg2[%c0, %c0] {in_bounds = [true, true]} : vector<4096x4096xf32>, memref<4096x4096xf32>
-    scf.forall (%arg3, %arg4, %arg5) in (512, 512, 512) {
-      %1 = affine.apply #map(%arg3)
-      %2 = affine.apply #map(%arg4)
-      %subview = memref.subview %arg2[%1, %2] [8, 8] [1, 1] : memref<4096x4096xf32> to memref<8x8xf32, strided<[4096, 1], offset: ?>>
-      %3 = affine.apply #map(%arg3)
-      %4 = affine.apply #map(%arg5)
-      %5 = vector.transfer_read %arg0[%3, %4], %0 {in_bounds = [true, true]} : memref<4096x4096xf32>, vector<8x8xf32>
-      %6 = affine.apply #map(%arg5)
-      %7 = affine.apply #map(%arg4)
-      %8 = vector.transfer_read %arg1[%6, %7], %0 {in_bounds = [true, true]} : memref<4096x4096xf32>, vector<8x8xf32>
-      %9 = affine.apply #map(%arg3)
-      %10 = affine.apply #map(%arg4)
-      %11 = vector.transfer_read %arg2[%9, %10], %0 {in_bounds = [true, true]} : memref<4096x4096xf32>, vector<8x8xf32>
-      %12 = vector.contract {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %5, %8, %11 : vector<8x8xf32>, vector<8x8xf32> into vector<8x8xf32>
-      vector.transfer_write %12, %subview[%c0, %c0] {in_bounds = [true, true]} : vector<8x8xf32>, memref<8x8xf32, strided<[4096, 1], offset: ?>>
-      %subview_0 = memref.subview %arg2[%1, %2] [8, 8] [1, 1] : memref<4096x4096xf32> to memref<8x8xf32, strided<[4096, 1], offset: ?>>
-      linalg.copy ins(%subview : memref<8x8xf32, strided<[4096, 1], offset: ?>>) outs(%subview_0 : memref<8x8xf32, strided<[4096, 1], offset: ?>>)
+    %c1 = arith.constant 1 : index
+    %cst = arith.constant 0.000000e+00 : f32
+    %dim = memref.dim %arg0, %c1 : memref<?x?xf32>
+    %dim_0 = memref.dim %arg1, %c0 : memref<?x?xf32>
+    %0 = arith.cmpi eq, %dim, %dim_0 : index
+    cf.assert %0, "mismatching contracting dimension for torch.aten.mm"
+    linalg.fill ins(%cst : f32) outs(%arg2 : memref<?x?xf32>)
+    %dim_1 = memref.dim %arg0, %c0 : memref<?x?xf32>
+    %dim_2 = memref.dim %arg0, %c1 : memref<?x?xf32>
+    %dim_3 = memref.dim %arg1, %c1 : memref<?x?xf32>
+    %1 = affine.apply #map()[%dim_1]
+    %2 = affine.apply #map1()[%dim_3]
+    %3 = affine.apply #map1()[%dim_2]
+    scf.forall (%arg3, %arg4, %arg5) in (%1, %2, %3) {
+      %4 = affine.apply #map2(%arg3)
+      %5 = affine.apply #map3(%arg4)
+      %6 = affine.apply #map3(%arg5)
+      %7 = affine.min #map4(%4)[%dim_1]
+      %8 = affine.min #map5(%5)[%dim_3]
+      %9 = affine.min #map5(%6)[%dim_2]
+      %subview = memref.subview %arg0[%4, %6] [%7, %9] [1, 1] : memref<?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+      %subview_4 = memref.subview %arg1[%6, %5] [%9, %8] [1, 1] : memref<?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+      %subview_5 = memref.subview %arg2[%4, %5] [%7, %8] [1, 1] : memref<?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+      linalg.matmul ins(%subview, %subview_4 : memref<?x?xf32, strided<[?, 1], offset: ?>>, memref<?x?xf32, strided<[?, 1], offset: ?>>) outs(%subview_5 : memref<?x?xf32, strided<[?, 1], offset: ?>>)
+      %subview_6 = memref.subview %arg2[%4, %5] [%7, %8] [1, 1] : memref<?x?xf32> to memref<?x?xf32, strided<[?, 1], offset: ?>>
+      linalg.copy ins(%subview_5 : memref<?x?xf32, strided<[?, 1], offset: ?>>) outs(%subview_6 : memref<?x?xf32, strided<[?, 1], offset: ?>>)
     }
     return
   }

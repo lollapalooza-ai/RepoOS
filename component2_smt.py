@@ -235,6 +235,12 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     - `schedule.vectorize(target_var: str)` 
       (Forces SIMD vectorization. Apply this to the handle returned by schedule.tile).
 
+    CRITICAL DYNAMIC SHAPE CONSTRAINTS:
+    - The baseline MLIR graph contains SYMBOLIC DYNAMIC SHAPES (tensor<?x?xf32>).
+    - When you call `schedule.tile()`, the compiler will automatically generate affine boundary checks (e.g., scf.if or affine.min) to handle uneven loop tails.
+    - DO NOT attempt to mask or pad the data manually. Let the compiler handle the boundary geometry.
+    - Prioritize cache-friendly tile sizes (e.g., 32, 64, 128) that divide cleanly into typical power-of-2 sequence lengths to minimize branch prediction penalties on the CPU.
+
     FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
         # 1. Isolate the mathematical hotspot

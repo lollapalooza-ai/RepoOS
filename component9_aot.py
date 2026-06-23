@@ -434,11 +434,17 @@ def prune_abi_to_void(mlir_text: str) -> str:
     Surgically removes return signatures to guarantee a C-compatible void kernel.
     Handles tensor, memref, and multi-value returns.
     """
-    # 1. Strip the return type (anything after ->) before the opening brace
+    # 1. Strip the return type (anything after ->) before the opening brace, and inject llvm.emit_c_interface
+    # This guarantees the function returns void AND generates the _mlir_ciface_main struct pointer wrapper
+    def repl(m):
+        func_decl = m.group(1)
+        return func_decl + " attributes {llvm.emit_c_interface} {"
+
     mlir_text = re.sub(
-        r"(func\.func\s+@[a-zA-Z0-9_\./]+\(.*?\))\s*->\s*[^\{]+\{",
-        r"\1 {",
-        mlir_text
+        r"(func\.func\s+@[a-zA-Z0-9_\./]+\([^)]*\))(?:\s*->\s*[^\{]+)?\s*\{",
+        repl,
+        mlir_text,
+        count=1
     )
     
     # 2. Strip the return operand
@@ -601,7 +607,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             MLIR_OPT, intermediate_memref_path,
             # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
             # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
-            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
+            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 

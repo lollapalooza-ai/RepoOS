@@ -1,9 +1,15 @@
 module {
-  func.func @main(%arg0: tensor<4096x4096xf32>, %arg1: tensor<4096x4096xf32>, %arg2: tensor<4096x4096xf32>) -> tensor<4096x4096xf32> {
+  func.func @main(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %arg2: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
     %cst = arith.constant 0.000000e+00 : f32
-    %0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor<4096x4096xf32>) -> tensor<4096x4096xf32>
-    %1 = linalg.matmul ins(%arg0, %arg1 : tensor<4096x4096xf32>, tensor<4096x4096xf32>) outs(%0 : tensor<4096x4096xf32>) -> tensor<4096x4096xf32>
-    return %1 : tensor<4096x4096xf32>
+    %dim = tensor.dim %arg0, %c1 : tensor<?x?xf32>
+    %dim_0 = tensor.dim %arg1, %c0 : tensor<?x?xf32>
+    %0 = arith.cmpi eq, %dim, %dim_0 : index
+    cf.assert %0, "mismatching contracting dimension for torch.aten.mm"
+    %1 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor<?x?xf32>) -> tensor<?x?xf32>
+    %2 = linalg.matmul ins(%arg0, %arg1 : tensor<?x?xf32>, tensor<?x?xf32>) outs(%1 : tensor<?x?xf32>) -> tensor<?x?xf32>
+    return %2 : tensor<?x?xf32>
   }
 }
 

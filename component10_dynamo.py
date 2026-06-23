@@ -7,7 +7,7 @@ import re
 from typing import Callable
 from component2_smt import generate_inference_transforms
 from component9_aot import apply_ai_transform_and_compile
-from component5_orchestrator import to_memref
+from component5_orchestrator import pack_tensor_to_memref
 
 # --- GLOBAL CONFIGURATION ---
 # Set to "NVIDIA H100" for GPU (requires real hardware)
@@ -47,25 +47,58 @@ def to_true_dps(mlir_text: str) -> str:
     
     # Replace internal tensor.empty with the out_arg only if the type matches the return type
     # We use tensor.cast to bridge the argument to the existing SSA name
+    # We account for possible dimension arguments in tensor.empty(...) for dynamic shapes
     ret_type_escaped = re.escape(ret_type)
     mlir_text = re.sub(
-        r"(%[a-zA-Z0-9_]+) = tensor\.empty\(\) : " + ret_type_escaped, 
+        r"(%[a-zA-Z0-9_]+) = tensor\.empty\([^)]*\)\s*:\s*" + ret_type_escaped, 
         fr"\1 = tensor.cast {out_arg} : {ret_type} to {ret_type}", 
         mlir_text
     )
     
     return mlir_text
 
+from torch.export import Dim
+from torch_mlir.extras.fx_importer import FxImporter
+
+def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list) -> str:
+    """
+    Captures the MLIR graph with strictly symbolic dynamic dimensions.
+    """
+    from torch_mlir.fx import export_and_import
+    from torch.export import Dim
+    
+    dynamic_shapes = []
+    
+    # Create a unique Dim for each unique size we see to satisfy PyTorch's constraint solver
+    size_to_dim = {}
+    dim_counter = 0
+    
+    # Map symbolic variables to the input tensors
+    for i, arg in enumerate(example_inputs):
+        if isinstance(arg, torch.Tensor):
+            shape_dict = {}
+            for d, size in enumerate(arg.shape):
+                if size not in size_to_dim:
+                    size_to_dim[size] = Dim(f"dim_{dim_counter}")
+                    dim_counter += 1
+                shape_dict[d] = size_to_dim[size]
+            dynamic_shapes.append(shape_dict)
+        else:
+            dynamic_shapes.append(None)
+
+    base_mlir_module = export_and_import(
+        gm, *example_inputs,
+        output_type="linalg-on-tensors",
+        dynamic_shapes=tuple(dynamic_shapes)
+    )
+    return str(base_mlir_module)
+
 async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inputs: list) -> Callable:
     print(f"\n[Dynamo] 🧠 Intercepted Graph. Target Device: {TARGET_DEVICE}")
     
-    # 1. THE ALGORITHM (Strictly Deterministic)
-    from torch_mlir.fx import export_and_import
-    base_mlir_module = export_and_import(
-        gm, *example_inputs, 
-        output_type="linalg-on-tensors"
-    )
-    base_mlir_text = to_true_dps(str(base_mlir_module))
+    # 1. THE ALGORITHM (Dynamic Symbolic Shapes)
+    base_mlir_module_str = capture_dynamic_mlir(gm, example_inputs)
+    base_mlir_text = to_true_dps(base_mlir_module_str)
     
     kernel_id = abs(hash(base_mlir_text))
     base_dylib_path = os.path.join(CACHE_DIR, f"kernel_{kernel_id}_base.so")
@@ -131,20 +164,25 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
             k_func = lib._mlir_ciface_main if hasattr(lib, "_mlir_ciface_main") else lib.main
             k_func.restype = ctypes.c_void_p
             
-            # Prepare bare-pointer args for the micro-benchmark
+            # Prepare args for the micro-benchmark
             kernel_args = []
             numpy_arrays = []
+            structs = []
             for arg in example_inputs:
                 if not isinstance(arg, torch.Tensor): continue
                 arr = arg.detach().cpu().numpy()
                 numpy_arrays.append(arr)
-                kernel_args.append(arr.ctypes.data_as(ctypes.c_void_p))
+                memref = pack_tensor_to_memref(arg)
+                structs.append(memref)
+                kernel_args.append(ctypes.byref(memref))
             
             # THE FIX: Also pass the output buffer for the benchmark
             bench_res = torch.zeros_like(example_inputs[0])
             bench_arr = bench_res.detach().cpu().numpy()
             numpy_arrays.append(bench_arr)
-            kernel_args.append(bench_arr.ctypes.data_as(ctypes.c_void_p))
+            memref_out = pack_tensor_to_memref(bench_res)
+            structs.append(memref_out)
+            kernel_args.append(ctypes.byref(memref_out))
                 
             # Warmup
             k_func(*kernel_args)
@@ -189,20 +227,25 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
             # In our 'to_true_dps', we added it as the LAST argument.
             kernel_args = []
             numpy_arrays = []
+            structs = []
             
-            # 1. Prepare Input Tensors
+            # 1. Prepare Inputs
             for arg in args:
                 if not isinstance(arg, torch.Tensor): continue
                 arr = arg.detach().cpu().numpy()
                 numpy_arrays.append(arr)
-                kernel_args.append(arr.ctypes.data_as(ctypes.c_void_p))
+                memref = pack_tensor_to_memref(arg)
+                structs.append(memref)
+                kernel_args.append(ctypes.byref(memref))
             
             # 2. Allocate and Prepare Output Tensor
             # (Assuming the output shape matches the first input for this demo)
             res_torch = torch.zeros_like(args[0])
             res_arr = res_torch.detach().cpu().numpy()
             numpy_arrays.append(res_arr)
-            kernel_args.append(res_arr.ctypes.data_as(ctypes.c_void_p))
+            memref_res = pack_tensor_to_memref(res_torch)
+            structs.append(memref_res)
+            kernel_args.append(ctypes.byref(memref_res))
 
             # 3. Execute machine code
             kernel_func(*kernel_args)

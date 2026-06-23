@@ -31,26 +31,47 @@ def get_true_fqn(func):
         # Fallback if the object is a weird C-extension
         return getattr(func, '__name__', str(func))
 
-class MemRef1D(ctypes.Structure):
-    _fields_ = [("base", ctypes.c_void_p), ("data", ctypes.c_void_p), 
-                ("offset", ctypes.c_longlong), ("size", ctypes.c_longlong), 
-                ("stride", ctypes.c_longlong)]
+def make_nd_memref_struct(ndim: int, dtype):
+    """
+    Dynamically creates an MLIR-ABI compliant MemRef descriptor C-Struct 
+    for any tensor dimension at runtime.
+    """
+    c_type = ctypes.c_float # Default, map to dtype in prod
+    
+    class MemRefDescriptor(ctypes.Structure):
+        _fields_ = [
+            ("allocatedPtr", ctypes.POINTER(c_type)),
+            ("alignedPtr", ctypes.POINTER(c_type)),
+            ("offset", ctypes.c_int64),
+            ("sizes", ctypes.c_int64 * ndim),
+            ("strides", ctypes.c_int64 * ndim)
+        ]
+    return MemRefDescriptor
 
-class MemRef2D(ctypes.Structure):
-    _fields_ = [("base", ctypes.c_void_p), ("data", ctypes.c_void_p), 
-                ("offset", ctypes.c_longlong), 
-                ("size", ctypes.c_longlong * 2), 
-                ("stride", ctypes.c_longlong * 2)]
-
-def to_memref(arr):
-    """Maps a NumPy array to a C-compatible MemRef descriptor."""
-    if arr.ndim == 1:
-        return MemRef1D(arr.ctypes.data, arr.ctypes.data, 0, arr.size, 1)
-    elif arr.ndim == 2:
-        sizes = (ctypes.c_longlong * 2)(*arr.shape)
-        strides = (ctypes.c_longlong * 2)(*arr.strides)
-        return MemRef2D(arr.ctypes.data, arr.ctypes.data, 0, sizes, strides)
-    raise ValueError(f"Unsupported dimension: {arr.ndim}")
+def pack_tensor_to_memref(tensor: torch.Tensor):
+    """
+    Converts a PyTorch tensor into the C-Struct required by dynamic MLIR.
+    """
+    tensor_np = tensor.detach().cpu().numpy()
+    ndim = tensor_np.ndim
+    
+    # Generate the strict C-Struct for this specific rank
+    MemRefStruct = make_nd_memref_struct(ndim, tensor_np.dtype)
+    memref = MemRefStruct()
+    
+    # Fill the pointers
+    ptr = tensor_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    memref.allocatedPtr = ptr
+    memref.alignedPtr = ptr
+    memref.offset = 0
+    
+    # Fill dynamic sizes and strides
+    for i in range(ndim):
+        memref.sizes[i] = tensor_np.shape[i]
+        # NumPy strides are in bytes, MLIR expects elements
+        memref.strides[i] = tensor_np.strides[i] // tensor_np.itemsize
+        
+    return memref
 
 def to_byte_ptr(python_bytes_obj):
     """Zero-Copy for FSM Track"""
@@ -126,7 +147,7 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                 for t in tensors:
                     arr = t.detach().cpu().numpy()
                     numpy_arrays.append(arr)
-                    kernel_args.append(ctypes.byref(to_memref(arr)))
+                    kernel_args.append(ctypes.byref(pack_tensor_to_memref(t)))
 
                 print(f"--- 🚀 [RepoOS] Invoking Bare-Metal Kernel for {target_fqn} ---")
                 kernel(*kernel_args)
