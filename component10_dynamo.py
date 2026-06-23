@@ -45,15 +45,15 @@ def to_true_dps(mlir_text: str) -> str:
     new_args = args + f", {out_arg}: {ret_type}"
     mlir_text = mlir_text.replace(f"func.func @main({args})", f"func.func @main({new_args})")
     
-    # Replace internal tensor.empty with the out_arg only if the type matches the return type
-    # We use tensor.cast to bridge the argument to the existing SSA name
-    # We account for possible dimension arguments in tensor.empty(...) for dynamic shapes
+    # Replace ONLY the final internal tensor.empty with the out_arg.
+    # If there are multiple tensor.empty (e.g., intermediate matrices in NanoGPT), 
+    # we leave them alone so MLIR can memref.alloc them properly.
     ret_type_escaped = re.escape(ret_type)
-    mlir_text = re.sub(
-        r"(%[a-zA-Z0-9_]+) = tensor\.empty\([^)]*\)\s*:\s*" + ret_type_escaped, 
-        fr"\1 = tensor.cast {out_arg} : {ret_type} to {ret_type}", 
-        mlir_text
-    )
+    pattern = r"(%[a-zA-Z0-9_]+) = tensor\.empty\([^)]*\)\s*:\s*" + ret_type_escaped
+    matches = list(re.finditer(pattern, mlir_text))
+    if matches:
+        last_match = matches[-1]
+        mlir_text = mlir_text[:last_match.start()] + f"{last_match.group(1)} = tensor.cast {out_arg} : {ret_type} to {ret_type}" + mlir_text[last_match.end():]
     
     return mlir_text
 

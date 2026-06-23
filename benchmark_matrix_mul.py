@@ -13,7 +13,7 @@ from component10_dynamo import to_true_dps, CACHE_DIR, capture_dynamic_mlir
 from component5_orchestrator import pack_tensor_to_memref
 
 # AI workload parameters
-MATRIX_SIZE = 1024
+MATRIX_SIZE = 2048
 BENCHMARK_ITERATIONS = 3
 
 # We use the same simple workload
