@@ -11,9 +11,9 @@ from component2_smt import generate_inference_transforms
 from component9_aot import apply_ai_transform_and_compile
 from component10_dynamo import to_true_dps, CACHE_DIR
 
-# Enterprise AI workload parameters
-MATRIX_SIZE = 512
-BENCHMARK_ITERATIONS = 10
+# AI workload parameters
+MATRIX_SIZE = 4096
+BENCHMARK_ITERATIONS = 3
 
 # We use the same simple workload
 class FastModel(torch.nn.Module):
@@ -67,6 +67,28 @@ def measure_isolated_execution(dylib_path: str):
     
     return avg_time_ms, avg_cpu_time_ms, mem_mb, float(out_arr[0,0]), is_correct
 
+def measure_native_execution():
+    torch.set_num_threads(1)
+    process = psutil.Process(os.getpid())
+    a = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
+    b = torch.ones((MATRIX_SIZE, MATRIX_SIZE), dtype=torch.float32)
+    
+    out = torch.matmul(a, b)
+    is_correct = bool(torch.allclose(out, torch.tensor(float(MATRIX_SIZE))))
+    
+    start = time.perf_counter()
+    start_cpu = time.process_time()
+    for _ in range(BENCHMARK_ITERATIONS):
+        torch.matmul(a, b)
+    end = time.perf_counter()
+    end_cpu = time.process_time()
+    
+    avg_time_ms = ((end - start) / float(BENCHMARK_ITERATIONS)) * 1000.0
+    avg_cpu_time_ms = ((end_cpu - start_cpu) / float(BENCHMARK_ITERATIONS)) * 1000.0
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    
+    return avg_time_ms, avg_cpu_time_ms, mem_mb, float(out[0,0]), is_correct
+
 async def compile_variants():
     """Generates and compiles all variants ahead-of-time."""
     print("--- [AOT Compilation Phase] ---")
@@ -109,17 +131,35 @@ async def compile_variants():
 
 if __name__ == "__main__":
     import subprocess
+    import argparse
     
     # If called as a subprocess to measure a specific library
-    if len(sys.argv) == 3 and sys.argv[1] == "--measure":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--measure":
         dylib_path = sys.argv[2]
-        avg_time, cpu, mem, val, is_correct = measure_isolated_execution(dylib_path)
+        if dylib_path == "native_python":
+            avg_time, cpu, mem, val, is_correct = measure_native_execution()
+        else:
+            avg_time, cpu, mem, val, is_correct = measure_isolated_execution(dylib_path)
         print(f"{avg_time},{cpu},{mem},{val},{is_correct}")
         sys.exit(0)
         
-    # Main orchestrator
-    print("🚀 Starting Isolated Benchmarking Suite...")
-    dylibs = asyncio.run(compile_variants())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--use-variant', type=str, default=None, help='Which variants to run: a .so filename, "all_variants", or "all"')
+    args = parser.parse_args()
+
+    if args.use_variant:
+        dylibs = []
+        if args.use_variant == "all":
+            dylibs.append(("Native Python", "native_python"))
+        if args.use_variant in ["all", "all_variants"]:
+            for f in sorted(os.listdir(CACHE_DIR)):
+                if f.startswith("bench_") and f.endswith(".so"):
+                    dylibs.append((f.replace(".so", ""), os.path.join(CACHE_DIR, f)))
+        else:
+            dylibs.append((args.use_variant.replace(".so", ""), os.path.join(CACHE_DIR, args.use_variant)))
+    else:
+        print("🚀 Starting Isolated Benchmarking Suite...")
+        dylibs = asyncio.run(compile_variants())
     
     print(f"\n[Dynamo] 🏁 Racing {len(dylibs)} compiled kernels to find the Speed of Light (SoL)...")
     for name, path in dylibs:

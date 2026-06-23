@@ -36,8 +36,8 @@ def log_oracle_interaction(stage: str, prompt: str, response: str):
     print(f"DEBUG: AI ORACLE INTERACTION [{stage.upper()}]")
     print(f"LOG FILE: {log_file}")
     print("="*80)
-    print(f"\n>>> FULL PROMPT SENT TO GEMINI:\n{prompt}")
-    print(f"\n<<< FULL RESPONSE FROM GEMINI:\n{response}")
+    # print(f"\n>>> FULL PROMPT SENT TO GEMINI:\n{prompt}")
+    # print(f"\n<<< FULL RESPONSE FROM GEMINI:\n{response}")
     print("="*80 + "\n")
 
 async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}") -> str:
@@ -119,9 +119,12 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}") -> 
         )
         res_text = response.text
         log_oracle_interaction("fsm_transform_synthesis", prompt, res_text)
-        match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
-        if match:
-            return match.group(1)
+        matches = re.findall(r"```python\n(.*?)\n```", res_text, re.DOTALL)
+        if matches:
+            for m in reversed(matches):
+                if re.search(r"def\s+build_parser\s*\(", m):
+                    return m
+            return matches[-1]
         return res_text
     except Exception as e:
         print(f"[Oracle] Failed to generate FSM transforms: {e}")
