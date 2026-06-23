@@ -49,3 +49,30 @@ Workload: Dense PageRank step $2048 \times 2048$ (100 iterations, tolerance thre
 ## 🏎️ Key Observations
 1. **Matrix Multiplication Cache Benefits:** Matrix multiplication shows massive scale benefits (**10.1x Speedup**) because $O(N^3)$ operations on large arrays suffer heavily from L1/L2 cache misses when untiled. Tiling restricts cache working sets to $\approx 3$ KB, completely eliminating main memory traffic bottlenecks.
 2. **PageRank Tiling & Vectorization:** PageRank is an $O(N^2)$ matrix-vector computation. It is highly memory bandwidth bound. Tiling and vectorizing the MatMul core results in a **1.90x Speedup** (Variant 3) using SIMD AVX2 vectorization patterns (`[8, 1, 4]`).
+
+---
+
+## 📊 NanoGPT Self-Attention (Dynamic Shapes) Benchmark Results
+
+* **Workload:** NanoGPT Scaled Dot-Product Self-Attention (`Q * K^T / sqrt(d) * V`).
+* **Workload Size:** Evaluated on Sequence Length 5 and 500 dynamically on the **same compiled `.so` binary** without recompilation.
+* **Telemetry State:** Thread-isolated (Single-threaded).
+
+### Sequence Length 5
+| Variant Name | Speed (ms) | CPU Time (ms) | Memory (MB) | Correct |
+| :--- | :---: | :---: | :---: | :---: |
+| **Baseline** | 0.0280 | 0.0000 | 500.21 | Match |
+| **Variant 1** | 0.0357 | 0.0000 | 500.27 | Match |
+| **Variant 2** | 0.0396 | 0.0000 | 500.34 | Match |
+| **Variant 3** | 0.0282 | 0.0000 | 500.23 | Match |
+
+### Sequence Length 500
+| Variant Name | Speed (ms) | CPU Time (ms) | Memory (MB) | Correct | Speedup vs Base |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Baseline** | 40.3575 | 40.0000 | 510.67 | Match | 1.00x |
+| **Variant 1** | 27.9163 | 26.6667 | 518.03 | Match | 1.44x |
+| **Variant 2** | 27.2072 | 30.0000 | 518.27 | Match | **1.48x** |
+| **Variant 3** | 27.7740 | 26.6667 | 518.29 | Match | 1.45x |
+
+> [!NOTE]
+> The exact same binary dynamically scaled from a 5-token context window (computing in under 0.03ms) to a 500-token context window natively. The AI Oracle generated heuristics in Variant 2 that improved inference speeds by **~48%**!

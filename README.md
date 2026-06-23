@@ -113,6 +113,22 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 ```
 *   **Success Criteria:** RepoOS should show a **~2.0x Speedup** and **~70% Memory Reduction** for 20,000 nodes.
 
+### C. NanoGPT Self-Attention Micro-Benchmark (Dynamic Shapes)
+Validates the dynamic shape capabilities (Milestone 8.2) by compiling the core Scaled Dot-Product Self-Attention math into a single `.so` binary, which seamlessly scales to arbitrary Sequence Lengths without recompilation.
+
+**Run Command:**
+```bash
+export PROJECT_ROOT=$(pwd)
+export PYTHONPATH="$PROJECT_ROOT/llvm-project/build/tools/mlir/python_packages/mlir_core:$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PYTHONPATH"
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$PROJECT_ROOT/llvm-project/build/lib"
+
+./build_venv/bin/python3 benchmark_nanogpt.py
+```
+* To test a specific compiled variant on a custom sequence length:
+```bash
+./build_venv/bin/python3 benchmark_nanogpt.py --measure .poly_cache/nanogpt_v1.so 2048
+```
 ---
 
 ## 🏗 Detailed Lowering Flow (Step-by-Step)
