@@ -234,6 +234,8 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
       (Tiles the loop. CRITICAL: This returns a handle to the NEWLY TILED inner operations).
     - `schedule.tile_reduction(target_var: str, tile_sizes: list[int]) -> str`
       (Tiles a reduction operation like linalg.reduce using MapReduce partial sums logic. Returns a handle to the tiled loop).
+    - `schedule.generalize(target_var: str) -> str`
+      (Generalizes a Named Linalg Op like linalg.batch_matmul into a linalg.generic. MUST be called before tile_reduction on named ops).
     - `schedule.vectorize(target_var: str)` 
       (Forces SIMD vectorization. Apply this to the handle returned by schedule.tile).
 
@@ -242,6 +244,10 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     - When you call `schedule.tile()`, the compiler will automatically generate affine boundary checks (e.g., scf.if or affine.min) to handle uneven loop tails.
     - DO NOT attempt to mask or pad the data manually. Let the compiler handle the boundary geometry.
     - Prioritize cache-friendly tile sizes (e.g., 32, 64, 128) that divide cleanly into typical power-of-2 sequence lengths to minimize branch prediction penalties on the CPU.
+    
+    CRITICAL REDUCTION CONSTRAINTS:
+    - Named Operations (like `linalg.batch_matmul`) MUST be generalized using `schedule.generalize()` before applying `schedule.tile_reduction()`.
+    - DO NOT apply `schedule.tile_reduction()` to `linalg.generic` operations that have MULTIPLE outputs (such as the combined Max/Sum Softmax loop).
 
     FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
@@ -486,6 +492,7 @@ async def generate_transform_script(base_mlir_text: str, target_arch: str = "x86
         module attributes {transform.with_named_sequence} {
           transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
             %0 = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+            transform.structured.generalize %0 : !transform.any_op
             transform.structured.vectorize %0 : !transform.any_op
             transform.yield
           }
@@ -497,10 +504,10 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     The Self-Healing Loop: Feeds compiler syntax errors back to Gemini for autonomous correction.
     """
     prompt = f"""
-    You are an expert MLIR engineer. You wrote a Transform Dialect script, but the local MLIR parser rejected it with a syntax error.
+    You are an expert MLIR engineer. You wrote a Python optimization script using the RepoOSSchedule API, but the generated MLIR was rejected by the compiler.
     
-    BROKEN SCRIPT:
-    ```mlir
+    BROKEN PYTHON SCRIPT:
+    ```python
     {broken_script}
     ```
     
@@ -508,13 +515,13 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     {compiler_error}
     
     TASK:
-    Analyze the compiler error and fix the syntax in the script. 
+    Analyze the compiler error and fix the python script. 
     
     STRICT RULES FOR FIXING:
-    - Every `transform.structured.match` MUST end with a functional type signature: `: (!transform.any_op) -> !transform.any_op`
-    - NEVER use explicit type labels on the LEFT side of an assignment (e.g., `%op: !type = ...` is BANNED).
-    - You MUST enclose array attributes in curly braces, e.g., `ops{["linalg.generic"]}`.
-    - Output ONLY the corrected ```mlir block. Do not include apologies or explanations.
+    - You MUST output a pure Python function named `apply_schedule(schedule)`.
+    - Use `schedule.generalize(target_var)` before tiling reductions on Named Linalg Ops (like `linalg.batch_matmul`).
+    - DO NOT apply `schedule.tile_reduction` to ops with multiple outputs (e.g., Softmax `linalg.generic`).
+    - Output ONLY the corrected ```python block. Do not include apologies or explanations.
     """
     
     try:
@@ -522,7 +529,7 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
         response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
         res_text = response.text
         log_oracle_interaction("self_heal", prompt, res_text)
-        match = re.search(r"```mlir\n(.*?)\n```", res_text, re.DOTALL)
+        match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
         if match: return match.group(1)
         return res_text
     except Exception as e:

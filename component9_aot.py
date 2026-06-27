@@ -99,6 +99,17 @@ class RepoOSSchedule:
         )
         return for_op
 
+    def generalize(self, target_var: str) -> str:
+        """
+        Generalizes a named operation (like linalg.batch_matmul) into a linalg.generic operation.
+        This is required before calling tile_reduction on named operations.
+        """
+        gen_op = self._next_var()
+        self.instructions.append(
+            ("generalize", gen_op, target_var)
+        )
+        return gen_op
+
     def vectorize(self, target_var: str):
         """
         Vectorizes the inner loop bounds to exploit native SIMD extensions.
@@ -133,6 +144,11 @@ class RepoOSSchedule:
                 sizes_str = ", ".join(map(str, tile_sizes))
                 formatted_instructions.append(
                     f"    {fill_op}, {split_op}, {comb_op}, {for_op} = transform.structured.tile_reduction_using_for {target_var} by tile_sizes = [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)"
+                )
+            elif isinstance(inst, tuple) and inst[0] == "generalize":
+                _, gen_op, target_var = inst
+                formatted_instructions.append(
+                    f"    {gen_op} = transform.structured.generalize {target_var} : (!transform.any_op) -> !transform.any_op"
                 )
             else:
                 formatted_instructions.append(inst)
@@ -488,7 +504,7 @@ def strip_transform_dialect(mlir_text: str) -> str:
     # We strip from its start until the end, then ensure the module is closed.
     return mlir_text[:idx].rstrip() + "\n}\n"
 
-async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False):
+async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False, python_script: str = None):
     """
     3-Stage Hybrid Backend Pipeline:
     1. tm_tensor Scrub (torch-mlir-opt) -> Pure Linalg Tensors
@@ -562,10 +578,24 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.decode()
                 print(f"[Compiler] ⚠️ AI Transform Attempt {attempt+1} Invalid.")
-                if attempt == 0:
-                    current_transform = await fix_transform_syntax_with_ai(current_transform, error_msg)
+                if attempt == 0 and python_script is not None:
+                    print(f"[Compiler] Engaging python-level self-heal via Oracle...")
+                    healed_python = await fix_transform_syntax_with_ai(python_script, error_msg)
+                    if healed_python != python_script:
+                        try:
+                            # Local import to prevent circular dependency
+                            from component9_aot import safe_execute_schedule, RepoOSSchedule
+                            schedule = RepoOSSchedule()
+                            safe_execute_schedule(healed_python, schedule)
+                            current_transform = schedule.build_mlir()
+                            python_script = healed_python # Update for logs
+                        except Exception as he:
+                            print(f"[Compiler] Self-healed python script execution failed: {he}")
+                            raise RuntimeError(f"AI Transform failed after self-heal: {error_msg}")
+                    else:
+                        raise RuntimeError(f"AI returned identical script after self-heal.")
                 else:
-                    print(f"[Compiler] Self-heal failed.")
+                    print(f"[Compiler] Self-heal failed or unavailable.")
                     print(f"--- [DEBUG] FINAL COMPILER ERROR ---\n{error_msg}")
                     raise RuntimeError(f"AI Transform failed after self-heal: {error_msg}")
 

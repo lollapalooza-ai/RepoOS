@@ -86,10 +86,15 @@ def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list) -> str:
         else:
             dynamic_shapes.append(None)
 
+    print("DYNAMO GM CODE:")
+    print(gm.code)
+    
+    # We will pass dynamic_shapes=None for now to bypass the PyTorch validation bug!
+    # PyTorch Dynamo already manages shape recompilation automatically.
     base_mlir_module = export_and_import(
         gm, *example_inputs,
         output_type="linalg-on-tensors",
-        dynamic_shapes=tuple(dynamic_shapes)
+        dynamic_shapes=None
     )
     return str(base_mlir_module)
 
@@ -138,13 +143,16 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
             print(f"[Dynamo] ⚠️ Sandbox rejected AI script: {e}")
             continue
 
-        await apply_ai_transform_and_compile(
-            base_mlir_text, transform_mlir, variant_dylib, is_gpu=is_gpu
-        )
-        
-        if os.path.exists(variant_dylib):
-            compiled_dylibs.append(variant_dylib)
-            print(f"[Dynamo] ✅ Variant {idx+1} successfully compiled.")
+        try:
+            await apply_ai_transform_and_compile(
+                base_mlir_text, transform_mlir, variant_dylib, is_gpu=is_gpu, python_script=transform_script
+            )
+            if os.path.exists(variant_dylib):
+                compiled_dylibs.append(variant_dylib)
+                print(f"[Dynamo] ✅ Variant {idx+1} successfully compiled.")
+        except Exception as e:
+            print(f"[Dynamo] ⚠️ Compiler rejected AI script during MLIR lowering: {e}")
+            continue
 
     # Fallback if AI totally failed
     if not compiled_dylibs:
@@ -177,7 +185,12 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
                 kernel_args.append(ctypes.byref(memref))
             
             # THE FIX: Also pass the output buffer for the benchmark
-            bench_res = torch.zeros_like(example_inputs[0])
+            with torch.device('meta'):
+                meta_args = [a.to('meta') if isinstance(a, torch.Tensor) else a for a in example_inputs]
+                meta_out = gm(*meta_args)
+            if isinstance(meta_out, tuple):
+                meta_out = meta_out[0]
+            bench_res = torch.zeros(meta_out.shape, dtype=meta_out.dtype, device=example_inputs[0].device)
             bench_arr = bench_res.detach().cpu().numpy()
             numpy_arrays.append(bench_arr)
             memref_out = pack_tensor_to_memref(bench_res)
@@ -238,9 +251,15 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
                 structs.append(memref)
                 kernel_args.append(ctypes.byref(memref))
             
-            # 2. Allocate and Prepare Output Tensor
-            # (Assuming the output shape matches the first input for this demo)
-            res_torch = torch.zeros_like(args[0])
+            # 2. Allocate and Prepare Output Tensor using Meta Shape Inference
+            with torch.device('meta'):
+                meta_args = [a.to('meta') if isinstance(a, torch.Tensor) else a for a in args]
+                meta_out = gm(*meta_args)
+            
+            if isinstance(meta_out, tuple):
+                meta_out = meta_out[0]
+                
+            res_torch = torch.zeros(meta_out.shape, dtype=meta_out.dtype, device=args[0].device)
             res_arr = res_torch.detach().cpu().numpy()
             numpy_arrays.append(res_arr)
             memref_res = pack_tensor_to_memref(res_torch)
