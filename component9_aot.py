@@ -85,6 +85,20 @@ class RepoOSSchedule:
         )
         return tiled_op
 
+    def tile_reduction(self, target_var: str, tile_sizes: list[int]) -> str:
+        """
+        Tiles a reduction operation (like Softmax/LayerNorm sum) securely using MapReduce logic.
+        """
+        fill_op = self._next_var()
+        split_op = self._next_var()
+        comb_op = self._next_var()
+        for_op = self._next_var()
+        
+        self.instructions.append(
+            ("tile_reduction", fill_op, split_op, comb_op, for_op, target_var, tile_sizes)
+        )
+        return for_op
+
     def vectorize(self, target_var: str):
         """
         Vectorizes the inner loop bounds to exploit native SIMD extensions.
@@ -113,6 +127,12 @@ class RepoOSSchedule:
                 sizes_str = ", ".join(map(str, effective_tile_sizes))
                 formatted_instructions.append(
                     f"    {loop_handles}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+                )
+            elif isinstance(inst, tuple) and inst[0] == "tile_reduction":
+                _, fill_op, split_op, comb_op, for_op, target_var, tile_sizes = inst
+                sizes_str = ", ".join(map(str, tile_sizes))
+                formatted_instructions.append(
+                    f"    {fill_op}, {split_op}, {comb_op}, {for_op} = transform.structured.tile_reduction_using_for {target_var} by tile_sizes = [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)"
                 )
             else:
                 formatted_instructions.append(inst)
@@ -627,9 +647,26 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         # 2. Fix getelementptr syntax (Clang 18 does not support 'nuw' on GEP)
         sanitized_ir = re.sub(r"getelementptr\s+inbounds\s+nuw", "getelementptr inbounds", sanitized_ir)
         
+        # 3. Fix floating point infinities in LLVM IR
+        sanitized_ir = sanitized_ir.replace("float -inf", "float 0xFFF0000000000000")
+        sanitized_ir = sanitized_ir.replace("float inf", "float 0x7FF0000000000000")
+        
+        # 4. Fix MLIR-specific 32-bit float hex literals (f0x...)
+        import struct
+        def fix_f0x(match):
+            hex_str = match.group(1).ljust(8, '0')
+            val = struct.unpack('>f', bytes.fromhex(hex_str))[0]
+            # Ensure the output has a decimal point if it formats as an integer
+            val_str = str(val)
+            if '.' not in val_str and 'e' not in val_str:
+                val_str += ".0"
+            return val_str
+            
+        sanitized_ir = re.sub(r"f0x([0-9A-Fa-f]+)", fix_f0x, sanitized_ir)
+        
         with open("kernel.ll", "w") as f: f.write(sanitized_ir)
 
-        subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib], check=True)
+        subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib, "-lm"], check=True)
         print(f"[Compiler] ✅ Native library generated: {output_dylib}")
 
     except subprocess.CalledProcessError as e:

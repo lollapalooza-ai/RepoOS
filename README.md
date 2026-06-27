@@ -113,21 +113,42 @@ REPOOS_MANUAL_CACHE_DIR=.poly_cache_manual \
 ```
 *   **Success Criteria:** RepoOS should show a **~2.0x Speedup** and **~70% Memory Reduction** for 20,000 nodes.
 
-### C. NanoGPT Self-Attention Micro-Benchmark (Dynamic Shapes)
-Validates the dynamic shape capabilities (Milestone 8.2) by compiling the core Scaled Dot-Product Self-Attention math into a single `.so` binary, which seamlessly scales to arbitrary Sequence Lengths without recompilation.
+### C. NanoGPT Sub-Component Benchmarks (Milestone 8.3)
+Validates the compilation of entire LLM inference blocks on the CPU (incorporating Map-Reduce tiling, C Math Library linkage for transcendental functions, and dynamic Causal Masking).
 
-**Run Command:**
+**Environment Setup:**
+Before running the benchmarks, you must export the MLIR and LLVM shared library paths:
 ```bash
 export PROJECT_ROOT=$(pwd)
 export PYTHONPATH="$PROJECT_ROOT/llvm-project/build/tools/mlir/python_packages/mlir_core:$PROJECT_ROOT"
 export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PYTHONPATH"
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$PROJECT_ROOT/llvm-project/build/lib"
-
-./build_venv/bin/python3 benchmark_nanogpt.py
 ```
-* To test a specific compiled variant on a custom sequence length:
+
+**Run Commands:**
+To clear the cache and compile each component natively:
+
+1. **Softmax Kernel (Reduction Tiling):**
 ```bash
-./build_venv/bin/python3 benchmark_nanogpt.py --measure .poly_cache/nanogpt_v1.so 2048
+rm -rf .poly_cache/softmax_*
+./build_venv/bin/python3 benchmark_softmax.py
+```
+
+2. **GELU/MLP Kernel (Transcendental Math):**
+```bash
+rm -rf .poly_cache/gelu_*
+./build_venv/bin/python3 benchmark_gelu.py
+```
+
+3. **Full NanoGPT Block (Self-Attention + LayerNorm + MLP):**
+```bash
+rm -rf .poly_cache/fullblock_*
+./build_venv/bin/python3 benchmark_full_block.py
+```
+
+* To test a specific compiled variant on a custom sequence length without recompiling, use the `--measure` flag:
+```bash
+./build_venv/bin/python3 benchmark_full_block.py --measure .poly_cache/fullblock_v1.so 2048
 ```
 ---
 

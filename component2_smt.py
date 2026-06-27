@@ -232,6 +232,8 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
       (Finds a target operation handle).
     - `schedule.tile(target_var: str, tile_sizes: list[int]) -> str` 
       (Tiles the loop. CRITICAL: This returns a handle to the NEWLY TILED inner operations).
+    - `schedule.tile_reduction(target_var: str, tile_sizes: list[int]) -> str`
+      (Tiles a reduction operation like linalg.reduce using MapReduce partial sums logic. Returns a handle to the tiled loop).
     - `schedule.vectorize(target_var: str)` 
       (Forces SIMD vectorization. Apply this to the handle returned by schedule.tile).
 
