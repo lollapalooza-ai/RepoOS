@@ -110,32 +110,13 @@ class RepoOSSchedule:
         )
         return gen_op
 
-    def vectorize(self, target_var: str):
-        """
-        Vectorizes the inner loop bounds to exploit native SIMD extensions.
-        We safely ignore the AI's specific target_var and apply robust 
-        pattern-based vectorization to the parent function to handle reductions safely.
-        """
-        self.vectorize_requested = True
-        func_var = self._next_var()
-        self.instructions.append(
-            f"    {func_var} = transform.structured.match ops{{[\"func.func\"]}} in %root : (!transform.any_op) -> !transform.any_op"
-        )
-        self.instructions.append(
-            f"    transform.structured.vectorize_children_and_apply_patterns {func_var} : (!transform.any_op) -> !transform.any_op"
-        )
-
     def build_mlir(self) -> str:
         """Compiles the Python instructions into a valid Transform Dialect block."""
         formatted_instructions = []
         for inst in self.instructions:
             if isinstance(inst, tuple) and inst[0] == "tile":
                 _, loop_handles, tiled_op, target_var, tile_sizes = inst
-                effective_tile_sizes = tile_sizes
-                if self.vectorize_requested and any(x > 32 for x in tile_sizes):
-                    effective_tile_sizes = [min(x, 16) for x in tile_sizes]
-                    print(f"[Compiler Debug] Vectorization requested with large tile sizes {tile_sizes}. Capping to {effective_tile_sizes} to prevent compilation hang.")
-                sizes_str = ", ".join(map(str, effective_tile_sizes))
+                sizes_str = ", ".join(map(str, tile_sizes))
                 formatted_instructions.append(
                     f"    {loop_handles}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
                 )
@@ -657,7 +638,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             MLIR_OPT, intermediate_memref_path,
             # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
             # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
-            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
+            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,func.func(lower-vector-multi-reduction),convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 

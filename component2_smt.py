@@ -221,9 +221,9 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     
     TASK:
     You must generate exactly 3 DIFFERENT optimization strategy scripts for this CPU target:
-    1. L1 Cache Optimized (Aggressive deep tiling into very small blocks to fit entirely in L1, followed by vectorization).
-    2. L2 Cache Optimized (Moderate tiling sizes, prioritizing continuous memory scans).
-    3. SIMD-Optimized (Tile the innermost loops to a multiple of 4 or 8, then vectorize the resulting inner loops. NEVER vectorize untiled loops, as it will crash the compiler).
+    1. L1 Cache Optimized: Deep tiling of spatial loops into very small blocks (e.g., 8, 16) to fit entirely in the CPU L1 cache.
+    2. L2 Cache Optimized: Moderate tiling sizes (e.g., 64, 128), prioritizing continuous memory scans for the L2 cache.
+    3. Hardware Fallback: Do not tile at all. Leave the loops intact and let the LLVM auto-vectorizer handle the entire workload natively.
 
     CRITICAL API CONSTRAINTS:
     You must output a pure Python function named `apply_schedule(schedule)` using ONLY these API options:
@@ -232,34 +232,22 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
       (Finds a target operation handle).
     - `schedule.tile(target_var: str, tile_sizes: list[int]) -> str` 
       (Tiles the loop. CRITICAL: This returns a handle to the NEWLY TILED inner operations).
-    - `schedule.tile_reduction(target_var: str, tile_sizes: list[int]) -> str`
-      (Tiles a reduction operation like linalg.reduce using MapReduce partial sums logic. Returns a handle to the tiled loop).
-    - `schedule.generalize(target_var: str) -> str`
-      (Generalizes a Named Linalg Op like linalg.batch_matmul into a linalg.generic. MUST be called before tile_reduction on named ops).
-    - `schedule.vectorize(target_var: str)` 
-      (Forces SIMD vectorization. Apply this to the handle returned by schedule.tile).
 
     CRITICAL DYNAMIC SHAPE CONSTRAINTS:
     - The baseline MLIR graph contains SYMBOLIC DYNAMIC SHAPES (tensor<?x?xf32>).
     - When you call `schedule.tile()`, the compiler will automatically generate affine boundary checks (e.g., scf.if or affine.min) to handle uneven loop tails.
     - DO NOT attempt to mask or pad the data manually. Let the compiler handle the boundary geometry.
     - Prioritize cache-friendly tile sizes (e.g., 32, 64, 128) that divide cleanly into typical power-of-2 sequence lengths to minimize branch prediction penalties on the CPU.
-    
-    CRITICAL REDUCTION CONSTRAINTS:
-    - Named Operations (like `linalg.batch_matmul`) MUST be generalized using `schedule.generalize()` before applying `schedule.tile_reduction()`.
-    - DO NOT apply `schedule.tile_reduction()` to `linalg.generic` operations that have MULTIPLE outputs (such as the combined Max/Sum Softmax loop).
 
     FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
-        # 1. Isolate the mathematical hotspot
-        math_ops = schedule.match("linalg.matmul")
+        # 1. Tile batch_matmul for L2 cache
+        bmm_ops = schedule.match("linalg.batch_matmul")
+        schedule.tile(bmm_ops, tile_sizes=[1, 32, 32, 0])
         
-        # 2. Tile to fit inside CPU Cache bounds
-        # Save the returned handle to interact with the inner loops
-        tiled_inner_ops = schedule.tile(math_ops, tile_sizes=[32, 32, 32])
-        
-        # 3. Vectorize the inner loops for AVX/NEON SIMD execution
-        schedule.vectorize(tiled_inner_ops)
+        # 2. Tile generic parallel ops
+        generic_ops = schedule.match("linalg.generic")
+        schedule.tile(generic_ops, tile_sizes=[1, 1, 8])
 
     OUTPUT FORMAT:
     You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
@@ -519,8 +507,9 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     
     STRICT RULES FOR FIXING:
     - You MUST output a pure Python function named `apply_schedule(schedule)`.
-    - Use `schedule.generalize(target_var)` before tiling reductions on Named Linalg Ops (like `linalg.batch_matmul`).
-    - DO NOT apply `schedule.tile_reduction` to ops with multiple outputs (e.g., Softmax `linalg.generic`).
+    - DO NOT use `schedule.tile_reduction()`, `schedule.generalize()`, or `schedule.vectorize()`. Only use `schedule.tile()` for parallel loops.
+    - `schedule.tile` CANNOT tile reduction loops. The last dimension's tile size MUST be 0.
+    - If the error states that a handle was invalidated, it means you tried to apply another transform to a handle that was already consumed by `schedule.tile()`. You must use the NEW handle returned by `schedule.tile()` for subsequent inner-loop operations.
     - Output ONLY the corrected ```python block. Do not include apologies or explanations.
     """
     

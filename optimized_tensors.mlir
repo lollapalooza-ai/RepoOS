@@ -278,9 +278,8 @@ module attributes {transform.with_named_sequence} {
     } -> tensor<2x?x64xf32>
     return %66 : tensor<2x?x64xf32>
   }
-
-transform.named_sequence @__transform_main(%root: !transform.any_op) {
-
-    transform.yield
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
+    transform.yield 
+  }
 }
-}
+

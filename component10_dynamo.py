@@ -60,41 +60,21 @@ def to_true_dps(mlir_text: str) -> str:
 from torch.export import Dim
 from torch_mlir.extras.fx_importer import FxImporter
 
-def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list) -> str:
+def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list, dynamic_shapes: list = None) -> str:
     """
     Captures the MLIR graph with strictly symbolic dynamic dimensions.
     """
     from torch_mlir.fx import export_and_import
     from torch.export import Dim
     
-    dynamic_shapes = []
-    
-    # Create a unique Dim for each unique size we see to satisfy PyTorch's constraint solver
-    size_to_dim = {}
-    dim_counter = 0
-    
-    # Map symbolic variables to the input tensors
-    for i, arg in enumerate(example_inputs):
-        if isinstance(arg, torch.Tensor):
-            shape_dict = {}
-            for d, size in enumerate(arg.shape):
-                if size not in size_to_dim:
-                    size_to_dim[size] = Dim(f"dim_{dim_counter}")
-                    dim_counter += 1
-                shape_dict[d] = size_to_dim[size]
-            dynamic_shapes.append(shape_dict)
-        else:
-            dynamic_shapes.append(None)
-
     print("DYNAMO GM CODE:")
     print(gm.code)
     
-    # We will pass dynamic_shapes=None for now to bypass the PyTorch validation bug!
-    # PyTorch Dynamo already manages shape recompilation automatically.
+    # We now pass the dynamic shapes properly to allow varying sequence lengths.
     base_mlir_module = export_and_import(
         gm, *example_inputs,
         output_type="linalg-on-tensors",
-        dynamic_shapes=None
+        dynamic_shapes=dynamic_shapes
     )
     return str(base_mlir_module)
 
@@ -102,7 +82,7 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
     print(f"\n[Dynamo] 🧠 Intercepted Graph. Target Device: {TARGET_DEVICE}")
     
     # 1. THE ALGORITHM (Dynamic Symbolic Shapes)
-    base_mlir_module_str = capture_dynamic_mlir(gm, example_inputs)
+    base_mlir_module_str = capture_dynamic_mlir(gm, example_inputs, dynamic_shapes=None)
     base_mlir_text = to_true_dps(base_mlir_module_str)
     
     kernel_id = abs(hash(base_mlir_text))
