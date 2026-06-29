@@ -13,7 +13,7 @@ from component10_dynamo import to_true_dps, CACHE_DIR, capture_dynamic_mlir
 from component5_orchestrator import pack_tensor_to_memref
 
 # AI workload parameters
-MATRIX_SIZE = 512
+MATRIX_SIZE = 128
 BENCHMARK_ITERATIONS = 3
 
 # We use the same simple workload
@@ -113,7 +113,11 @@ async def compile_variants():
     base_dylib = os.path.join(CACHE_DIR, "bench_base.so")
     print("\n2. Compiling Baseline MLIR...")
     await apply_ai_transform_and_compile(base_mlir_text, "", base_dylib, is_gpu=False)
-    if os.path.exists(base_dylib): dylibs.append(("Baseline", base_dylib))
+    
+    # Always insert Native PyTorch first!
+    dylibs.append(("PyTorch Native (MKL/BLAS)", "native_python"))
+    
+    if os.path.exists(base_dylib): dylibs.append(("RepoOS Unoptimized (Scalar MLIR)", base_dylib))
     
     # Compile variants
     from component9_aot import RepoOSSchedule, safe_execute_schedule
@@ -153,7 +157,7 @@ if __name__ == "__main__":
     if args.use_variant:
         dylibs = []
         if args.use_variant == "all":
-            dylibs.append(("Native Python", "native_python"))
+            pass # Handled by compile_variants or explicit check
         if args.use_variant in ["all", "all_variants"]:
             for f in sorted(os.listdir(CACHE_DIR)):
                 if f.startswith("bench_") and f.endswith(".so"):

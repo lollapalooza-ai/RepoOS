@@ -110,6 +110,12 @@ class RepoOSSchedule:
         )
         return gen_op
 
+    def vectorize(self, target_var: str):
+        """Applies AVX SIMD vectorization."""
+        self.instructions.append(
+            f"    transform.structured.vectorize {target_var} : !transform.any_op"
+        )
+
     def build_mlir(self) -> str:
         """Compiles the Python instructions into a valid Transform Dialect block."""
         formatted_instructions = []
@@ -117,8 +123,12 @@ class RepoOSSchedule:
             if isinstance(inst, tuple) and inst[0] == "tile":
                 _, loop_handles, tiled_op, target_var, tile_sizes = inst
                 sizes_str = ", ".join(map(str, tile_sizes))
+                num_loops = sum(1 for s in tile_sizes if s > 0)
+                if num_loops == 0: num_loops = 1 # Safety fallback
+                type_str = ", ".join(["!transform.any_op"] * (num_loops + 1))
+                loop_def = f"{loop_handles}:{num_loops}" if num_loops > 1 else f"{loop_handles}"
                 formatted_instructions.append(
-                    f"    {loop_handles}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
+                    f"    {tiled_op}, {loop_def} = transform.structured.tile_using_for {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> ({type_str})"
                 )
             elif isinstance(inst, tuple) and inst[0] == "tile_reduction":
                 _, fill_op, split_op, comb_op, for_op, target_var, tile_sizes = inst

@@ -140,12 +140,37 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
         compiled_dylibs.append(base_dylib_path)
 
     # 5. MICRO-BENCHMARK THE SURVIVORS
-    print(f"[Dynamo] 🏁 Racing {len(compiled_dylibs)} compiled kernels to find the Speed of Light (SoL)...")
-    
+    import psutil
+    process = psutil.Process(os.getpid())
+    print(f"\n\n--- [Isolated Benchmarking Phase - {TARGET_DEVICE}] ---")
+    print(f"{'Variant Name':<30} | {'Speed (ms)':<10} | {'CPU Time (ms)':<13} | {'Memory (MB)':<12} | {'Correct'}")
+    print("-" * 90)
+
     best_dylib = compiled_dylibs[0]
     best_time = float('inf')
     best_kernel_func = None
-    
+
+    # Benchmark Native PyTorch (Baseline)
+    try:
+        # Warmup
+        for _ in range(2):
+            gm(*example_inputs)
+        
+        start_time = time.perf_counter()
+        start_cpu = process.cpu_times()
+        for _ in range(10):
+            gm(*example_inputs)
+        end_time = time.perf_counter()
+        end_cpu = process.cpu_times()
+        
+        avg_time_base = ((end_time - start_time) / 10.0) * 1000
+        cpu_time_base = (((end_cpu.user - start_cpu.user) + (end_cpu.system - start_cpu.system)) / 10.0) * 1000
+        mem_base = process.memory_info().rss / (1024 * 1024)
+        print(f"{'Native PyTorch':<30} | {avg_time_base:10.4f} | {cpu_time_base:13.4f} | {mem_base:12.2f} | True")
+    except Exception as e:
+        print(f"{'Native PyTorch':<30} | {'CRASHED':<10} | {'-':<13} | {'-':<12} | False")
+        print(f"      ❌ Benchmark failed for Native PyTorch: {e}")
+
     for dylib in compiled_dylibs:
         try:
             lib = ctypes.CDLL(dylib)
@@ -177,26 +202,44 @@ async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inpu
             structs.append(memref_out)
             kernel_args.append(ctypes.byref(memref_out))
                 
-            # Warmup
+            # Compute expected output to verify match
+            expected_out = gm(*example_inputs)
+            if isinstance(expected_out, tuple):
+                expected_out = expected_out[0]
+                
+            # Warmup & Match check
             k_func(*kernel_args)
+            is_correct = bool(torch.allclose(torch.from_numpy(bench_arr), expected_out, atol=1.0))
+            result_str = "Match" if is_correct else "Mismatch"
             
             # Benchmark (10 iterations)
             start_time = time.perf_counter()
+            start_cpu = process.cpu_times()
             for _ in range(10):
                 k_func(*kernel_args)
-            avg_time = (time.perf_counter() - start_time) / 10.0
+            end_time = time.perf_counter()
+            end_cpu = process.cpu_times()
             
-            print(f"      🏎️  {os.path.basename(dylib)}: {avg_time*1000:.4f} ms")
+            avg_time = ((end_time - start_time) / 10.0) * 1000
+            cpu_time = (((end_cpu.user - start_cpu.user) + (end_cpu.system - start_cpu.system)) / 10.0) * 1000
+            mem_usage = process.memory_info().rss / (1024 * 1024)
             
-            if avg_time < best_time:
-                best_time = avg_time
+            variant_name = os.path.basename(dylib)
+            print(f"{variant_name:<30} | {avg_time:10.4f} | {cpu_time:13.4f} | {mem_usage:12.2f} | {result_str}")
+            
+            # In time context, we compare in seconds
+            avg_time_sec = avg_time / 1000.0
+            if avg_time_sec < best_time:
+                best_time = avg_time_sec
                 best_dylib = dylib
                 best_kernel_func = k_func
                 
         except Exception as e:
+            variant_name = os.path.basename(dylib)
+            print(f"{variant_name:<30} | {'CRASHED':<10} | {'-':<13} | {'-':<12} | False")
             print(f"      ❌ Benchmark failed for {dylib}: {e}")
 
-    print(f"[Dynamo] 🏆 Winner: {os.path.basename(best_dylib)} ({best_time*1000:.4f} ms)")
+    print(f"\n[Dynamo] 🏆 Winner: {os.path.basename(best_dylib)} ({best_time*1000:.4f} ms)")
     kernel_func = best_kernel_func
 
     def optimized_forward(*args):

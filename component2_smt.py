@@ -232,22 +232,27 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
       (Finds a target operation handle).
     - `schedule.tile(target_var: str, tile_sizes: list[int]) -> str` 
       (Tiles the loop. CRITICAL: This returns a handle to the NEWLY TILED inner operations).
+    - `schedule.vectorize(target_var: str)`
+      (Applies AVX SIMD vectorization to the operation handle).
 
     CRITICAL DYNAMIC SHAPE CONSTRAINTS:
     - The baseline MLIR graph contains SYMBOLIC DYNAMIC SHAPES (tensor<?x?xf32>).
     - When you call `schedule.tile()`, the compiler will automatically generate affine boundary checks (e.g., scf.if or affine.min) to handle uneven loop tails.
     - DO NOT attempt to mask or pad the data manually. Let the compiler handle the boundary geometry.
     - Prioritize cache-friendly tile sizes (e.g., 32, 64, 128) that divide cleanly into typical power-of-2 sequence lengths to minimize branch prediction penalties on the CPU.
+    - ALWAYS vectorize the inner tiled operations for L1 and L2 variants using `schedule.vectorize()` to achieve massive AVX speedups.
 
     FEW-SHOT EXAMPLE OF A VALID CPU STRATEGY SCRIPT:
     def apply_schedule(schedule):
-        # 1. Tile batch_matmul for L2 cache
+        # 1. Tile and Vectorize batch_matmul for L2 cache
         bmm_ops = schedule.match("linalg.batch_matmul")
-        schedule.tile(bmm_ops, tile_sizes=[1, 32, 32, 0])
+        tiled_bmm = schedule.tile(bmm_ops, tile_sizes=[1, 32, 32, 0])
+        schedule.vectorize(tiled_bmm)
         
-        # 2. Tile generic parallel ops
+        # 2. Tile and Vectorize generic parallel ops
         generic_ops = schedule.match("linalg.generic")
-        schedule.tile(generic_ops, tile_sizes=[1, 1, 8])
+        tiled_generic = schedule.tile(generic_ops, tile_sizes=[1, 1, 8])
+        schedule.vectorize(tiled_generic)
 
     OUTPUT FORMAT:
     You MUST output a raw JSON array containing exactly 3 strings. Each string is the raw Python code for one of the variants.
@@ -507,9 +512,10 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     
     STRICT RULES FOR FIXING:
     - You MUST output a pure Python function named `apply_schedule(schedule)`.
-    - DO NOT use `schedule.tile_reduction()`, `schedule.generalize()`, or `schedule.vectorize()`. Only use `schedule.tile()` for parallel loops.
+    - DO NOT use `schedule.tile_reduction()` or `schedule.generalize()`. 
+    - Only use `schedule.tile()` for parallel loops, and `schedule.vectorize()` on the returned handles.
     - `schedule.tile` CANNOT tile reduction loops. The last dimension's tile size MUST be 0.
-    - If the error states that a handle was invalidated, it means you tried to apply another transform to a handle that was already consumed by `schedule.tile()`. You must use the NEW handle returned by `schedule.tile()` for subsequent inner-loop operations.
+    - If the error states that a handle was invalidated, it means you tried to apply another transform to a handle that was already consumed by `schedule.tile()`. You must use the NEW handle returned by `schedule.tile()` for subsequent inner-loop operations (like vectorize).
     - Output ONLY the corrected ```python block. Do not include apologies or explanations.
     """
     

@@ -58,7 +58,11 @@ async def compile_variants():
     base_dylib = os.path.join(CACHE_DIR, "nanogpt_base.so")
     print("\n2. Compiling Baseline MLIR...")
     await apply_ai_transform_and_compile(base_mlir_text, "", base_dylib, is_gpu=False)
-    if os.path.exists(base_dylib): dylibs.append(("Baseline", base_dylib))
+    
+    # Always insert Native PyTorch first!
+    dylibs.append(("PyTorch Native (MKL/BLAS)", "native_python"))
+    
+    if os.path.exists(base_dylib): dylibs.append(("RepoOS Unoptimized (Scalar MLIR)", base_dylib))
     
     # Compile variants
     from component9_aot import RepoOSSchedule, safe_execute_schedule
@@ -76,6 +80,30 @@ async def compile_variants():
             print(f"Skipping Variant {idx+1} due to error: {e}")
             
     return dylibs
+
+def measure_native_execution(seq_len: int):
+    torch.set_num_threads(1)
+    process = psutil.Process(os.getpid())
+    torch.manual_seed(42)
+    q = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)
+    k = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)
+    v = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)
+    model = NanoGPTSelfAttention()
+    
+    out = model(q, k, v)
+    is_correct = True
+    
+    start_time = time.perf_counter()
+    start_cpu = process.cpu_times()
+    for _ in range(BENCHMARK_ITERATIONS):
+        model(q, k, v)
+    end_time = time.perf_counter()
+    end_cpu = process.cpu_times()
+    
+    avg_time = ((end_time - start_time) / BENCHMARK_ITERATIONS) * 1000
+    cpu_time = (((end_cpu.user - start_cpu.user) + (end_cpu.system - start_cpu.system)) / BENCHMARK_ITERATIONS) * 1000
+    mem_usage = process.memory_info().rss / (1024 * 1024)
+    return avg_time, cpu_time, mem_usage, is_correct
 
 def measure_isolated_execution(dylib_path: str, seq_len: int):
     torch.set_num_threads(1)
@@ -131,11 +159,15 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--measure":
         dylib_path = sys.argv[2]
         seq_len = int(sys.argv[3])
-        avg_time, cpu, mem, is_correct = measure_isolated_execution(dylib_path, seq_len)
+        if dylib_path == "native_python":
+            avg_time, cpu, mem, is_correct = measure_native_execution(seq_len)
+        else:
+            avg_time, cpu, mem, is_correct = measure_isolated_execution(dylib_path, seq_len)
         # We append a slice of the tensor to the CSV output (just the first 2 elements of the first row of batch 1)
         # to prevent crashing the terminal with massive 1024x64 arrays
         import torch
         # We need the actual array to print it, so we'll re-run a fast test inline just to grab the data
+        torch.manual_seed(42)
         q = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)
         k = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)
         v = torch.randn((BATCH_SIZE, seq_len, HEAD_DIM), dtype=torch.float32)

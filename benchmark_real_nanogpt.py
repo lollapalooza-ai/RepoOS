@@ -1,7 +1,16 @@
 import os
+# Telemetry Isolation: Disable background thread pools to measure true single-core performance
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import sys
 import torch
 import torch.nn.functional as F
+
+torch.set_num_threads(1)
 
 # 1. Setup paths to include RepoOS components and nanoGPT
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +27,7 @@ def benchmark_real_nanogpt():
     
     # Create a small configuration for testing compilation speed and accuracy
     config = GPTConfig(
-        block_size=128,
+        block_size=500,
         vocab_size=50304,
         n_layer=2,
         n_head=4,
@@ -59,7 +68,7 @@ def benchmark_real_nanogpt():
 
     # 5. Run the models!
     batch_size = 2
-    seq_len = 8
+    seq_len = 500
     
     # Random token indices
     idx = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.long)
