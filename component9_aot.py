@@ -485,7 +485,7 @@ def strip_transform_dialect(mlir_text: str) -> str:
     # We strip from its start until the end, then ensure the module is closed.
     return mlir_text[:idx].rstrip() + "\n}\n"
 
-async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False, python_script: str = None):
+async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False, python_script: str = None, bucket_size: int = 0):
     """
     3-Stage Hybrid Backend Pipeline:
     1. tm_tensor Scrub (torch-mlir-opt) -> Pure Linalg Tensors
@@ -677,7 +677,34 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         
         with open("kernel.ll", "w") as f: f.write(sanitized_ir)
 
-        subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib, "-lm"], check=True)
+        OPENMP_THRESHOLD = 512
+        
+        clang_cmd = [
+            CLANG, 
+            "-O3", 
+            "-march=native", 
+            "-ffast-math"
+        ]
+
+        if bucket_size >= OPENMP_THRESHOLD:
+            print(f"[Compiler] Bucket {bucket_size} >= {OPENMP_THRESHOLD}. Enabling Polly & OpenMP Multi-Threading.")
+            clang_cmd.extend([
+                "-fopenmp", 
+                "-mllvm", "-polly", 
+                "-mllvm", "-polly-parallel"
+            ])
+        else:
+            print(f"[Compiler] Bucket {bucket_size} < {OPENMP_THRESHOLD}. Forcing strict Serial Execution (L1 Cache Locality).")
+
+        clang_cmd.extend([
+            "-shared", 
+            "-fPIC", 
+            "kernel.ll", 
+            "-o", output_dylib, 
+            "-lm"
+        ])
+        
+        subprocess.run(clang_cmd, check=True)
         print(f"[Compiler] ✅ Native library generated: {output_dylib}")
 
     except subprocess.CalledProcessError as e:

@@ -59,7 +59,7 @@ def benchmark_real_nanogpt():
 
     # 5. Run the models!
     batch_size = 2
-    seq_len = 8
+    seq_len = 128
     
     # Random token indices
     idx = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.long)
