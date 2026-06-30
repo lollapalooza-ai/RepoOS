@@ -1,320 +1,44 @@
 import torch
-import torch_mlir
-import os
-import asyncio
-import ctypes
-import re
-from typing import Callable
-from component2_smt import generate_inference_transforms
-from component9_aot import apply_ai_transform_and_compile
-from component5_orchestrator import pack_tensor_to_memref
+import torch.nn.functional as F
 
-# --- GLOBAL CONFIGURATION ---
-# Set to "NVIDIA H100" for GPU (requires real hardware)
-# Set to "x86_64 Linux" for CPU (Bare-metal execution on this machine)
-TARGET_DEVICE = "x86_64 Linux"
-
-CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def repoos_inference_backend(gm: torch.fx.GraphModule, example_inputs: list) -> Callable:
+class RepoOSBucketRouter(torch.nn.Module):
     """
-    Dynamo Backend: Programmatic Lowering + AI Benchmarking Search.
-    This entry point is strictly isolated to the INFERENCE track.
+    Phase 1: The Pre-Pad Shield.
+    Isolates the compiler from PyTorch's dynamic shape tracing (SymInts).
     """
-    return asyncio.run(_repoos_inference_backend_async(gm, example_inputs))
+    def __init__(self, core_attention_stack, buckets=[128, 256, 512, 1024]):
+        super().__init__()
+        self.buckets = sorted(buckets)
+        
+        # CRITICAL: dynamic=False forces Dynamo to trace a pristine, static graph.
+        from component9_aot import egraph_inference_backend
+        self.fused_stack = torch.compile(
+            core_attention_stack, 
+            backend=egraph_inference_backend, 
+            dynamic=False
+        )
 
-def to_true_dps(mlir_text: str) -> str:
-    """
-    Surgically transforms a standard functional MLIR module into True DPS.
-    1. Adds an output tensor as the LAST argument.
-    2. Replaces the internal tensor.empty() with that argument.
-    """
-    # Find the main function signature
-    match = re.search(r"func.func @main\((.*?)\)\s*->\s*(tensor<.*?>)", mlir_text)
-    if not match: return mlir_text
-    
-    args = match.group(1)
-    ret_type = match.group(2)
-    
-    # Determine the next argument index
-    arg_count = len(re.findall(r"%arg\d+", args))
-    out_arg = f"%arg{arg_count}"
-    
-    # Update signature: add out_arg
-    new_args = args + f", {out_arg}: {ret_type}"
-    mlir_text = mlir_text.replace(f"func.func @main({args})", f"func.func @main({new_args})")
-    
-    # Replace ONLY the final internal tensor.empty with the out_arg.
-    # If there are multiple tensor.empty (e.g., intermediate matrices in NanoGPT), 
-    # we leave them alone so MLIR can memref.alloc them properly.
-    ret_type_escaped = re.escape(ret_type)
-    pattern = r"(%[a-zA-Z0-9_]+) = tensor\.empty\([^)]*\)\s*:\s*" + ret_type_escaped
-    matches = list(re.finditer(pattern, mlir_text))
-    if matches:
-        last_match = matches[-1]
-        mlir_text = mlir_text[:last_match.start()] + f"{last_match.group(1)} = tensor.cast {out_arg} : {ret_type} to {ret_type}" + mlir_text[last_match.end():]
-    
-    return mlir_text
+    def _get_bucket(self, seq_len: int) -> int:
+        for b in self.buckets:
+            if seq_len <= b: return b
+        return self.buckets[-1]
 
-from torch.export import Dim
-from torch_mlir.extras.fx_importer import FxImporter
-
-def capture_dynamic_mlir(gm: torch.fx.GraphModule, example_inputs: list, dynamic_shapes: list = None) -> str:
-    """
-    Captures the MLIR graph with strictly symbolic dynamic dimensions.
-    """
-    from torch_mlir.fx import export_and_import
-    from torch.export import Dim
-    
-    print("DYNAMO GM CODE:")
-    print(gm.code)
-    
-    # We now pass the dynamic shapes properly to allow varying sequence lengths.
-    base_mlir_module = export_and_import(
-        gm, *example_inputs,
-        output_type="linalg-on-tensors",
-        dynamic_shapes=dynamic_shapes
-    )
-    return str(base_mlir_module)
-
-async def _repoos_inference_backend_async(gm: torch.fx.GraphModule, example_inputs: list) -> Callable:
-    print(f"\n[Dynamo] 🧠 Intercepted Graph. Target Device: {TARGET_DEVICE}")
-    
-    # 1. THE ALGORITHM (Dynamic Symbolic Shapes)
-    base_mlir_module_str = capture_dynamic_mlir(gm, example_inputs, dynamic_shapes=None)
-    base_mlir_text = to_true_dps(base_mlir_module_str)
-    
-    kernel_id = abs(hash(base_mlir_text))
-    base_dylib_path = os.path.join(CACHE_DIR, f"kernel_{kernel_id}_base.so")
-    
-    # 2. VERIFY BASE COMPILABILITY
-    print("[Dynamo] 🛡️ Verifying base programmatic MLIR compilability...")
-    is_gpu = (TARGET_DEVICE == "NVIDIA H100")
-    
-    # Calculate bucket_size (typically seq_len is dim 1 for transformer inputs)
-    bucket_size = 0
-    if len(example_inputs) > 0 and hasattr(example_inputs[0], 'shape'):
-        if len(example_inputs[0].shape) >= 2:
-            bucket_size = example_inputs[0].shape[1]
+    def forward(self, x):
+        # x shape is usually (Batch, Seq_Len, Embed_Dim)
+        seq_len = x.shape[1]
+        target_len = self._get_bucket(seq_len)
+        
+        pad_amount = target_len - seq_len
+        if pad_amount > 0:
+            # Pad the sequence dimension (dim 1)
+            x_pad = F.pad(x, (0, 0, 0, pad_amount), "constant", 0.0)
         else:
-            bucket_size = example_inputs[0].shape[0]
+            x_pad = x
 
-    await apply_ai_transform_and_compile(
-        base_mlir_text, "", base_dylib_path, is_gpu=is_gpu, bucket_size=bucket_size
-    )
-    
-    if not os.path.exists(base_dylib_path):
-        raise RuntimeError("CRITICAL: Base programmatic MLIR failed deterministic lowering.")
+        # Hit the AOT cache (or trigger compilation on first run)
+        out_pad = self.fused_stack(x_pad)
 
-    print(f"[Dynamo] 🤖 Base programmatic MLIR compiled successfully. Consulting Oracle for {TARGET_DEVICE} Optimization Schedules...")
-
-    # 3. THE SCHEDULE (AI Heuristics)
-    transform_scripts = await generate_inference_transforms(base_mlir_text, TARGET_DEVICE)
-    
-    # 4. BENCHMARKING SEARCH (EQUALITY SATURATION)
-    from component9_aot import safe_execute_schedule, RepoOSSchedule
-    import time
-    
-    compiled_dylibs = []
-    
-    # Try all AI-generated schedules
-    for idx, transform_script in enumerate(transform_scripts):
-        variant_dylib = os.path.join(CACHE_DIR, f"kernel_{kernel_id}_v{idx}.so")
-        print(f"[Dynamo] Compiling AI Schedule Variant {idx+1}/{len(transform_scripts)}...")
-        
-        try:
-            schedule = RepoOSSchedule()
-            safe_execute_schedule(transform_script, schedule)
-            transform_mlir = schedule.build_mlir()
-        except Exception as e:
-            print(f"[Dynamo] ⚠️ Sandbox rejected AI script: {e}")
-            continue
-
-        try:
-            await apply_ai_transform_and_compile(
-                base_mlir_text, transform_mlir, variant_dylib, is_gpu=is_gpu, python_script=transform_script, bucket_size=bucket_size
-            )
-            if os.path.exists(variant_dylib):
-                compiled_dylibs.append(variant_dylib)
-                print(f"[Dynamo] ✅ Variant {idx+1} successfully compiled.")
-        except Exception as e:
-            print(f"[Dynamo] ⚠️ Compiler rejected AI script during MLIR lowering: {e}")
-            continue
-
-    # Fallback or explicit include
-    # To match other benchmarks, we should ALWAYS include the base MLIR so we can see the relative speedup
-    print("[Dynamo] ℹ️ Injecting programmatic base for relative speedup comparison.")
-    compiled_dylibs.append(base_dylib_path)
-
-    # 5. MICRO-BENCHMARK THE SURVIVORS
-    import psutil
-    process = psutil.Process(os.getpid())
-    print(f"\n\n--- [Isolated Benchmarking Phase - {TARGET_DEVICE}] ---")
-    print(f"{'Variant Name':<32} | {'Speed (ms)':<10} | {'CPU Time (ms)':<13} | {'CPUs Used':<9} | {'Memory (MB)':<12} | {'Correct'}")
-    print("-" * 102)
-
-    best_dylib = compiled_dylibs[0]
-    best_time = float('inf')
-    best_kernel_func = None
-
-    # Benchmark Native PyTorch (Baseline)
-    try:
-        # Warmup
-        for _ in range(2):
-            gm(*example_inputs)
-        
-        start_time = time.perf_counter()
-        start_cpu = process.cpu_times()
-        for _ in range(10):
-            gm(*example_inputs)
-        end_time = time.perf_counter()
-        end_cpu = process.cpu_times()
-        
-        avg_time_base = ((end_time - start_time) / 10.0) * 1000
-        cpu_time_base = (((end_cpu.user - start_cpu.user) + (end_cpu.system - start_cpu.system)) / 10.0) * 1000
-        cpus_used_base = cpu_time_base / avg_time_base if avg_time_base > 0 else 0.0
-        mem_base = process.memory_info().rss / (1024 * 1024)
-        print(f"{'PyTorch Native (MKL/BLAS)':<32} | {avg_time_base:10.4f} | {cpu_time_base:13.4f} | {cpus_used_base:9.1f} | {mem_base:12.2f} | True")
-    except Exception as e:
-        print(f"{'PyTorch Native (MKL/BLAS)':<32} | {'CRASHED':<10} | {'-':<13} | {'-':<9} | {'-':<12} | False")
-        print(f"      ❌ Benchmark failed for Native PyTorch: {e}")
-
-    for dylib in compiled_dylibs:
-        try:
-            lib = ctypes.CDLL(dylib)
-            k_func = lib._mlir_ciface_main if hasattr(lib, "_mlir_ciface_main") else lib.main
-            k_func.restype = ctypes.c_void_p
-            
-            # Prepare args for the micro-benchmark
-            kernel_args = []
-            numpy_arrays = []
-            structs = []
-            for arg in example_inputs:
-                if not isinstance(arg, torch.Tensor): continue
-                arr = arg.detach().cpu().numpy()
-                numpy_arrays.append(arr)
-                memref = pack_tensor_to_memref(arg)
-                structs.append(memref)
-                kernel_args.append(ctypes.byref(memref))
-            
-            # THE FIX: Also pass the output buffer for the benchmark
-            with torch.device('meta'):
-                meta_args = [a.to('meta') if isinstance(a, torch.Tensor) else a for a in example_inputs]
-                meta_out = gm(*meta_args)
-            if isinstance(meta_out, tuple):
-                meta_out = meta_out[0]
-            bench_res = torch.zeros(meta_out.shape, dtype=meta_out.dtype, device=example_inputs[0].device)
-            bench_arr = bench_res.detach().cpu().numpy()
-            numpy_arrays.append(bench_arr)
-            memref_out = pack_tensor_to_memref(bench_res)
-            structs.append(memref_out)
-            kernel_args.append(ctypes.byref(memref_out))
-                
-            # Compute expected output to verify match
-            expected_out = gm(*example_inputs)
-            if isinstance(expected_out, tuple):
-                expected_out = expected_out[0]
-                
-            # Warmup & Match check
-            k_func(*kernel_args)
-            is_correct = bool(torch.allclose(torch.from_numpy(bench_arr), expected_out, atol=1.0))
-            result_str = "Match" if is_correct else "Mismatch"
-            
-            # Benchmark (10 iterations)
-            start_time = time.perf_counter()
-            start_cpu = process.cpu_times()
-            for _ in range(10):
-                k_func(*kernel_args)
-            end_time = time.perf_counter()
-            end_cpu = process.cpu_times()
-            
-            avg_time = ((end_time - start_time) / 10.0) * 1000
-            cpu_time = (((end_cpu.user - start_cpu.user) + (end_cpu.system - start_cpu.system)) / 10.0) * 1000
-            cpus_used = cpu_time / avg_time if avg_time > 0 else 0.0
-            mem_usage = process.memory_info().rss / (1024 * 1024)
-            
-            variant_name = os.path.basename(dylib)
-            if variant_name.endswith("_base.so"):
-                variant_name = "RepoOS Unoptimized (Scalar MLIR)"
-            print(f"{variant_name:<32} | {avg_time:10.4f} | {cpu_time:13.4f} | {cpus_used:9.1f} | {mem_usage:12.2f} | {result_str}")
-            
-            # In time context, we compare in seconds
-            avg_time_sec = avg_time / 1000.0
-            if avg_time_sec < best_time:
-                best_time = avg_time_sec
-                best_dylib = dylib
-                best_kernel_func = k_func
-                
-        except Exception as e:
-            variant_name = os.path.basename(dylib)
-            print(f"{variant_name:<32} | {'CRASHED':<10} | {'-':<13} | {'-':<9} | {'-':<12} | False")
-            print(f"      ❌ Benchmark failed for {dylib}: {e}")
-
-    print(f"[Dynamo] 🏆 Winner: {os.path.basename(best_dylib)} ({best_time*1000:.4f} ms)")
-    kernel_func = best_kernel_func
-
-    def optimized_forward(*args):
-        is_prod = os.getenv("REPOOS_ENV") == "prod"
-        
-        # --- SAFE FALLBACK PATH (PROD ONLY) ---
-        if not kernel_func:
-            if is_prod:
-                print("[Runtime] 🛡️ Using Safe Fallback: Executing via Torch FX Graph")
-                res = gm(*args)
-                return res if isinstance(res, (list, tuple)) else [res]
-            else:
-                raise RuntimeError("CRITICAL: FFI Binding failed and REPOOS_ENV != 'prod'. Check .so kernel and ctypes mapping.")
-
-        # --- BARE-METAL HARDWARE PATH ---
-        try:
-            print(f"[Runtime] Invoking Bare-Metal Kernel: {best_dylib}")
-            
-            # THE FIX: Destination-Passing Style (DPS)
-            # We pre-allocate the output buffer in Python and pass it to the kernel.
-            # In our 'to_true_dps', we added it as the LAST argument.
-            kernel_args = []
-            numpy_arrays = []
-            structs = []
-            
-            # 1. Prepare Inputs
-            for arg in args:
-                if not isinstance(arg, torch.Tensor): continue
-                arr = arg.detach().cpu().numpy()
-                numpy_arrays.append(arr)
-                memref = pack_tensor_to_memref(arg)
-                structs.append(memref)
-                kernel_args.append(ctypes.byref(memref))
-            
-            # 2. Allocate and Prepare Output Tensor using Meta Shape Inference
-            with torch.device('meta'):
-                meta_args = [a.to('meta') if isinstance(a, torch.Tensor) else a for a in args]
-                meta_out = gm(*meta_args)
-            
-            if isinstance(meta_out, tuple):
-                meta_out = meta_out[0]
-                
-            res_torch = torch.zeros(meta_out.shape, dtype=meta_out.dtype, device=args[0].device)
-            res_arr = res_torch.detach().cpu().numpy()
-            numpy_arrays.append(res_arr)
-            memref_res = pack_tensor_to_memref(res_torch)
-            structs.append(memref_res)
-            kernel_args.append(ctypes.byref(memref_res))
-
-            # 3. Execute machine code
-            kernel_func(*kernel_args)
-
-            # 4. Sync result back to PyTorch
-            res = torch.from_numpy(res_arr)
-            return [res]
-
-        except Exception as e:
-            if is_prod:
-                print(f"[Runtime] ⚠️ Bare-Metal Execution Failed: {e}. Falling back to Torch.")
-                res = gm(*args)
-                return res if isinstance(res, (list, tuple)) else [res]
-            else:
-                print(f"[Runtime] ❌ Bare-Metal Execution Failed: {e}")
-                raise e
-        
-    return optimized_forward
+        # Slice off padding
+        if pad_amount > 0:
+            return out_pad[:, :seq_len, :]
+        return out_pad

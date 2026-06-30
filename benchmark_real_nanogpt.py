@@ -7,11 +7,11 @@ import torch.nn.functional as F
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanoGPT"))
 
-# Import our orchestrator
-from component10_dynamo import repoos_inference_backend
-
 # Import Karpathy's nanoGPT
 from nanoGPT.model import GPT, GPTConfig
+
+# Import our new V2 Routing Shield
+from component10_dynamo import RepoOSBucketRouter
 
 class MacroBlock(torch.nn.Module):
     def __init__(self, h_list):
@@ -21,28 +21,6 @@ class MacroBlock(torch.nn.Module):
         for block in self.h:
             x = block(x)
         return x
-
-class BucketRouter(torch.nn.Module):
-    def __init__(self, h_list, bucket_size=1024):
-        super().__init__()
-        self.bucket_size = bucket_size
-        self.compiled_macro = torch.compile(
-            MacroBlock(h_list), 
-            backend=repoos_inference_backend,
-            dynamic=False # MUST be False to prevent SymInt MLIR crashes
-        )
-        
-    def forward(self, x):
-        seq_len = x.size(1)
-        if seq_len < self.bucket_size:
-            pad_len = self.bucket_size - seq_len
-            x = F.pad(x, (0, 0, 0, pad_len))
-            out = self.compiled_macro(x)
-            return out[:, :seq_len, :]
-        elif seq_len == self.bucket_size:
-            return self.compiled_macro(x)
-        else:
-            raise ValueError(f"Input size {seq_len} exceeds bucket size {self.bucket_size}")
 
 def benchmark_real_nanogpt():
     print("🚀 Initializing Real NanoGPT from Karpathy's Repo...")
@@ -81,9 +59,9 @@ def benchmark_real_nanogpt():
 
     # 4. Inject RepoOS AI Compiler specifically onto the Transformer Blocks (Graph Break Mandate!)
     print("💉 Injecting RepoOS AOT Compiler into Transformer Blocks (Macro-Fusion)...")
-    # Wrap the entire ModuleList in the BucketRouter and replace the list with a single element
+    # Wrap the entire ModuleList in the RepoOSBucketRouter and replace the list with a single element
     compiled_model.transformer.h = torch.nn.ModuleList([
-        BucketRouter(compiled_model.transformer.h, bucket_size=1024)
+        RepoOSBucketRouter(MacroBlock(compiled_model.transformer.h), buckets=[1024])
     ])
 
     # 5. Run the models!
