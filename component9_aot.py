@@ -624,21 +624,82 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             # We also strip the transform dialect here.
             memref_text = open(intermediate_memref_path).read()
             
-            # HACK: Convert memref.copy to linalg.copy so it can be lowered to loops.
-            # We use a greedy match until ' to ' to capture nested brackets in strided memrefs.
-            memref_text = re.sub(r"memref\.copy\s+(%[a-zA-Z0-9_]+),\s+(%[a-zA-Z0-9_]+)\s*:\s*(memref<.*>)\s+to\s+memref<.*>", 
-                                 r"linalg.copy ins(\1 : \3) outs(\2 : \3)", memref_text)
+            def repl_copy(m):
+                types = m.group(3).split(' to ')
+                if len(types) == 2:
+                    return f"linalg.copy ins({m.group(1)} : {types[0].strip()}) outs({m.group(2)} : {types[1].strip()})"
+                return m.group(0)
+            memref_text = re.sub(r"memref\.copy\s+(%[a-zA-Z0-9_]+),\s+(%[a-zA-Z0-9_]+)\s*:\s*(.+)", repl_copy, memref_text)
+            
+            # THE PROPER FIX: Safely strip alloca_scope boundaries by brace matching
+            def strip_alloca_scope(text):
+                lines = text.split('\n')
+                out_lines = []
+                scope_depths = []
+                current_depth = 0
+                for line in lines:
+                    if 'memref.alloca_scope' in line and '{' in line:
+                        scope_depths.append(current_depth)
+                        current_depth += line.count('{') - line.count('}')
+                        continue
+                    
+                    if 'memref.alloca_scope.return' in line:
+                        continue
+                        
+                    prev_depth = current_depth
+                    current_depth += line.count('{') - line.count('}')
+                    
+                    if scope_depths and current_depth <= scope_depths[-1]:
+                        scope_depths.pop()
+                        continue
+                        
+                    out_lines.append(line)
+                return '\n'.join(out_lines)
+            
+            memref_text = strip_alloca_scope(memref_text)
             
             memref_text = prune_abi_to_void(memref_text)
             memref_text = strip_transform_dialect(memref_text)
             with open(intermediate_memref_path, "w") as f: f.write(memref_text)
 
         print("[Compiler] Stage 3B: Applying Bare Pointer ABI...")
+        # Stage 1: Lower down to OpenMP and Loops
+        stage1_path = "temp_stage1.mlir"
         subprocess.run([
             MLIR_OPT, intermediate_memref_path,
-            # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
-            # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
-            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,func.func(lower-vector-multi-reduction),convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)",
+            "--pass-pipeline=builtin.module("
+            "canonicalize,"
+            "scf-forall-to-parallel,"
+            "convert-scf-to-openmp,"
+            "memref-expand,"
+            "convert-linalg-to-loops,"
+            "expand-strided-metadata,"
+            "lower-affine)",
+            "-o", stage1_path
+        ], check=True)
+        
+        # INTERCEPT: OpenMP lowering generates a pesky alloca_scope that breaks convert-scf-to-cf.
+        # We strip it out here before it crashes the CFG.
+        stage1_text = open(stage1_path).read()
+        stage1_text = strip_alloca_scope(stage1_text)
+        with open(stage1_path, "w") as f: f.write(stage1_text)
+
+        # Stage 2: Lower SCF to CF and finally to LLVM
+        subprocess.run([
+            MLIR_OPT, stage1_path,
+            "--pass-pipeline=builtin.module("
+            "convert-scf-to-cf,"
+            "convert-openmp-to-llvm,"
+            "convert-cf-to-llvm,"
+            "convert-vector-to-llvm,"
+            "convert-arith-to-llvm,"
+            "convert-math-to-llvm,"
+            "convert-math-to-libm,"
+            "convert-index-to-llvm,"
+            "convert-ub-to-llvm,"
+            "finalize-memref-to-llvm,"
+            "convert-func-to-llvm,"
+            "reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 
@@ -677,7 +738,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         
         with open("kernel.ll", "w") as f: f.write(sanitized_ir)
 
-        OPENMP_THRESHOLD = 512
+        OPENMP_THRESHOLD = 128
         
         clang_cmd = [
             CLANG, 

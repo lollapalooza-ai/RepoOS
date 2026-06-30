@@ -13,12 +13,43 @@ from component10_dynamo import repoos_inference_backend
 # Import Karpathy's nanoGPT
 from nanoGPT.model import GPT, GPTConfig
 
+class MacroBlock(torch.nn.Module):
+    def __init__(self, h_list):
+        super().__init__()
+        self.h = h_list
+    def forward(self, x):
+        for block in self.h:
+            x = block(x)
+        return x
+
+class BucketRouter(torch.nn.Module):
+    def __init__(self, h_list, bucket_size=1024):
+        super().__init__()
+        self.bucket_size = bucket_size
+        self.compiled_macro = torch.compile(
+            MacroBlock(h_list), 
+            backend=repoos_inference_backend,
+            dynamic=False # MUST be False to prevent SymInt MLIR crashes
+        )
+        
+    def forward(self, x):
+        seq_len = x.size(1)
+        if seq_len < self.bucket_size:
+            pad_len = self.bucket_size - seq_len
+            x = F.pad(x, (0, 0, 0, pad_len))
+            out = self.compiled_macro(x)
+            return out[:, :seq_len, :]
+        elif seq_len == self.bucket_size:
+            return self.compiled_macro(x)
+        else:
+            raise ValueError(f"Input size {seq_len} exceeds bucket size {self.bucket_size}")
+
 def benchmark_real_nanogpt():
     print("🚀 Initializing Real NanoGPT from Karpathy's Repo...")
     
     # Create a small configuration for testing compilation speed and accuracy
     config = GPTConfig(
-        block_size=128,
+        block_size=1024,
         vocab_size=50304,
         n_layer=2,
         n_head=4,
@@ -49,17 +80,15 @@ def benchmark_real_nanogpt():
     compiled_model.eval()
 
     # 4. Inject RepoOS AI Compiler specifically onto the Transformer Blocks (Graph Break Mandate!)
-    print("💉 Injecting RepoOS AOT Compiler into Transformer Blocks...")
-    for i in range(len(compiled_model.transformer.h)):
-        # We compile EACH block individually
-        compiled_model.transformer.h[i] = torch.compile(
-            compiled_model.transformer.h[i], 
-            backend=repoos_inference_backend
-        )
+    print("💉 Injecting RepoOS AOT Compiler into Transformer Blocks (Macro-Fusion)...")
+    # Wrap the entire ModuleList in the BucketRouter and replace the list with a single element
+    compiled_model.transformer.h = torch.nn.ModuleList([
+        BucketRouter(compiled_model.transformer.h, bucket_size=1024)
+    ])
 
     # 5. Run the models!
     batch_size = 2
-    seq_len = 128
+    seq_len = 1024
     
     # Random token indices
     idx = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.long)
