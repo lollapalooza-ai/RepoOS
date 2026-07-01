@@ -241,7 +241,48 @@ def egraph_inference_backend(gm: torch.fx.GraphModule, example_inputs: list):
             "-o", "memref.mlir"
         ], check=True)
         
-        memref_text = open("memref.mlir").read()
+        # --- UKERNEL INTERCEPT STAGE ---
+        with open("memref.mlir", "r") as f:
+            memref_text = f.read()
+
+        import re
+        pattern = r"linalg\.batch_matmul\s+ins\(([^,]+),\s*([^:]+)\s*:\s*(.+?),\s*(memref<.+)\)\s*outs\(([^:]+)\s*:\s*(.+)\)"
+        
+        ukernel_count = [0]
+        def ukernel_replacer(m):
+            a_var = m.group(1).strip()
+            b_var = m.group(2).strip()
+            a_type = m.group(3).strip()
+            b_type = m.group(4).strip()
+            c_var = m.group(5).strip()
+            c_type = m.group(6).strip()
+            
+            idx = ukernel_count[0]
+            ukernel_count[0] += 1
+            
+            dyn_type = "memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>"
+            
+            res = f"%A_cast_{idx} = memref.cast {a_var} : {a_type} to {dyn_type}\n"
+            res += f"    %B_cast_{idx} = memref.cast {b_var} : {b_type} to {dyn_type}\n"
+            res += f"    %C_cast_{idx} = memref.cast {c_var} : {c_type} to {dyn_type}\n"
+            res += f"    func.call @ukernel_bmm(%A_cast_{idx}, %B_cast_{idx}, %C_cast_{idx}) : ({dyn_type}, {dyn_type}, {dyn_type}) -> ()"
+            return res
+            
+        memref_text = re.sub(pattern, ukernel_replacer, memref_text)
+        
+        if ukernel_count[0] > 0:
+            dyn_type = "memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>"
+            func_decl = f"func.func private @ukernel_bmm({dyn_type}, {dyn_type}, {dyn_type})\n"
+            last_brace_idx = memref_text.rfind('}')
+            if last_brace_idx != -1:
+                memref_text = memref_text[:last_brace_idx] + func_decl + memref_text[last_brace_idx:]
+            else:
+                memref_text += f"\n{func_decl}"
+            
+        with open("memref.mlir", "w") as f:
+            f.write(memref_text)
+        # -------------------------------
+
         memref_text = prune_abi_to_void(memref_text)
         with open("memref.mlir", "w") as f: f.write(memref_text)
 
@@ -295,7 +336,8 @@ def egraph_inference_backend(gm: torch.fx.GraphModule, example_inputs: list):
             print(f"[Compiler] Warning: Could not evaluate seq_len: {e}. Enabling OpenMP anyway for safety.")
             clang_cmd.extend(["-fopenmp", "-mllvm", "-polly", "-mllvm", "-polly-parallel"])
             
-        clang_cmd.extend(["-shared", "-fPIC", "kernel.ll", "-o", dylib_path, "-lm"])
+        ukernel_path = os.path.abspath("ukernel.so")
+        clang_cmd.extend(["-shared", "-fPIC", "kernel.ll", ukernel_path, f"-Wl,-rpath={os.path.dirname(ukernel_path)}", "-o", dylib_path, "-lm"])
         subprocess.run(clang_cmd, check=True)
         compiled_dylibs.append(dylib_path)
 

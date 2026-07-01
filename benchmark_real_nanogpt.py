@@ -1,4 +1,6 @@
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "4"
 import sys
 import torch
 import torch.nn.functional as F

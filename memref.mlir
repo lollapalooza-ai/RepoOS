@@ -107,7 +107,10 @@ module {
     linalg.fill ins(%cst : f32) outs(%alloc_15 : memref<2x1024x384xf32>)
     %alloc_16 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x384xf32>
     memref.copy %alloc_15, %alloc_16 : memref<2x1024x384xf32> to memref<2x1024x384xf32>
-    linalg.batch_matmul ins(%arg27, %alloc_13 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>, memref<2x128x384xf32>) outs(%alloc_16 : memref<2x1024x384xf32>)
+    %A_cast_0 = memref.cast %arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_0 = memref.cast %alloc_13 : memref<2x128x384xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_0 = memref.cast %alloc_16 : memref<2x1024x384xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_0, %B_cast_0, %C_cast_0) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_16, %arg4 : memref<2x1024x384xf32>, memref<384xf32, strided<[?], offset: ?>>) outs(%alloc_14 : memref<2x1024x384xf32>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -131,7 +134,10 @@ module {
     linalg.fill ins(%cst : f32) outs(%alloc_26 : memref<8x1024x1024xf32>)
     %alloc_27 = memref.alloc() {alignment = 64 : i64} : memref<8x1024x1024xf32>
     memref.copy %alloc_26, %alloc_27 : memref<8x1024x1024xf32> to memref<8x1024x1024xf32>
-    linalg.batch_matmul ins(%collapse_shape_24, %collapse_shape_25 : memref<8x1024x32xf32>, memref<8x32x1024xf32>) outs(%alloc_27 : memref<8x1024x1024xf32>)
+    %A_cast_1 = memref.cast %collapse_shape_24 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_1 = memref.cast %collapse_shape_25 : memref<8x32x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_1 = memref.cast %alloc_27 : memref<8x1024x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_1, %B_cast_1, %C_cast_1) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     %expand_shape_28 = memref.expand_shape %alloc_27 [[0, 1], [2], [3]] output_shape [2, 4, 1024, 1024] : memref<8x1024x1024xf32> into memref<2x4x1024x1024xf32>
     %alloc_29 = memref.alloc() {alignment = 64 : i64} : memref<2x4x1024x1024xf32>
     linalg.generic {indexing_maps = [#map5, #map5], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%expand_shape_28 : memref<2x4x1024x1024xf32>) outs(%alloc_29 : memref<2x4x1024x1024xf32>) {
@@ -199,7 +205,10 @@ module {
     linalg.fill ins(%cst : f32) outs(%alloc_40 : memref<8x1024x32xf32>)
     %alloc_41 = memref.alloc() {alignment = 64 : i64} : memref<8x1024x32xf32>
     memref.copy %alloc_40, %alloc_41 : memref<8x1024x32xf32> to memref<8x1024x32xf32>
-    linalg.batch_matmul ins(%collapse_shape_38, %collapse_shape_39 : memref<8x1024x1024xf32>, memref<8x1024x32xf32>) outs(%alloc_41 : memref<8x1024x32xf32>)
+    %A_cast_2 = memref.cast %collapse_shape_38 : memref<8x1024x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_2 = memref.cast %collapse_shape_39 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_2 = memref.cast %alloc_41 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_2, %B_cast_2, %C_cast_2) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     %expand_shape_42 = memref.expand_shape %alloc_41 [[0, 1], [2], [3]] output_shape [2, 4, 1024, 32] : memref<8x1024x32xf32> into memref<2x4x1024x32xf32>
     %alloc_43 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x4x32xf32>
     linalg.transpose ins(%expand_shape_42 : memref<2x4x1024x32xf32>) outs(%alloc_43 : memref<2x1024x4x32xf32>) permutation = [0, 2, 1, 3] 
@@ -215,7 +224,10 @@ module {
     linalg.fill ins(%cst : f32) outs(%alloc_47 : memref<2x1024x128xf32>)
     %alloc_48 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x128xf32>
     memref.copy %alloc_47, %alloc_48 : memref<2x1024x128xf32> to memref<2x1024x128xf32>
-    linalg.batch_matmul ins(%collapse_shape_44, %alloc_46 : memref<2x1024x128xf32>, memref<2x128x128xf32>) outs(%alloc_48 : memref<2x1024x128xf32>)
+    %A_cast_3 = memref.cast %collapse_shape_44 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_3 = memref.cast %alloc_46 : memref<2x128x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_3 = memref.cast %alloc_48 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_3, %B_cast_3, %C_cast_3) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_48, %arg7 : memref<2x1024x128xf32>, memref<128xf32, strided<[?], offset: ?>>) outs(%arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -310,7 +322,10 @@ module {
     linalg.fill ins(%cst : f32) outs(%alloc_58 : memref<2x1024x512xf32>)
     %alloc_59 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x512xf32>
     memref.copy %alloc_58, %alloc_59 : memref<2x1024x512xf32> to memref<2x1024x512xf32>
-    linalg.batch_matmul ins(%arg27, %alloc_56 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>, memref<2x128x512xf32>) outs(%alloc_59 : memref<2x1024x512xf32>)
+    %A_cast_4 = memref.cast %arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_4 = memref.cast %alloc_56 : memref<2x128x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_4 = memref.cast %alloc_59 : memref<2x1024x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_4, %B_cast_4, %C_cast_4) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_59, %arg11 : memref<2x1024x512xf32>, memref<512xf32, strided<[?], offset: ?>>) outs(%alloc_57 : memref<2x1024x512xf32>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -334,7 +349,10 @@ module {
     }
     %alloc_62 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x128xf32>
     memref.copy %alloc_47, %alloc_62 : memref<2x1024x128xf32> to memref<2x1024x128xf32>
-    linalg.batch_matmul ins(%alloc_57, %alloc_61 : memref<2x1024x512xf32>, memref<2x512x128xf32>) outs(%alloc_62 : memref<2x1024x128xf32>)
+    %A_cast_5 = memref.cast %alloc_57 : memref<2x1024x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_5 = memref.cast %alloc_61 : memref<2x512x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_5 = memref.cast %alloc_62 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_5, %B_cast_5, %C_cast_5) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_62, %arg13 : memref<2x1024x128xf32>, memref<128xf32, strided<[?], offset: ?>>) outs(%arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -422,7 +440,10 @@ module {
     ^bb0(%in: f32, %out: f32):
       linalg.yield %in : f32
     }
-    linalg.batch_matmul ins(%arg27, %alloc_13 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>, memref<2x128x384xf32>) outs(%alloc_15 : memref<2x1024x384xf32>)
+    %A_cast_6 = memref.cast %arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_6 = memref.cast %alloc_13 : memref<2x128x384xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_6 = memref.cast %alloc_15 : memref<2x1024x384xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_6, %B_cast_6, %C_cast_6) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_15, %arg17 : memref<2x1024x384xf32>, memref<384xf32, strided<[?], offset: ?>>) outs(%alloc_14 : memref<2x1024x384xf32>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -440,7 +461,10 @@ module {
     linalg.transpose ins(%expand_shape_72 : memref<2x1024x4x32xf32, strided<[393216, 384, 32, 1], offset: 128>>) outs(%alloc_23 : memref<2x4x32x1024xf32>) permutation = [0, 2, 3, 1] 
     %collapse_shape_76 = memref.collapse_shape %alloc_74 [[0, 1], [2], [3]] : memref<2x4x1024x32xf32> into memref<8x1024x32xf32>
     %collapse_shape_77 = memref.collapse_shape %alloc_23 [[0, 1], [2], [3]] : memref<2x4x32x1024xf32> into memref<8x32x1024xf32>
-    linalg.batch_matmul ins(%collapse_shape_76, %collapse_shape_77 : memref<8x1024x32xf32>, memref<8x32x1024xf32>) outs(%alloc_26 : memref<8x1024x1024xf32>)
+    %A_cast_7 = memref.cast %collapse_shape_76 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_7 = memref.cast %collapse_shape_77 : memref<8x32x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_7 = memref.cast %alloc_26 : memref<8x1024x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_7, %B_cast_7, %C_cast_7) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     %expand_shape_78 = memref.expand_shape %alloc_26 [[0, 1], [2], [3]] output_shape [2, 4, 1024, 1024] : memref<8x1024x1024xf32> into memref<2x4x1024x1024xf32>
     linalg.generic {indexing_maps = [#map5, #map5], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%expand_shape_78 : memref<2x4x1024x1024xf32>) outs(%alloc_29 : memref<2x4x1024x1024xf32>) {
     ^bb0(%in: f32, %out: f32):
@@ -490,7 +514,10 @@ module {
     }
     %collapse_shape_80 = memref.collapse_shape %alloc_29 [[0, 1], [2], [3]] : memref<2x4x1024x1024xf32> into memref<8x1024x1024xf32>
     %collapse_shape_81 = memref.collapse_shape %alloc_20 [[0, 1], [2], [3]] : memref<2x4x1024x32xf32> into memref<8x1024x32xf32>
-    linalg.batch_matmul ins(%collapse_shape_80, %collapse_shape_81 : memref<8x1024x1024xf32>, memref<8x1024x32xf32>) outs(%alloc_40 : memref<8x1024x32xf32>)
+    %A_cast_8 = memref.cast %collapse_shape_80 : memref<8x1024x1024xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_8 = memref.cast %collapse_shape_81 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_8 = memref.cast %alloc_40 : memref<8x1024x32xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_8, %B_cast_8, %C_cast_8) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     %expand_shape_82 = memref.expand_shape %alloc_40 [[0, 1], [2], [3]] output_shape [2, 4, 1024, 32] : memref<8x1024x32xf32> into memref<2x4x1024x32xf32>
     linalg.transpose ins(%expand_shape_82 : memref<2x4x1024x32xf32>) outs(%alloc_43 : memref<2x1024x4x32xf32>) permutation = [0, 2, 1, 3] 
     %collapse_shape_83 = memref.collapse_shape %alloc_43 [[0], [1], [2, 3]] : memref<2x1024x4x32xf32> into memref<2x1024x128xf32>
@@ -501,7 +528,10 @@ module {
     }
     %alloc_84 = memref.alloc() {alignment = 64 : i64} : memref<2x1024x128xf32>
     memref.copy %alloc_47, %alloc_84 : memref<2x1024x128xf32> to memref<2x1024x128xf32>
-    linalg.batch_matmul ins(%collapse_shape_83, %alloc_46 : memref<2x1024x128xf32>, memref<2x128x128xf32>) outs(%alloc_84 : memref<2x1024x128xf32>)
+    %A_cast_9 = memref.cast %collapse_shape_83 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_9 = memref.cast %alloc_46 : memref<2x128x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_9 = memref.cast %alloc_84 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_9, %B_cast_9, %C_cast_9) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_84, %arg20 : memref<2x1024x128xf32>, memref<128xf32, strided<[?], offset: ?>>) outs(%arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -587,7 +617,10 @@ module {
     ^bb0(%in: f32, %out: f32):
       linalg.yield %in : f32
     }
-    linalg.batch_matmul ins(%arg27, %alloc_56 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>, memref<2x128x512xf32>) outs(%alloc_58 : memref<2x1024x512xf32>)
+    %A_cast_10 = memref.cast %arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_10 = memref.cast %alloc_56 : memref<2x128x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_10 = memref.cast %alloc_58 : memref<2x1024x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_10, %B_cast_10, %C_cast_10) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_58, %arg24 : memref<2x1024x512xf32>, memref<512xf32, strided<[?], offset: ?>>) outs(%alloc_57 : memref<2x1024x512xf32>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -607,7 +640,10 @@ module {
     ^bb0(%in: f32, %out: f32):
       linalg.yield %in : f32
     }
-    linalg.batch_matmul ins(%alloc_57, %alloc_61 : memref<2x1024x512xf32>, memref<2x512x128xf32>) outs(%alloc_47 : memref<2x1024x128xf32>)
+    %A_cast_11 = memref.cast %alloc_57 : memref<2x1024x512xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %B_cast_11 = memref.cast %alloc_61 : memref<2x512x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    %C_cast_11 = memref.cast %alloc_47 : memref<2x1024x128xf32> to memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>
+    func.call @ukernel_bmm(%A_cast_11, %B_cast_11, %C_cast_11) : (memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>) -> ()
     linalg.generic {indexing_maps = [#map, #map3, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%alloc_47, %arg26 : memref<2x1024x128xf32>, memref<128xf32, strided<[?], offset: ?>>) outs(%arg27 : memref<2x1024x128xf32, strided<[?, ?, ?], offset: ?>>) {
     ^bb0(%in: f32, %in_90: f32, %out: f32):
       %1 = arith.addf %in, %in_90 : f32
@@ -620,5 +656,6 @@ module {
     }
     return
   }
+func.func private @ukernel_bmm(memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>, memref<?x?x?xf32, strided<[?, ?, ?], offset: ?>>)
 }
 
