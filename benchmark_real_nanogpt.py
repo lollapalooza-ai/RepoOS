@@ -74,13 +74,31 @@ def benchmark_real_nanogpt():
     idx = torch.randint(0, config.vocab_size, (batch_size, seq_len), dtype=torch.long)
     
     print("\n▶️ Running Native PyTorch (Baseline)...")
+    import time
     with torch.no_grad():
+        # Warmup
+        model(idx)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        
+        start_t = time.perf_counter()
         expected_logits, _ = model(idx)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        end_t = time.perf_counter()
+        pytorch_time = (end_t - start_t) * 1000
+    print(f"PyTorch Time: {pytorch_time:.2f} ms")
         
     print("\n▶️ Running Compiled RepoOS (AOT)...")
-    # This will trigger compilation on the first forward pass
     with torch.no_grad():
+        # Warmup & Compile
+        compiled_model(idx)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        
+        start_t = time.perf_counter()
         compiled_logits, _ = compiled_model(idx)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        end_t = time.perf_counter()
+        repoos_time = (end_t - start_t) * 1000
+    print(f"RepoOS Time: {repoos_time:.2f} ms")
         
     print("\n✅ Execution Complete!")
     
