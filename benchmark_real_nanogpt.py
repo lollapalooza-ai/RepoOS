@@ -75,16 +75,29 @@ def benchmark_real_nanogpt():
     
     print("\n▶️ Running Native PyTorch (Baseline)...")
     import time
+    import tracemalloc
+    
     with torch.no_grad():
         # Warmup
         model(idx)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         
+        tracemalloc.start()
         start_t = time.perf_counter()
+        start_cpu = time.process_time()
+        
         expected_logits, _ = model(idx)
+        
         torch.cuda.synchronize() if torch.cuda.is_available() else None
+        end_cpu = time.process_time()
         end_t = time.perf_counter()
+        _, peak_mem_pt = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        
         pytorch_time = (end_t - start_t) * 1000
+        pytorch_cpu = (end_cpu - start_cpu) * 1000
+        pytorch_mem = peak_mem_pt / (1024 * 1024)
+        
     print(f"PyTorch Time: {pytorch_time:.2f} ms")
         
     print("\n▶️ Running Compiled RepoOS (AOT)...")
@@ -93,21 +106,38 @@ def benchmark_real_nanogpt():
         compiled_model(idx)
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         
+        tracemalloc.start()
         start_t = time.perf_counter()
+        start_cpu = time.process_time()
+        
         compiled_logits, _ = compiled_model(idx)
+        
         torch.cuda.synchronize() if torch.cuda.is_available() else None
+        end_cpu = time.process_time()
         end_t = time.perf_counter()
+        _, peak_mem_repo = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        
         repoos_time = (end_t - start_t) * 1000
+        repoos_cpu = (end_cpu - start_cpu) * 1000
+        repoos_mem = peak_mem_repo / (1024 * 1024)
+        
     print(f"RepoOS Time: {repoos_time:.2f} ms")
         
     print("\n✅ Execution Complete!")
     
     # 6. Verify Correctness
-    # The output from a full transformer has accumulated precision drift across multiple blocks.
-    # We will use an absolute tolerance of 1.0 just to check structural correctness.
     diff = torch.max(torch.abs(expected_logits - compiled_logits)).item()
-    print(f"Maximum absolute difference between PyTorch and RepoOS Native: {diff:.6f}")
     
+    # Generate Table
+    print("\n" + "="*85)
+    print(f"{'Variant':<20} | {'Wall Time (ms)':<15} | {'CPU Time (ms)':<15} | {'Memory (MB)':<12} | {'Input Size':<12}")
+    print("-" * 85)
+    print(f"{'Native PyTorch':<20} | {pytorch_time:<15.2f} | {pytorch_cpu:<15.2f} | {pytorch_mem:<12.2f} | {batch_size}x{seq_len}")
+    print(f"{'RepoOS Mega-UKernel':<20} | {repoos_time:<15.2f} | {repoos_cpu:<15.2f} | {repoos_mem:<12.2f} | {batch_size}x{seq_len}")
+    print("="*85)
+    
+    print(f"\nMaximum absolute difference between PyTorch and RepoOS Native: {diff:.6f}")
     if diff < 2.0:
         print("🎉 SUCCESS! RepoOS successfully compiled and executed Karpathy's Real NanoGPT!")
     else:
