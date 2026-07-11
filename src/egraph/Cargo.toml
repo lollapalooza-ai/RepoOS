@@ -1,0 +1,12 @@
+[package]
+name = "repo_os_egraph"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "repo_os_egraph"
+crate-type = ["cdylib"]
+
+[dependencies]
+egg = "0.9.4"
+pyo3 = { version = "0.19.0", features = ["extension-module"] }
