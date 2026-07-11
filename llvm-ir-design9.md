@@ -1,27 +1,27 @@
 # Milestone 9.0 - The total transformation
 
 ## Part 1 : Background:
-Here is a deep architectural analysis of Luminal, how we extract its superpowers, and exactly how we rebuild the Repo OS V2 Inference Track to achieve our ultimate goal: obliterating PyTorch's performance by eliminating kernel launch overhead.
+Here is a deep architectural analysis of ProjectX, how we extract its superpowers, and exactly how we rebuild the Repo OS V2 Inference Track to achieve our ultimate goal: obliterating PyTorch's performance by eliminating kernel launch overhead.
 
-Part 1: The Luminal Analysis (Why it Wins)
-Luminal achieves bare-metal speed without LLVM, without heuristics, and without an AI Oracle. It does this through three radical design choices:
+Part 1: The ProjectX Analysis (Why it Wins)
+ProjectX achieves bare-metal speed without LLVM, without heuristics, and without an AI Oracle. It does this through three radical design choices:
 
 The Micro-Primitive ISA (~15 Ops): PyTorch has over 2,000 distinct operations (aten::matmul, aten::softmax, aten::gelu, etc.). MLIR has dozens of dialects.
-Luminal reduces the entire universe of deep learning down to just ~15 primitive mathematical operations (Add, Mul, Exp, Mod, SumReduce, MaxReduce, etc.). By shrinking the vocabulary, the compiler becomes incredibly simple and robust.
+ProjectX reduces the entire universe of deep learning down to just ~15 primitive mathematical operations (Add, Mul, Exp, Mod, SumReduce, MaxReduce, etc.). By shrinking the vocabulary, the compiler becomes incredibly simple and robust.
 
 Equality Saturation (E-Graphs):
-Instead of using a brittle, hand-written heuristic (like LLVM's Polly) or an AI to guess how to optimize a loop, Luminal uses E-Graphs. It takes a mathematical formula, applies a set of strict algebraic rewrite rules, and mechanically generates thousands of mathematically equivalent graphs. It then searches for the one with the fewest memory reads. It is 100% deterministic and mathematically proven to be correct.
+Instead of using a brittle, hand-written heuristic (like LLVM's Polly) or an AI to guess how to optimize a loop, ProjectX uses E-Graphs. It takes a mathematical formula, applies a set of strict algebraic rewrite rules, and mechanically generates thousands of mathematically equivalent graphs. It then searches for the one with the fewest memory reads. It is 100% deterministic and mathematically proven to be correct.
 
 Macro-Fusion (The PyTorch Killer):
-Because Luminal understands the math fundamentally, it can look at a Matrix Multiply, a LayerNorm, and a GELU, and use the E-Graph to mathematically fuse them into a single hardware kernel. The data never leaves the GPU SRAM / CPU L1 Cache.
+Because ProjectX understands the math fundamentally, it can look at a Matrix Multiply, a LayerNorm, and a GELU, and use the E-Graph to mathematically fuse them into a single hardware kernel. The data never leaves the GPU SRAM / CPU L1 Cache.
 
-Part 2: The Flaw in Pure Luminal (Why we still need AI)
-If Luminal is so perfect, why don't we just copy it 1:1 and fire the AI Oracle?
+Part 2: The Flaw in Pure ProjectX (Why we still need AI)
+If ProjectX is so perfect, why don't we just copy it 1:1 and fire the AI Oracle?
 
 1. The Search Space Explosion: E-Graphs suffer from combinatorial explosion. If you feed an entire NanoGPT block into an E-Graph without guidance, it will generate billions of equivalent graphs and run out of RAM before it finds the optimal one.
-2. Semantic Blindness: Luminal requires you to write your model in its pristine Rust DSL. It cannot ingest messy, real-world enterprise Python, custom PyTorch subclasses, or dynamic routing logic.
+2. Semantic Blindness: ProjectX requires you to write your model in its pristine Rust DSL. It cannot ingest messy, real-world enterprise Python, custom PyTorch subclasses, or dynamic routing logic.
 
-The Middle Ground: We use the AI Oracle to solve the exact problems that Luminal cannot solve: Semantic Translation and Search Space Pruning.
+The Middle Ground: We use the AI Oracle to solve the exact problems that ProjectX cannot solve: Semantic Translation and Search Space Pruning.
 
 Part 3: The Transformed Architecture (Repo OS V2)
 We are going to throw away the brittle MLIR Transform Dialect (RepoOSSchedule). We will no longer ask the AI to write loop tiles or fight LLVM memory scopes.
@@ -31,7 +31,7 @@ Here is the new, E-Graph inspired hybrid architecture.
 Phase 1: Semantic Ingestion (The AI Oracle)
 The Input: Messy PyTorch / Enterprise Python (wrapped in our Pre-Pad Shield and Bucket Compilation).
 
-The Oracle's Job: Act as a Semantic Translator. It ingests the complex Python and translates it into a strict, minimalist mathematical graph of Micro-Primitives (the Luminal 15-Op standard).
+The Oracle's Job: Act as a Semantic Translator. It ingests the complex Python and translates it into a strict, minimalist mathematical graph of Micro-Primitives (the ProjectX 15-Op standard).
 
 Why it's better: The AI is no longer guessing hardware tiles. It is simply translating complex code into pure, undeniable math.
 
@@ -153,7 +153,7 @@ async def generate_egraph_policy(fx_graph_code: str) -> dict:
     
     TASK:
     Identify specific operation chains that should be fused by the E-Graph engine into single kernels.
-    Output ONLY a JSON configuration mapping targeting the Luminal Micro-Primitives.
+    Output ONLY a JSON configuration mapping targeting the ProjectX Micro-Primitives.
     
     Rules:
     - Target "Matmul + Add -> LinearFusion"
@@ -168,7 +168,7 @@ async def generate_egraph_policy(fx_graph_code: str) -> dict:
     }}
     """
     # ... call Gemini API and return the JSON dictionary ...
-NEW Component 3: component3_egraph.py (The Luminal Engine)
+NEW Component 3: component3_egraph.py (The ProjectX Engine)
 The Shift: This is the beating heart of V2. We use the egglog Python library to apply mathematical Equality Saturation. We define deep learning as a set of algebraic rewrites.
 
 The Code Blueprint:
@@ -178,7 +178,7 @@ Python
 import egglog
 from egglog import egraph, eq, rule, String
 
-# 1. Define the Luminal-style Micro-Primitives
+# 1. Define the ProjectX-style Micro-Primitives
 eg = egraph.EGraph()
 
 @egraph.class_

@@ -1,7 +1,7 @@
 use egg::{rewrite as rw, *};
 use pyo3::prelude::*;
 
-// 1. Define the Luminal 15-Op Micro-Primitives
+// 1. Define the ProjectX 15-Op Micro-Primitives
 define_language! {
     pub enum TensorLang {
         "matmul" = MatMul([Id; 2]),

@@ -15,7 +15,7 @@ async def generate_egraph_policy(fx_graph_code: str) -> dict:
     
     TASK:
     Identify specific operation chains that should be fused by the E-Graph engine into single kernels.
-    Output ONLY a JSON configuration mapping targeting the Luminal Micro-Primitives.
+    Output ONLY a JSON configuration mapping targeting the ProjectX Micro-Primitives.
     
     Rules:
     - Target "Matmul + Add -> LinearFusion"

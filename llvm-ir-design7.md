@@ -407,7 +407,7 @@ import json
 
 async def generate_inference_transforms(base_mlir_text: str, target_gpu: str) -> list[str]:
     """
-    The Luminal Parameterization Approach.
+    The ProjectX Parameterization Approach.
     The AI generates ONLY hardware configurations, never raw syntax.
     """
     prompt = f"""

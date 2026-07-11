@@ -264,3 +264,33 @@ Intermediate stages are preserved in `build_artifacts/` for debugging:
 ## Inference Benchmark
 *   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 test_inference.py`
 *   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 benchmark_variants.py`
+
+## Running Repo OS V2 Pipeline on GPU
+
+The Repo OS V2 Production pipeline introduces a native C++ Custom Op Dispatcher, a Rust-based E-Graph Equality Saturation engine, and a Triton-based Generalized Mega-UKernel library.
+
+### How to Run
+To execute the V2 orchestration pipeline, run the following command from the repository root:
+
+```bash
+export PYTHONPATH="/home/yeshr/repoos/projectrepo/src:$PYTHONPATH" && \
+/home/yeshr/repoos/projectrepo/build_venv/bin/python3 /home/yeshr/repoos/projectrepo/test_v2_pipeline.py
+```
+
+### Installation and Tooling
+To build and execute this pipeline, the following tools and dependencies were installed:
+*   **Rustup & Cargo**: The Rust toolchain required to compile the E-Graph engine.
+*   **Maturin**: Used to seamlessly compile the Rust crate into a native Python module (`repo_os_egraph`).
+*   **Triton**: The `triton` pip package to JIT compile the Python macro-fusion definitions into ultra-optimized GPU PTX code.
+*   **PyO3 & egg (Rust crates)**: Used for Python-Rust bindings and executing mathematical equality saturation over the PyTorch AST.
+
+### Test Results & Limitations
+During end-to-end testing, the PyTorch Dynamo backend successfully intercepted the graph, routed the S-expression to the Rust engine, extracted the `(fused_linear x w1 b)` macro-fusion plan, and swapped the native graph node for our Triton-backed C++ Custom Op (`torch.ops.repo_os.mega_mlp`). 
+
+**Where it failed:** 
+The script ultimately crashed during the Triton driver initialization with the error:
+`RuntimeError: 0 active drivers ([]). There should only be one.`
+This occurred because the test environment was CPU-only, and Triton requires an active GPU (NVIDIA or AMD) driver to compile and launch the kernel.
+
+**What was not tested yet:**
+Due to the lack of physical GPU hardware, the final JIT compilation to PTX and the physical execution of the fused kernels entirely within GPU SRAM has not yet been benchmarked or validated.

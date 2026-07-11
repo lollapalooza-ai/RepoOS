@@ -2,7 +2,7 @@ import sys
 import os
 import egglog as eg
 
-# 1. Define the Luminal Micro-Primitive ISA
+# 1. Define the ProjectX Micro-Primitive ISA
 class Tensor(eg.Expr):
     def __init__(self, name: eg.String): ...
     
