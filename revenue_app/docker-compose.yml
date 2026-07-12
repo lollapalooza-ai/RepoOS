@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: revenue_db
+      MYSQL_USER: revenue_user
+      MYSQL_PASSWORD: revenue_password
+    ports:
+      - "3306:3306"

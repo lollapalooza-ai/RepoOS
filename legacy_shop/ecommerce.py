@@ -1,7 +1,7 @@
 # legacy_shop/ecommerce.py
 import random
 
-def generate_payload(num_orders: int = 500000):
+def generate_payload(num_orders: int = 5000):
     """
     Generates a massive, fragmented list of nested Python dictionaries.
     This simulates a typical JSON payload from a database or API.
@@ -18,7 +18,7 @@ def generate_payload(num_orders: int = 500000):
                 "total_value": random.uniform(10.0, 500.0),
                 "item_count": random.randint(1, 10)
             },
-            "status": "PROCESSED"
+            "status": random.choice(["PROCESSED", "PENDING", "CANCELLED"])
         }
         orders.append(order)
     return orders
@@ -32,7 +32,7 @@ def calculate_vip_revenue(orders: bytes) -> float:
     data = json.loads(orders.decode('utf-8'))
     total_revenue = 0.0
     for order in data:
-        if order["user"]["is_vip"]:
+        if order["user"]["is_vip"] and order["status"] == "PROCESSED":
             total_revenue += order["cart"]["total_value"]
             
     return total_revenue
