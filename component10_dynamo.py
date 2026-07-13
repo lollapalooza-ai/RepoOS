@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from component9_aot import egraph_inference_backend as repoos_inference_backend
 
 class RepoOSBucketRouter(torch.nn.Module):
     """

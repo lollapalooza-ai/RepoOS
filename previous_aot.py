@@ -37,8 +37,7 @@ class SafeScheduleValidator(ast.NodeVisitor):
         # Comprehensions
         ast.ListComp, ast.DictComp, ast.SetComp, ast.comprehension,
         # Strings
-        ast.FormattedValue, ast.JoinedStr,
-        ast.Return, ast.Import, ast.ImportFrom
+        ast.FormattedValue, ast.JoinedStr
     }
 
     def generic_visit(self, node):
@@ -86,30 +85,20 @@ class RepoOSSchedule:
         )
         return tiled_op
 
-    def tile_reduction(self, target_var: str, tile_sizes: list[int]) -> str:
+    def vectorize(self, target_var: str):
         """
-        Tiles a reduction operation (like Softmax/LayerNorm sum) securely using MapReduce logic.
+        Vectorizes the inner loop bounds to exploit native SIMD extensions.
+        We safely ignore the AI's specific target_var and apply robust 
+        pattern-based vectorization to the parent function to handle reductions safely.
         """
-        fill_op = self._next_var()
-        split_op = self._next_var()
-        comb_op = self._next_var()
-        for_op = self._next_var()
-        
+        self.vectorize_requested = True
+        func_var = self._next_var()
         self.instructions.append(
-            ("tile_reduction", fill_op, split_op, comb_op, for_op, target_var, tile_sizes)
+            f"    {func_var} = transform.structured.match ops{{[\"func.func\"]}} in %root : (!transform.any_op) -> !transform.any_op"
         )
-        return for_op
-
-    def generalize(self, target_var: str) -> str:
-        """
-        Generalizes a named operation (like linalg.batch_matmul) into a linalg.generic operation.
-        This is required before calling tile_reduction on named operations.
-        """
-        gen_op = self._next_var()
         self.instructions.append(
-            ("generalize", gen_op, target_var)
+            f"    transform.structured.vectorize_children_and_apply_patterns {func_var} : (!transform.any_op) -> !transform.any_op"
         )
-        return gen_op
 
     def build_mlir(self) -> str:
         """Compiles the Python instructions into a valid Transform Dialect block."""
@@ -117,20 +106,13 @@ class RepoOSSchedule:
         for inst in self.instructions:
             if isinstance(inst, tuple) and inst[0] == "tile":
                 _, loop_handles, tiled_op, target_var, tile_sizes = inst
-                sizes_str = ", ".join(map(str, tile_sizes))
+                effective_tile_sizes = tile_sizes
+                if self.vectorize_requested and any(x > 32 for x in tile_sizes):
+                    effective_tile_sizes = [min(x, 16) for x in tile_sizes]
+                    print(f"[Compiler Debug] Vectorization requested with large tile sizes {tile_sizes}. Capping to {effective_tile_sizes} to prevent compilation hang.")
+                sizes_str = ", ".join(map(str, effective_tile_sizes))
                 formatted_instructions.append(
                     f"    {loop_handles}, {tiled_op} = transform.structured.tile_using_forall {target_var} tile_sizes [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op)"
-                )
-            elif isinstance(inst, tuple) and inst[0] == "tile_reduction":
-                _, fill_op, split_op, comb_op, for_op, target_var, tile_sizes = inst
-                sizes_str = ", ".join(map(str, tile_sizes))
-                formatted_instructions.append(
-                    f"    {fill_op}, {split_op}, {comb_op}, {for_op} = transform.structured.tile_reduction_using_for {target_var} by tile_sizes = [{sizes_str}] : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)"
-                )
-            elif isinstance(inst, tuple) and inst[0] == "generalize":
-                _, gen_op, target_var = inst
-                formatted_instructions.append(
-                    f"    {gen_op} = transform.structured.generalize {target_var} : (!transform.any_op) -> !transform.any_op"
                 )
             else:
                 formatted_instructions.append(inst)
@@ -152,58 +134,6 @@ def escape_char(c):
     elif c == "\r":
         return "\\r"
     return c
-
-class RepoOSBranchingBuilder:
-    """
-    The Python Builder API for generating MLIR SCF and CF logic safely.
-    Guarantees correctly formatted struct definitions and function boundaries.
-    """
-    def __init__(self):
-        self.lines = []
-        self.indent = 1
-        self.struct_aliases = {}
-        self.is_fallback = False
-    
-    def fallback_to_python(self):
-        self.is_fallback = True
-    
-    def _add(self, code: str):
-        for line in code.strip().split('\n'):
-            self.lines.append("  " * self.indent + line)
-
-    def declare_struct(self, name: str, types: list[str]):
-        """Safely declares an LLVM struct, guaranteeing proper parenthesis syntax."""
-        t_str = ", ".join(types)
-        struct_type = f"!llvm.struct<({t_str})>"
-        self.struct_aliases[name] = struct_type
-        
-    def begin_function(self, name: str, arg_types: list[str], ret_types: list[str]):
-        """Safely opens a func.func block."""
-        args = ", ".join([f"%arg{i}: {t}" for i, t in enumerate(arg_types)])
-        rets = ", ".join(ret_types)
-        ret_suffix = f" -> ({rets})" if rets else ""
-        self.lines.append(f"func.func @{name}({args}){ret_suffix} {{")
-        self.indent += 1
-
-    def end_function(self):
-        """Safely closes a func.func block."""
-        self.indent -= 1
-        self.lines.append("  " * self.indent + "}")
-
-    def emit_op(self, op: str):
-        """Allows emitting operations inside the function body safely indented."""
-        self._add(op)
-
-    def build_mlir(self) -> str:
-        if self.is_fallback:
-            return "FALLBACK"
-        code = "module {\n" + "\n".join(self.lines) + "\n}\n"
-        for name, struct_type in self.struct_aliases.items():
-            code = code.replace(f"!llvm.ptr<{name}>", f"!llvm.ptr<{struct_type}>")
-            code = code.replace(f"!llvm.struct<{name}>", struct_type)
-            code = code.replace(f"!llvm.{name}", struct_type)
-            code = code.replace(f"<{name}>", f"<{struct_type}>")
-        return code
 
 class RepoOSFSMBuilder:
     """
@@ -421,22 +351,6 @@ extern "C" void _mlir_ciface_main(const char* data, size_t len, float* out) {{
 """
         return cpp_template
 
-def safe_execute_branching_schedule(ai_generated_python_code: str, builder: RepoOSBranchingBuilder):
-    """Safely parses and executes the AI Branching schedule via AST whitelist."""
-    tree = ast.parse(ai_generated_python_code)
-    
-    validator = SafeScheduleValidator()
-    validator.visit(tree) 
-    
-    local_scope = {}
-    compiled_code = compile(tree, filename="<ast>", mode="exec")
-    exec(compiled_code, {}, local_scope)
-    
-    if "build_branching" not in local_scope:
-        raise ValueError("AI failed to generate 'build_branching' function.")
-        
-    local_scope["build_branching"](builder)
-
 def safe_execute_fsm_schedule(ai_generated_python_code: str, fsm_builder: RepoOSFSMBuilder):
     """Safely parses and executes the AI FSM schedule via AST whitelist."""
     tree = ast.parse(ai_generated_python_code)
@@ -470,11 +384,10 @@ def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoO
     local_scope["apply_schedule"](schedule_builder)
 
 # Compiler Paths
-MLIR_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "llvm-project/build/bin"))
-TORCH_MLIR_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "torch-mlir/build/bin"))
+MLIR_DIR = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin"
 MLIR_OPT = os.path.join(MLIR_DIR, "mlir-opt")
 MLIR_TRANSLATE = os.path.join(MLIR_DIR, "mlir-translate")
-TORCH_MLIR_OPT = os.path.join(TORCH_MLIR_DIR, "torch-mlir-opt")
+TORCH_MLIR_OPT = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin/torch-mlir-opt"
 CLANG = "clang"
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -521,17 +434,11 @@ def prune_abi_to_void(mlir_text: str) -> str:
     Surgically removes return signatures to guarantee a C-compatible void kernel.
     Handles tensor, memref, and multi-value returns.
     """
-    # 1. Strip the return type (anything after ->) before the opening brace, and inject llvm.emit_c_interface
-    # This guarantees the function returns void AND generates the _mlir_ciface_main struct pointer wrapper
-    def repl(m):
-        func_decl = m.group(1)
-        return func_decl + " attributes {llvm.emit_c_interface} {"
-
+    # 1. Strip the return type (anything after ->) before the opening brace
     mlir_text = re.sub(
-        r"(func\.func\s+@[a-zA-Z0-9_\./]+\([^)]*\))(?:\s*->\s*[^\{]+)?\s*\{",
-        repl,
-        mlir_text,
-        count=1
+        r"(func\.func\s+@[a-zA-Z0-9_\./]+\(.*?\))\s*->\s*[^\{]+\{",
+        r"\1 {",
+        mlir_text
     )
     
     # 2. Strip the return operand
@@ -555,34 +462,30 @@ def strip_transform_dialect(mlir_text: str) -> str:
     # We strip from its start until the end, then ensure the module is closed.
     return mlir_text[:idx].rstrip() + "\n}\n"
 
-async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False, python_script: str = None, bucket_size: int = 0, is_pytorch: bool = True):
+async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, output_dylib: str, is_gpu: bool = False):
     """
     3-Stage Hybrid Backend Pipeline:
-    1. tm_tensor Scrub (torch-mlir-opt) -> Pure Linalg Tensors (Skip if not PyTorch)
+    1. tm_tensor Scrub (torch-mlir-opt) -> Pure Linalg Tensors
     2. AI Optimization (mlir-opt + Transform Dialect) -> Optimized Tensors
     3. Bufferization & Bare-Metal Lowering (mlir-opt) -> Native Machine Code
     """
     clean_base_path = "temp_clean_base.mlir"
     with open(clean_base_path, "w") as f: f.write(base_mlir)
     
-    if is_pytorch:
-        # --- STAGE 1: The tm_tensor Scrub (Using robust macro-pipeline as per PE) ---
-        linalg_tensors_path = "pure_linalg_tensors.mlir"
-        try:
-            print("[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...")
-            subprocess.run([
-                TORCH_MLIR_OPT, clean_base_path,
-                "-pass-pipeline=builtin.module(torch-backend-to-linalg-on-tensors-backend-pipeline)", 
-                "-o", linalg_tensors_path
-            ], check=True)
-        except Exception as e:
-            print(f"[Compiler] Stage 1 failed: {e}")
-            return
-            
-        target_mlir = linalg_tensors_path
-    else:
-        print("[Compiler] Stage 1: Skipping torch-mlir scrub (Direct MLIR track)...")
-        target_mlir = clean_base_path
+    # --- STAGE 1: The tm_tensor Scrub (Using robust macro-pipeline as per PE) ---
+    linalg_tensors_path = "pure_linalg_tensors.mlir"
+    try:
+        print("[Compiler] Stage 1: Scrubbing tm_tensor (Preserving Tensors)...")
+        subprocess.run([
+            TORCH_MLIR_OPT, clean_base_path,
+            "-pass-pipeline=builtin.module(torch-backend-to-linalg-on-tensors-backend-pipeline)", 
+            "-o", linalg_tensors_path
+        ], check=True)
+    except Exception as e:
+        print(f"[Compiler] Stage 1 failed: {e}")
+        return
+
+    target_mlir = linalg_tensors_path
 
     # --- STAGE 2: The AI Optimization Schedule ---
     if transform_mlir.strip():
@@ -592,7 +495,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         
         current_transform = transform_mlir
         for attempt in range(2): # 1 initial + 1 self-heal retry
-            with open(target_mlir, "r") as bf:
+            with open(linalg_tensors_path, "r") as bf:
                 base_mlir = bf.read()
             
             # Ensure the module has the necessary attribute for named sequences
@@ -633,24 +536,10 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.decode()
                 print(f"[Compiler] ⚠️ AI Transform Attempt {attempt+1} Invalid.")
-                if attempt == 0 and python_script is not None:
-                    print(f"[Compiler] Engaging python-level self-heal via Oracle...")
-                    healed_python = await fix_transform_syntax_with_ai(python_script, error_msg)
-                    if healed_python != python_script:
-                        try:
-                            # Local import to prevent circular dependency
-                            from component9_aot import safe_execute_schedule, RepoOSSchedule
-                            schedule = RepoOSSchedule()
-                            safe_execute_schedule(healed_python, schedule)
-                            current_transform = schedule.build_mlir()
-                            python_script = healed_python # Update for logs
-                        except Exception as he:
-                            print(f"[Compiler] Self-healed python script execution failed: {he}")
-                            raise RuntimeError(f"AI Transform failed after self-heal: {error_msg}")
-                    else:
-                        raise RuntimeError(f"AI returned identical script after self-heal.")
+                if attempt == 0:
+                    current_transform = await fix_transform_syntax_with_ai(current_transform, error_msg)
                 else:
-                    print(f"[Compiler] Self-heal failed or unavailable.")
+                    print(f"[Compiler] Self-heal failed.")
                     print(f"--- [DEBUG] FINAL COMPILER ERROR ---\n{error_msg}")
                     raise RuntimeError(f"AI Transform failed after self-heal: {error_msg}")
 
@@ -698,82 +587,21 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
             # We also strip the transform dialect here.
             memref_text = open(intermediate_memref_path).read()
             
-            def repl_copy(m):
-                types = m.group(3).split(' to ')
-                if len(types) == 2:
-                    return f"linalg.copy ins({m.group(1)} : {types[0].strip()}) outs({m.group(2)} : {types[1].strip()})"
-                return m.group(0)
-            memref_text = re.sub(r"memref\.copy\s+(%[a-zA-Z0-9_]+),\s+(%[a-zA-Z0-9_]+)\s*:\s*(.+)", repl_copy, memref_text)
-            
-            # THE PROPER FIX: Safely strip alloca_scope boundaries by brace matching
-            def strip_alloca_scope(text):
-                lines = text.split('\n')
-                out_lines = []
-                scope_depths = []
-                current_depth = 0
-                for line in lines:
-                    if 'memref.alloca_scope' in line and '{' in line:
-                        scope_depths.append(current_depth)
-                        current_depth += line.count('{') - line.count('}')
-                        continue
-                    
-                    if 'memref.alloca_scope.return' in line:
-                        continue
-                        
-                    prev_depth = current_depth
-                    current_depth += line.count('{') - line.count('}')
-                    
-                    if scope_depths and current_depth <= scope_depths[-1]:
-                        scope_depths.pop()
-                        continue
-                        
-                    out_lines.append(line)
-                return '\n'.join(out_lines)
-            
-            memref_text = strip_alloca_scope(memref_text)
+            # HACK: Convert memref.copy to linalg.copy so it can be lowered to loops.
+            # We use a greedy match until ' to ' to capture nested brackets in strided memrefs.
+            memref_text = re.sub(r"memref\.copy\s+(%[a-zA-Z0-9_]+),\s+(%[a-zA-Z0-9_]+)\s*:\s*(memref<.*>)\s+to\s+memref<.*>", 
+                                 r"linalg.copy ins(\1 : \3) outs(\2 : \3)", memref_text)
             
             memref_text = prune_abi_to_void(memref_text)
             memref_text = strip_transform_dialect(memref_text)
             with open(intermediate_memref_path, "w") as f: f.write(memref_text)
 
         print("[Compiler] Stage 3B: Applying Bare Pointer ABI...")
-        # Stage 1: Lower down to OpenMP and Loops
-        stage1_path = "temp_stage1.mlir"
         subprocess.run([
             MLIR_OPT, intermediate_memref_path,
-            "--pass-pipeline=builtin.module("
-            "canonicalize,"
-            "scf-forall-to-parallel,"
-            "convert-scf-to-openmp,"
-            "memref-expand,"
-            "convert-linalg-to-loops,"
-            "expand-strided-metadata,"
-            "lower-affine)",
-            "-o", stage1_path
-        ], check=True)
-        
-        # INTERCEPT: OpenMP lowering generates a pesky alloca_scope that breaks convert-scf-to-cf.
-        # We strip it out here before it crashes the CFG.
-        stage1_text = open(stage1_path).read()
-        stage1_text = strip_alloca_scope(stage1_text)
-        with open(stage1_path, "w") as f: f.write(stage1_text)
-
-        # Stage 2: Lower SCF to CF and finally to LLVM
-        subprocess.run([
-            MLIR_OPT, stage1_path,
-            "--pass-pipeline=builtin.module("
-            "convert-scf-to-cf,"
-            "convert-openmp-to-llvm,"
-            "convert-cf-to-llvm,"
-            "convert-vector-to-llvm,"
-            "convert-arith-to-llvm,"
-            "convert-math-to-llvm,"
-            "convert-math-to-libm,"
-            "convert-index-to-llvm,"
-            "convert-ub-to-llvm,"
-            "finalize-memref-to-llvm,"
-            "convert-func-to-llvm,"
-            "reconcile-unrealized-casts)",
+            # FINAL LOWERING: Comprehensive pipeline to reach LLVM Dialect
+            # We use memref-expand to handle copies and full-unroll to handle 2D vectorization
+            "--pass-pipeline=builtin.module(scf-forall-to-for,memref-expand,convert-linalg-to-loops,expand-strided-metadata,lower-affine,convert-vector-to-scf{full-unroll=1 target-rank=1},lower-affine,convert-scf-to-cf,convert-cf-to-llvm,convert-vector-to-llvm,convert-arith-to-llvm,convert-math-to-llvm,convert-math-to-libm,convert-index-to-llvm,convert-ub-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm{use-bare-ptr-memref-call-conv=1},reconcile-unrealized-casts)",
             "-o", final_machine_code_path
         ], check=True)
 
@@ -793,53 +621,9 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
         # 2. Fix getelementptr syntax (Clang 18 does not support 'nuw' on GEP)
         sanitized_ir = re.sub(r"getelementptr\s+inbounds\s+nuw", "getelementptr inbounds", sanitized_ir)
         
-        # 3. Fix floating point infinities in LLVM IR
-        sanitized_ir = sanitized_ir.replace("float -inf", "float 0xFFF0000000000000")
-        sanitized_ir = sanitized_ir.replace("float inf", "float 0x7FF0000000000000")
-        
-        # 4. Fix MLIR-specific 32-bit float hex literals (f0x...)
-        import struct
-        def fix_f0x(match):
-            hex_str = match.group(1).ljust(8, '0')
-            val = struct.unpack('>f', bytes.fromhex(hex_str))[0]
-            # Ensure the output has a decimal point if it formats as an integer
-            val_str = str(val)
-            if '.' not in val_str and 'e' not in val_str:
-                val_str += ".0"
-            return val_str
-            
-        sanitized_ir = re.sub(r"f0x([0-9A-Fa-f]+)", fix_f0x, sanitized_ir)
-        
         with open("kernel.ll", "w") as f: f.write(sanitized_ir)
 
-        OPENMP_THRESHOLD = 128
-        
-        clang_cmd = [
-            CLANG, 
-            "-O3", 
-            "-march=native", 
-            "-ffast-math"
-        ]
-
-        if bucket_size >= OPENMP_THRESHOLD:
-            print(f"[Compiler] Bucket {bucket_size} >= {OPENMP_THRESHOLD}. Enabling Polly & OpenMP Multi-Threading.")
-            clang_cmd.extend([
-                "-fopenmp", 
-                "-mllvm", "-polly", 
-                "-mllvm", "-polly-parallel"
-            ])
-        else:
-            print(f"[Compiler] Bucket {bucket_size} < {OPENMP_THRESHOLD}. Forcing strict Serial Execution (L1 Cache Locality).")
-
-        clang_cmd.extend([
-            "-shared", 
-            "-fPIC", 
-            "kernel.ll", 
-            "-o", output_dylib, 
-            "-lm"
-        ])
-        
-        subprocess.run(clang_cmd, check=True)
+        subprocess.run([CLANG, "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "kernel.ll", "-o", output_dylib], check=True)
         print(f"[Compiler] ✅ Native library generated: {output_dylib}")
 
     except subprocess.CalledProcessError as e:
@@ -987,63 +771,25 @@ async def aot_compile_all(module_filter: str = ""):
 
                 elif track == "FSM":
                     # We now generate a single python script directly
-                    fsm_scripts = synthesis_result if isinstance(synthesis_result, list) else [synthesis_result]
+                    fsm_scripts = [synthesis_result]
                     
                     if fsm_scripts:
-                        print(f"      🏁 Starting FSM Arena Race for {len(fsm_scripts)} variants...")
-                        best_dylib = None
-                        best_time = float('inf')
-                        
-                        import time
-                        import ctypes
-                        
-                        # Generate a mock payload for benchmarking FSMs
-                        # This should simulate a typical JSON payload the FSM expects
-                        test_payload = b'{"is_vip": true, "total_value": 150.5}'
-                        
-                        for idx, script in enumerate(fsm_scripts):
-                            variant_dylib = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_var{idx}.dylib")
-                            try:
-                                print(f"        🔨 Compiling Variant {idx}...")
-                                fsm_builder = RepoOSFSMBuilder()
-                                safe_execute_fsm_schedule(script, fsm_builder)
-                                cpp_code = fsm_builder.build_cpp()
-                                
-                                cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_var{idx}.cpp")
-                                with open(cpp_source_path, "w") as f:
-                                    f.write(cpp_code)
-                                
-                                subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
-                                                cpp_source_path, "-o", variant_dylib], check=True)
-                                
-                                # Benchmark it
-                                print(f"        🏎️  Racing Variant {idx}...")
-                                lib = ctypes.CDLL(variant_dylib)
-                                # Signature: void _mlir_ciface_main(const char* data, size_t len, float* out)
-                                out_arr = (ctypes.c_float * 1)()
-                                
-                                start_t = time.perf_counter()
-                                for _ in range(10000):
-                                    lib._mlir_ciface_main(test_payload, len(test_payload), out_arr)
-                                end_t = time.perf_counter()
-                                
-                                elapsed = (end_t - start_t) * 1000.0 # ms
-                                print(f"          ⏱️  Time: {elapsed:.2f}ms")
-                                
-                                if elapsed < best_time:
-                                    best_time = elapsed
-                                    best_dylib = variant_dylib
-                                    
-                            except Exception as e:
-                                print(f"        ❌ Variant {idx} failed: {e}")
-                                
-                        if best_dylib:
-                            print(f"      🏆 Arena Race Complete! Winner: {best_dylib} ({best_time:.2f}ms)")
-                            import shutil
-                            shutil.copy2(best_dylib, output_dylib)
-                            print(f"      ✅ Final C++ Library generated: {output_dylib}")
-                        else:
-                            raise ValueError("All FSM variants failed to compile or run.")
+                        print(f"      🧵 Compiling C++ FSM Kernel (Default AOT Variant)...")
+                        try:
+                            fsm_builder = RepoOSFSMBuilder()
+                            safe_execute_fsm_schedule(fsm_scripts[0], fsm_builder)
+                            cpp_code = fsm_builder.build_cpp()
+                            
+                            cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
+                            with open(cpp_source_path, "w") as f:
+                                f.write(cpp_code)
+                            
+                            subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
+                                            cpp_source_path, "-o", output_dylib], check=True)
+                            print(f"      ✅ C++ Library generated: {output_dylib}")
+                        except Exception as e:
+                            print(f"      ❌ FSM compilation failed: {e}")
+                            raise e
                     else:
                         raise ValueError("No FSM scripts found.")
 
@@ -1058,7 +804,7 @@ async def aot_compile_all(module_filter: str = ""):
                                     cpp_source_path, "-o", output_dylib], check=True)
                     print(f"      ✅ C++ Library generated: {output_dylib}")
 
-                elif track == "MATH":
+                elif track in ["MATH", "BRANCHING"]:
                     # MLIR to LLVM Compilation (Existing V2 code)
                     wrapper_code = synthesis_result
                     bridge = await generate_data_bridge(python_code, wrapper_code)
@@ -1072,18 +818,18 @@ async def aot_compile_all(module_filter: str = ""):
                     local_scope = {"torch": torch}
                     exec(wrapper_code, local_scope)
                     module_class = local_scope.get("GeneratedModule")
-                    
-                    if not module_class:
-                        raise ValueError("Failed to find 'GeneratedModule' class in AI output.")
-                    
                     module = module_class()
-                    module.eval()
                     
-                    print(f"      Building Sample Inputs...")
-                    local_scope_inputs = {"torch": torch, "json": json}
-                    exec(sample_inputs_code, local_scope_inputs)
-                    build_sample = local_scope_inputs.get("build_sample_inputs")
-                    sample_inputs_dict = build_sample()
+                    # Robustly clean sample inputs code
+                    cleaned_inputs_code = sample_inputs_code.strip()
+                    if cleaned_inputs_code.startswith("```"):
+                        # Strip start block
+                        cleaned_inputs_code = "\n".join(cleaned_inputs_code.split("\n")[1:])
+                        # Strip end block
+                        if cleaned_inputs_code.endswith("```"):
+                            cleaned_inputs_code = cleaned_inputs_code[:-3]
+                    
+                    sample_inputs_dict = eval(cleaned_inputs_code, {"torch": torch})
                     sample_args = tuple(sample_inputs_dict.values())
                     
                     print(f"      Tracing Module...")
@@ -1098,38 +844,6 @@ async def aot_compile_all(module_filter: str = ""):
                     
                     print(f"      Compiling MLIR Kernel...")
                     await apply_ai_transform_and_compile(base_mlir, transform_script, output_dylib)
-
-                elif track == "BRANCHING":
-                    # For BRANCHING, the AI generates a Python script using RepoOSBranchingBuilder
-                    python_script = synthesis_result
-                    bridge = {} # No python bridge for branching
-                    
-                    if not python_script:
-                        print("      ⚠️ AI failed to generate script for BRANCHING. Skipping.")
-                        failure_count += 1
-                        continue
-                        
-                    builder = RepoOSBranchingBuilder()
-                    try:
-                        safe_execute_branching_schedule(python_script, builder)
-                        base_mlir = builder.build_mlir()
-                    except Exception as e:
-                        print(f"      ⚠️ Failed to execute Branching Schedule: {e}")
-                        failure_count += 1
-                        continue
-                        
-                    if base_mlir == "FALLBACK":
-                        print("      [Compiler] AI requested Python fallback for this function. Skipping AOT.")
-                        continue
-                    
-                    base_mlir_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_base.mlir")
-                    with open(base_mlir_path, "w") as f: f.write(base_mlir)
-
-                    print(f"      Generating Optimization Heuristics...")
-                    transform_script = await generate_transform_script(base_mlir)
-                    
-                    print(f"      Compiling MLIR Kernel...")
-                    await apply_ai_transform_and_compile(base_mlir, transform_script, output_dylib, is_pytorch=False)
 
                 # Update Neo4j Cache
                 # Capture prep/post for tracks that use them (default to empty for C++)

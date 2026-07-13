@@ -4,12 +4,23 @@ import requests
 import sys
 import os
 
-# Add the project root to python path to import legacy_shop
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from legacy_shop.ecommerce import calculate_vip_revenue
 
 from revenue_app.database import SessionLocal, engine
 from revenue_app import models
+
+def calculate_vip_revenue(orders: bytes) -> float:
+    """
+    Sum the total cart values, but ONLY for VIP users.
+    Accepts raw JSON bytes directly from the network buffer.
+    """
+    import json
+    data = json.loads(orders.decode('utf-8'))
+    total_revenue = 0.0
+    for order in data:
+        if order["user"]["is_vip"] and order["status"] == "PROCESSED":
+            total_revenue += order["cart"]["total_value"]
+            
+    return total_revenue
 
 def calculate_status_revenues(orders_list):
     revenues = {"PROCESSED": 0.0, "PENDING": 0.0, "CANCELLED": 0.0}

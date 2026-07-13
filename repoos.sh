@@ -66,6 +66,7 @@ export PYTHONPATH="$PROJECT_ROOT/llvm-project/build/tools/mlir/python_packages/m
 export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PYTHONPATH"
 # Dynamic Libraries
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$PROJECT_ROOT/llvm-project/build/lib"
+export DYLD_LIBRARY_PATH="/opt/homebrew/opt/expat/lib:$PROJECT_ROOT/llvm-project/build/lib"
 
 if [ "$SKIP_COMPILE" != "--skip-compile" ]; then
     echo "--- 🛠 RepoOS: Stage 1 (Semantic Ingestion) ---"

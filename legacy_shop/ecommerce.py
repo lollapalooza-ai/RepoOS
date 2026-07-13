@@ -23,16 +23,3 @@ def generate_payload(num_orders: int = 5000):
         orders.append(order)
     return orders
 
-def calculate_vip_revenue(orders: bytes) -> float:
-    """
-    Sum the total cart values, but ONLY for VIP users.
-    Accepts raw JSON bytes directly from the network buffer.
-    """
-    import json
-    data = json.loads(orders.decode('utf-8'))
-    total_revenue = 0.0
-    for order in data:
-        if order["user"]["is_vip"] and order["status"] == "PROCESSED":
-            total_revenue += order["cart"]["total_value"]
-            
-    return total_revenue

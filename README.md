@@ -264,3 +264,32 @@ Intermediate stages are preserved in `build_artifacts/` for debugging:
 ## Inference Benchmark
 *   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 test_inference.py`
 *   `export PYTHONPATH=$PYTHONPATH:/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir && ./build_venv/bin/python3 benchmark_variants.py`
+
+## 💻 CPU with Python Validation
+
+To run and validate the revenue validation application on CPU, follow these 5 steps from the repository root:
+
+1. **Start the MySQL Database:**
+   ```bash
+   docker compose -f revenue_app/docker-compose.yml up -d
+   ```
+
+2. **Install Dependencies:**
+   ```bash
+   ./build_venv/bin/pip install -r revenue_app/requirements.txt
+   ```
+
+3. **Start the Legacy API Server (port 8080):**
+   ```bash
+   ./build_venv/bin/python3 -m legacy_shop.api_server
+   ```
+
+4. **Start the Background Job:**
+   ```bash
+   ./build_venv/bin/python3 -m revenue_app.job
+   ```
+
+5. **Start the New API Server (port 8000):**
+   ```bash
+   ./build_venv/bin/uvicorn revenue_app.main:app --host 127.0.0.1 --port 8000
+   ```
