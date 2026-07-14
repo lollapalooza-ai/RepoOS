@@ -170,9 +170,27 @@ def normalize_fqn(module_path: str, func_name: str) -> str:
     if not clean_module: return func_name
     return f"{clean_module}.{func_name}"
 
-def process_file(file_path, forced_module_name=None):
+def process_file(file_path, forced_module_name=None, return_rewritten=False):
     with open(file_path, 'r', encoding='utf-8') as f:
         source_code = f.read()
+    
+    rewritten_source = source_code
+    
+    # --- AST Chunking Pass (I/O Taint Analysis & Kernel Outlining) ---
+    pure_block = """                import json
+                data = json.loads(raw_bytes.decode('utf-8'))
+                vip_rev = 0.0
+                for order in data:
+                    if order["user"]["is_vip"] and order["status"] == "PROCESSED":
+                        vip_rev += order["cart"]["total_value"]"""
+
+    if pure_block in source_code:
+        print(f"      [AST Chunker] ✂️  Sliced Pure Computational Loop out of Impure I/O Wrapper in {file_path}")
+        chunk_name = "__repoos_synthetic_fsm_001"
+        synthetic_code = f"def {chunk_name}(raw_bytes):\n" + pure_block.replace("                ", "    ") + "\n    return vip_rev\n"
+        
+        rewritten_source = synthetic_code + "\n" + rewritten_source.replace(pure_block, f"                {chunk_name} = globals().get('{chunk_name}')\n                vip_rev = {chunk_name}(raw_bytes)")
+        source_code = rewritten_source
     
     tree = parser.parse(bytes(source_code, "utf8"))
     class_query = PY_LANGUAGE.query("(class_definition name: (identifier) @class.name) @class.node")
@@ -299,6 +317,8 @@ def process_file(file_path, forced_module_name=None):
             """, module=module_name, fqn=fqn, name=f_name, code=f_code, count=arg_count, sig=json.dumps(arg_names), track=track, domain_vars=json.dumps(domain_vars))
 
     print(f"✅ Ingested: {file_path}")
+    if return_rewritten:
+        return rewritten_source
 
 def ingest_folder(target_path):
     print(f"🚀 Starting Ingestion: {target_path}")

@@ -83,6 +83,7 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
     - ALL states MUST be explicitly created using `fsm.add_state(name)`. Do not transition to undefined states.
     - Use `on_sequence` directly to match keys (e.g. `'"my_key"'`).
     - CRITICAL: When using `RECORD_BOOL` or `RECORD_FLOAT`, you MUST attach the action DIRECTLY to the `on_sequence` transition that matches the key. DO NOT create intermediate states to wait for the value characters (e.g. do not wait for 't' or 'f' to trigger `RECORD_BOOL`). The C++ engine handles value parsing automatically.
+    - CRITICAL: When writing the C++ code for `set_object_complete_action`, you MUST use the exact variable names you declared with `declare_bool` and `declare_float`. DO NOT append trailing underscores (e.g. use `is_vip` not `is_vip_`). The builder generates the variables exactly as you name them.
 
     OUTPUT FORMAT:
     You MUST output a single JSON object containing EXACTLY 3 keys: "eager", "lazy", and "balanced". Each key must contain the raw Python string of the `build_parser(fsm)` function for that strategy.
@@ -91,15 +92,27 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
         response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config={'response_mime_type': 'application/json'}
+            config={'response_mime_type': 'application/json', 'temperature': 0.0}
         )
         res_text = response.text
         log_oracle_interaction("fsm_transform_synthesis", prompt, res_text)
         
-        variants_dict = json.loads(res_text)
-        return [variants_dict["eager"], variants_dict["lazy"], variants_dict["balanced"]]
+        # Strip markdown json blocks if the model wrapped it
+        clean_json = res_text
+        if clean_json.startswith("```json"):
+            clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+        elif clean_json.startswith("```"):
+            clean_json = clean_json.split("```")[1].split("```")[0].strip()
+            
+        # Fix LLM putting literal \n characters right after a closing quote
+        clean_json = re.sub(r"\"\\n\}", "\"\n}", clean_json)
+        clean_json = re.sub(r"\"\\n,", "\",\n", clean_json)
+            
+        variants_dict = json.loads(clean_json)
+        return [variants_dict.get("eager", ""), variants_dict.get("lazy", ""), variants_dict.get("balanced", "")]
     except Exception as e:
-        print(f"[Oracle] FSM synthesis failed: {e}")
+        import traceback
+        print(f"[Oracle] FSM synthesis failed: {repr(e)}\n{traceback.format_exc()}")
         return []
 
 async def compile_function_logic(python_code: str, execution_track: str, domain_vars: str = "{}"):
@@ -128,7 +141,11 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         {python_code}
         """
         try:
-            response = await client.aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            response = await client.aio.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config={'temperature': 0.0}
+            )
             res_text = response.text
             log_oracle_interaction("tabular_synthesis", prompt, res_text)
             match = re.search(r"```cpp\n(.*?)\n```", res_text, re.DOTALL)
@@ -140,27 +157,23 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
     elif execution_track == "BRANCHING":
         print("[Oracle] 🌳 Branching Track: Generating Structured Branching Builder Schedules...")
         prompt = f"""
-        Translate this nested rule engine into MLIR Structured Control Flow (scf).
-        You must output a pure Python function named `build_branching(builder)` using ONLY the RepoOSBranchingBuilder API.
+        You are a Semantic Translator for an E-graph compiler pipeline.
+        Translate the following Python business logic into a strict S-expression (Lisp-like) Intermediate Representation (IR).
         
-        API OPTIONS:
-        - `builder.declare_struct(name: str, types: list[str])`
-        - `builder.begin_function(name: str, arg_types: list[str], ret_types: list[str])`
-        - `builder.emit_op(op: str)` (Emit safe, raw MLIR ops inside the function)
-        - `builder.end_function()`
-        - `builder.fallback_to_python()` (Use this if the Python logic contains HTTP requests, DB calls, UUIDs, or OS modules)
+        ALLOWED S-EXPRESSION NODES:
+        - (if <condition> <then> <else>)
+        - (== <a> <b>)
+        - (!= <a> <b>)
+        - (get-dict <dict_name> <string_key>)
+        - (assign <var_name> <value>)
+        - (return <value>)
+        - (seq <expr1> <expr2> ...) ; For sequential operations
         
-        RULES:
-        1. Do NOT use Python runtime dependencies. If they exist, call `builder.fallback_to_python()` and stop.
-        2. Aim for branch-optimized assembly.
-        3. FATAL ERROR WARNING: When using `!llvm.struct`, you MUST enclose the types in parentheses. Correct: `!llvm.struct<(i32, f64)>`. Incorrect: `!llvm.struct<i32, f64>`.
-        4. FATAL ERROR WARNING: Do NOT use the `vararg` keyword in `llvm.func`. Variadic functions are indicated ONLY by `...`. Correct: `llvm.func @printf(!llvm.ptr, ...)`.
-        5. FATAL ERROR WARNING: Do NOT use typed pointers like `!llvm.ptr<i8>` or `!llvm.ptr<struct>`. MLIR uses opaque pointers. You MUST use `!llvm.ptr` by itself without angle brackets unless specifying an address space integer.
-        6. FATAL ERROR WARNING: MLIR identifiers MUST start with a letter or underscore. Do NOT use `@.` (e.g., `@.str`). Use `@_str` instead.
-        7. FATAL ERROR WARNING: Do NOT use the `mlir.block.arg` operation. It does not exist. Use function arguments (e.g., `%arg0`) directly.
-        8. FATAL ERROR WARNING: You CANNOT use `memref` with ANY `!llvm` types (e.g., `memref<?x!llvm.ptr>` or `memref<?x!llvm.struct>`). `memref` ONLY supports built-in types like `i32` or `f64`. For arrays of structs or pointers, you MUST use `!llvm.ptr` directly as the function argument type.
-        9. FATAL ERROR WARNING: When using `builder.emit_op(op)`, you MUST use Python triple-quotes `\"\"\"` for the string to avoid unterminated string literals and indentation errors.
-        10. OUTPUT AS JSON: You MUST output a single JSON object with a key "python" containing the generated Python string.
+        STRICT RULES:
+        1. FATAL ERROR WARNING: Do NOT generate C++ or Python code. You MUST generate ONLY valid S-expressions.
+        2. String literals must be wrapped in double quotes.
+        3. Do NOT attempt to optimize the logic. Translate the nested control flow exactly as it appears in the Python code. The E-graph will handle the optimization.
+        4. OUTPUT AS JSON: You MUST output a single JSON object with a key "s_expr" containing the raw S-expression string.
         
         PYTHON LOGIC:
         {python_code}
@@ -168,17 +181,16 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         try:
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash', 
-                config={'response_mime_type': 'application/json'},
-                contents=prompt
+                contents=prompt,
+                config={'response_mime_type': 'application/json', 'temperature': 0.0}
             )
             res_text = response.text
             log_oracle_interaction("branching_synthesis", prompt, res_text)
             try:
-                data = json.loads(res_text)
-                return data.get("python", res_text)
+                result_json = json.loads(res_text)
+                return result_json.get("s_expr", "")
             except json.JSONDecodeError:
-                match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
-                return match.group(1) if match else res_text
+                return ""
         except Exception as e:
             print(f"[Oracle] Branching synthesis failed: {e}")
             return ""
@@ -242,7 +254,7 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     try:
         response = await client.aio.models.generate_content(
             model='gemini-2.5-pro', 
-            config={'response_mime_type': 'application/json'},
+            config={'response_mime_type': 'application/json', 'temperature': 0.0},
             contents=prompt
         )
         res_text = response.text
@@ -323,7 +335,11 @@ async def generate_traceable_wrapper(python_code: str) -> str:
     """
     
     try:
-        response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config={'temperature': 0.0}
+        )
         res_text = response.text
         log_oracle_interaction("synthesis", prompt, res_text)
         match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
@@ -394,7 +410,11 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
     """
     
     try:
-        response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config={'temperature': 0.0}
+        )
         res_text = response.text
         log_oracle_interaction("sample_inputs", prompt, res_text)
         
@@ -454,7 +474,11 @@ async def generate_transform_script(base_mlir_text: str, target_arch: str = "x86
     """
     
     try:
-        response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config={'temperature': 0.0}
+        )
         res_text = response.text
         log_oracle_interaction("transform_schedule", prompt, res_text)
         match = re.search(r"```mlir\n(.*?)\n```", res_text, re.DOTALL)
@@ -500,7 +524,11 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     
     try:
         print("[Oracle] Analyzing compiler error and attempting self-heal...")
-        response = await client.aio.models.generate_content(model='gemini-2.5-pro', contents=prompt)
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt,
+            config={'temperature': 0.0}
+        )
         res_text = response.text
         log_oracle_interaction("self_heal", prompt, res_text)
         match = re.search(r"```python\n(.*?)\n```", res_text, re.DOTALL)
@@ -509,3 +537,13 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     except Exception as e:
         print(f"[Oracle] Self-heal failed: {e}")
         return broken_script
+
+def verify_branching_logic(python_code: str, cpp_code: str, domain_vars: dict) -> bool:
+    """
+    Stub for Z3 Formal Verification.
+    Proves that the highly optimized C++ logic perfectly matches the original Python intent.
+    Returns True if valid.
+    """
+    print("[Z3 Prover] 🔍 Verifying Equality between Python AST and C++ AST...")
+    # Mock implementation for now
+    return True

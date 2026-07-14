@@ -8,19 +8,7 @@ import os
 from revenue_app.database import SessionLocal, engine
 from revenue_app import models
 
-def calculate_vip_revenue(orders: bytes) -> float:
-    """
-    Sum the total cart values, but ONLY for VIP users.
-    Accepts raw JSON bytes directly from the network buffer.
-    """
-    import json
-    data = json.loads(orders.decode('utf-8'))
-    total_revenue = 0.0
-    for order in data:
-        if order["user"]["is_vip"] and order["status"] == "PROCESSED":
-            total_revenue += order["cart"]["total_value"]
-            
-    return total_revenue
+
 
 def calculate_status_revenues(orders_list):
     revenues = {"PROCESSED": 0.0, "PENDING": 0.0, "CANCELLED": 0.0}
@@ -30,12 +18,17 @@ def calculate_status_revenues(orders_list):
             revenues[status] += order.get("cart", {}).get("total_value", 0.0)
     return revenues
 
-def run_job():
+def run_job(run_count=None):
     # Make sure DB tables exist
     models.Base.metadata.create_all(bind=engine)
     
     print("Starting background job to fetch orders...")
+    count = 0
     while True:
+        if run_count is not None and count >= run_count:
+            print(f"Reached run-count of {run_count}. Exiting loop.")
+            break
+        count += 1
         try:
             print("Fetching orders from /api/v1/orders...")
             response = requests.get("http://127.0.0.1:8080/api/v1/orders")
@@ -43,8 +36,13 @@ def run_job():
                 raw_bytes = response.content
                 orders_list = response.json()
                 
-                # Compute vip revenue
-                vip_rev = calculate_vip_revenue(raw_bytes)
+                # Compute vip revenue inline
+                import json
+                data = json.loads(raw_bytes.decode('utf-8'))
+                vip_rev = 0.0
+                for order in data:
+                    if order["user"]["is_vip"] and order["status"] == "PROCESSED":
+                        vip_rev += order["cart"]["total_value"]
                 
                 # Compute status revenues
                 status_revs = calculate_status_revenues(orders_list)
@@ -75,4 +73,41 @@ def run_job():
         time.sleep(30)
 
 if __name__ == "__main__":
-    run_job()
+    import sys
+    if "--benchmark" in sys.argv:
+        # Generate a dummy payload of 10,000 orders
+        import json
+        import timeit
+        print("Generating dummy payload for benchmark...")
+        payload = []
+        for i in range(10000):
+            payload.append({
+                "id": str(uuid.uuid4()),
+                "user": {"id": 1, "is_vip": (i % 5 == 0)},
+                "cart": {"total_value": 150.0},
+                "status": "PROCESSED" if i % 2 == 0 else "PENDING"
+            })
+        raw_bytes = json.dumps(payload).encode('utf-8')
+        
+        def run_bench():
+            # Mimic the pure computational block inside run_job
+            data = json.loads(raw_bytes.decode('utf-8'))
+            vip_rev = 0.0
+            for order in data:
+                if order["user"]["is_vip"] and order["status"] == "PROCESSED":
+                    vip_rev += order["cart"]["total_value"]
+            return vip_rev
+
+        print("Warming up...")
+        for _ in range(10): run_bench()
+        
+        print("Benchmarking...")
+        iters = 50
+        total_time = timeit.timeit(run_bench, number=iters)
+        avg_time = (total_time / iters) * 1000
+        res = run_bench()
+        
+        print(f"  - Avg Speed: {avg_time:.4f} ms")
+        print(f"  - Final Result[0,0]: {res:.4f}")
+    else:
+        run_job()

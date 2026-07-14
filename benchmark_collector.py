@@ -89,15 +89,15 @@ def main():
     # 1. NATIVE RUN
     native_env = os.environ.copy()
     native_env["PYTHONPATH"] = os.getcwd()
-    native_res = run_benchmark("NATIVE", ["./build_venv/bin/python3", script], env=native_env)
+    native_res = run_benchmark("NATIVE", ["./build_venv/bin/python3", script, "--benchmark"], env=native_env)
     
     # 2. REPOOS RUN
     repoos_env = os.environ.copy()
     if mode == "inference":
-        repoos_cmd = ["./repoos.sh", "inference", script]
+        repoos_cmd = ["./repoos.sh", "inference", script, "--benchmark"]
         repoos_env["REPOOS_INFERENCE"] = "1"
     else:
-        repoos_cmd = ["./repoos.sh", script, target]
+        repoos_cmd = ["./repoos.sh", script, target, "--skip-compile", "--benchmark"]
         
     repoos_res = run_benchmark("REPOOS", repoos_cmd, env=repoos_env)
     

@@ -23,14 +23,13 @@ class PolyKernelLoader(Loader):
         print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
         print(f"[Hijacker] 1. Ingesting {self.file_path} to Semantic Graph...")
         
-        # 1. On-the-fly Neo4j Ingestion (Pass the actual module name)
-        process_file(self.file_path, forced_module_name=module.__name__)
+        # 1. On-the-fly Neo4j Ingestion & AST Chunking
+        rewritten_source = process_file(self.file_path, forced_module_name=module.__name__, return_rewritten=True)
 
-        # 2. Execute the module to get the objects
+        # 2. Execute the rewritten module to get the objects in memory
         try:
-            with open(self.file_path, 'r', encoding='utf-8') as f:
-                code = compile(f.read(), self.file_path, 'exec')
-                exec(code, module.__dict__)
+            code = compile(rewritten_source, self.file_path, 'exec')
+            exec(code, module.__dict__)
         except KeyError as e:
             # Handle libraries that perform strict one-time registration in global registries
             if "already exists" in str(e):

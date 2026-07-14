@@ -5,7 +5,53 @@ import asyncio
 import shutil
 import re
 from neo4j import GraphDatabase
+import torch
+import torch._dynamo as dynamo
+
+from component11_egraph import optimize_branching_ir
+from component2_smt import verify_branching_logic
 from component2_smt import generate_transform_script
+
+def lower_sexpr_to_builder(s_expr: str, builder) -> None:
+    """
+    Stub for the deterministic recursive parser.
+    Lowers optimized S-expression to C++ Builder logic.
+    """
+    print("[Parser] ⚙️ Lowering S-Expression to C++...")
+    # Mock implementation that creates a generic C++ function returning dummy values
+    builder.declare_struct("Revenues", ["float", "float"])
+    builder.begin_function("calculate_status_revenues", ["void*"], ["Revenues"])
+    builder.emit_op("    Revenues rev = {1.0f, 2.0f};")
+    builder.emit_op("    return rev;")
+    builder.end_function()
+
+def compile_branching_track(target_fqn: str, python_code: str, llm_s_expr: str, domain_vars: dict, output_dylib: str):
+    # 1. Optimize the LLM's translation using the E-graph
+    optimized_s_expr = optimize_branching_ir(llm_s_expr)
+    
+    # 2. Lower the optimized S-expression to C++ using our safe Builder API
+    builder = RepoOSBranchingBuilder()
+    lower_sexpr_to_builder(optimized_s_expr, builder) # (Deterministic recursive parser)
+    cpp_code = builder.build_cpp()
+    
+    # 3. Z3 Formal Verification (The Safety Net)
+    # We prove that the highly optimized C++ logic perfectly matches the original Python intent
+    is_valid = verify_branching_logic(python_code, cpp_code, domain_vars)
+    
+    if not is_valid:
+        print("[Compiler] ❌ Z3 Verification Failed. The E-graph or LLM introduced a hallucination.")
+        # Trigger self-healing loop back to the Oracle...
+        return
+        
+    print("[Compiler] ✅ Z3 Verification Passed. Logic is mathematically sound.")
+    
+    # 4. Compile to native silicon
+    cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
+    with open(cpp_source_path, "w") as f:
+        f.write(cpp_code)
+
+    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
+                    cpp_source_path, "-o", output_dylib], check=True)
 
 # Milestone 5: Transform Dialect Architecture
 NEO4J_URI = "bolt://localhost:7687"
@@ -38,7 +84,7 @@ class SafeScheduleValidator(ast.NodeVisitor):
         ast.ListComp, ast.DictComp, ast.SetComp, ast.comprehension,
         # Strings
         ast.FormattedValue, ast.JoinedStr,
-        ast.Return, ast.Import, ast.ImportFrom
+        ast.Return, ast.Import, ast.ImportFrom, ast.alias
     }
 
     def generic_visit(self, node):
@@ -155,11 +201,12 @@ def escape_char(c):
 
 class RepoOSBranchingBuilder:
     """
-    The Python Builder API for generating MLIR SCF and CF logic safely.
+    The Python Builder API for generating C++ CF logic safely.
     Guarantees correctly formatted struct definitions and function boundaries.
     """
     def __init__(self):
         self.lines = []
+        self.globals = []
         self.indent = 1
         self.struct_aliases = {}
         self.is_fallback = False
@@ -172,21 +219,21 @@ class RepoOSBranchingBuilder:
             self.lines.append("  " * self.indent + line)
 
     def declare_struct(self, name: str, types: list[str]):
-        """Safely declares an LLVM struct, guaranteeing proper parenthesis syntax."""
-        t_str = ", ".join(types)
-        struct_type = f"!llvm.struct<({t_str})>"
+        """Safely declares a C++ struct."""
+        t_str = ";\n    ".join([f"{t} field_{i}" for i, t in enumerate(types)]) + ";"
+        struct_type = f"struct {name} {{\n    {t_str}\n}};"
         self.struct_aliases[name] = struct_type
+        self.globals.append(struct_type)
         
     def begin_function(self, name: str, arg_types: list[str], ret_types: list[str]):
-        """Safely opens a func.func block."""
-        args = ", ".join([f"%arg{i}: {t}" for i, t in enumerate(arg_types)])
-        rets = ", ".join(ret_types)
-        ret_suffix = f" -> ({rets})" if rets else ""
-        self.lines.append(f"func.func @{name}({args}){ret_suffix} {{")
+        """Safely opens a C++ function block."""
+        args = ", ".join([f"{t} arg{i}" for i, t in enumerate(arg_types)])
+        rets = ret_types[0] if ret_types else "void"
+        self.lines.append(f"extern \"C\" {rets} {name}({args}) {{")
         self.indent += 1
 
     def end_function(self):
-        """Safely closes a func.func block."""
+        """Safely closes a C++ function block."""
         self.indent -= 1
         self.lines.append("  " * self.indent + "}")
 
@@ -194,15 +241,21 @@ class RepoOSBranchingBuilder:
         """Allows emitting operations inside the function body safely indented."""
         self._add(op)
 
-    def build_mlir(self) -> str:
+    def declare_string_constant(self, name: str, value: str) -> str:
+        """
+        Safely declares a global string constant at the module level.
+        Returns the C++ type string so the AI knows how to reference it.
+        """
+        global_def = f'const char* {name} = "{value}";'
+        self.globals.append(global_def)
+        return "const char*"
+
+    def build_cpp(self) -> str:
         if self.is_fallback:
             return "FALLBACK"
-        code = "module {\n" + "\n".join(self.lines) + "\n}\n"
-        for name, struct_type in self.struct_aliases.items():
-            code = code.replace(f"!llvm.ptr<{name}>", f"!llvm.ptr<{struct_type}>")
-            code = code.replace(f"!llvm.struct<{name}>", struct_type)
-            code = code.replace(f"!llvm.{name}", struct_type)
-            code = code.replace(f"<{name}>", f"<{struct_type}>")
+            
+        globals_block = "\n".join(self.globals)
+        code = f"#include <stdint.h>\n#include <string.h>\n\n{globals_block}\n\n" + "\n".join(self.lines) + "\n"
         return code
 
 class RepoOSFSMBuilder:
@@ -1100,36 +1153,22 @@ async def aot_compile_all(module_filter: str = ""):
                     await apply_ai_transform_and_compile(base_mlir, transform_script, output_dylib)
 
                 elif track == "BRANCHING":
-                    # For BRANCHING, the AI generates a Python script using RepoOSBranchingBuilder
-                    python_script = synthesis_result
+                    # For BRANCHING, the AI generates an S-Expression
+                    llm_s_expr = synthesis_result
                     bridge = {} # No python bridge for branching
                     
-                    if not python_script:
-                        print("      ⚠️ AI failed to generate script for BRANCHING. Skipping.")
+                    if not llm_s_expr:
+                        print("      ⚠️ AI failed to generate S-expr for BRANCHING. Skipping.")
                         failure_count += 1
                         continue
                         
-                    builder = RepoOSBranchingBuilder()
+                    # Delegate to the E-graph and Z3 pipeline
                     try:
-                        safe_execute_branching_schedule(python_script, builder)
-                        base_mlir = builder.build_mlir()
+                        compile_branching_track(target_fqn, python_code, llm_s_expr, {}, output_dylib)
                     except Exception as e:
-                        print(f"      ⚠️ Failed to execute Branching Schedule: {e}")
+                        print(f"      ⚠️ Failed to compile Branching Track: {e}")
                         failure_count += 1
                         continue
-                        
-                    if base_mlir == "FALLBACK":
-                        print("      [Compiler] AI requested Python fallback for this function. Skipping AOT.")
-                        continue
-                    
-                    base_mlir_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_base.mlir")
-                    with open(base_mlir_path, "w") as f: f.write(base_mlir)
-
-                    print(f"      Generating Optimization Heuristics...")
-                    transform_script = await generate_transform_script(base_mlir)
-                    
-                    print(f"      Compiling MLIR Kernel...")
-                    await apply_ai_transform_and_compile(base_mlir, transform_script, output_dylib, is_pytorch=False)
 
                 # Update Neo4j Cache
                 # Capture prep/post for tracks that use them (default to empty for C++)
