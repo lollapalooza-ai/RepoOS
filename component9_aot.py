@@ -348,6 +348,8 @@ class RepoOSFSMBuilder:
                             {target_var} = true;
                         }} else if (temp_ptr + 5 <= end && temp_ptr[0]=='f' && temp_ptr[1]=='a' && temp_ptr[2]=='l' && temp_ptr[3]=='s' && temp_ptr[4]=='e') {{
                             {target_var} = false;
+                        }} else {{
+                            {target_var} = true; // Implicit match for string enumerations
                         }}
                     """
                 elif t["action"] == "RECORD_FLOAT":
@@ -1049,11 +1051,23 @@ async def aot_compile_all(module_filter: str = ""):
                         
                         import time
                         import ctypes
+                        import json
                         
-                        # Generate a mock payload for benchmarking FSMs
-                        # This should simulate a typical JSON payload the FSM expects
-                        test_payload = b'{"is_vip": true, "total_value": 150.5}'
+                        # Generate a robust mock payload that tests the full schema
+                        test_payload = b'[{"user": {"is_vip": true}, "cart": {"total_value": 150.5}, "status": "PROCESSED"}, {"user": {"is_vip": true}, "cart": {"total_value": 100.0}, "status": "PENDING"}]'
                         
+                        # Golden Result Extraction
+                        local_scope = {}
+                        try:
+                            exec(python_code, {"json": json}, local_scope)
+                            func_name = target_fqn.split(".")[-1]
+                            golden_func = local_scope[func_name]
+                            golden_result = golden_func(test_payload)
+                            print(f"        ✨ Golden Result Computed: {golden_result}")
+                        except Exception as e:
+                            print(f"        ⚠️ Could not compute Golden Result: {e}")
+                            golden_result = None
+
                         for idx, script in enumerate(fsm_scripts):
                             variant_dylib = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_var{idx}.dylib")
                             try:
@@ -1069,12 +1083,20 @@ async def aot_compile_all(module_filter: str = ""):
                                 subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
                                                 cpp_source_path, "-o", variant_dylib], check=True)
                                 
-                                # Benchmark it
+                                # Verification & Benchmark
                                 print(f"        🏎️  Racing Variant {idx}...")
                                 lib = ctypes.CDLL(variant_dylib)
-                                # Signature: void _mlir_ciface_main(const char* data, size_t len, float* out)
                                 out_arr = (ctypes.c_float * 1)()
                                 
+                                # Correctness check first
+                                lib._mlir_ciface_main(test_payload, len(test_payload), out_arr)
+                                if golden_result is not None:
+                                    if abs(out_arr[0] - golden_result) > 1e-4:
+                                        print(f"          ❌ Variant {idx} failed Golden Result Check: {out_arr[0]:.4f} != {golden_result:.4f}")
+                                        continue
+                                    else:
+                                        print(f"          ✅ Variant {idx} passed Golden Result Check.")
+
                                 start_t = time.perf_counter()
                                 for _ in range(10000):
                                     lib._mlir_ciface_main(test_payload, len(test_payload), out_arr)

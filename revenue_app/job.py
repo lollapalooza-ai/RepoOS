@@ -89,9 +89,9 @@ if __name__ == "__main__":
             })
         raw_bytes = json.dumps(payload).encode('utf-8')
         
-        def run_bench():
+        def run_bench(payload_bytes):
             # Mimic the pure computational block inside run_job
-            data = json.loads(raw_bytes.decode('utf-8'))
+            data = json.loads(payload_bytes.decode('utf-8'))
             vip_rev = 0.0
             for order in data:
                 if order["user"]["is_vip"] and order["status"] == "PROCESSED":
@@ -99,15 +99,20 @@ if __name__ == "__main__":
             return vip_rev
 
         print("Warming up...")
-        for _ in range(10): run_bench()
+        for _ in range(10): run_bench(raw_bytes)
         
         print("Benchmarking...")
         iters = 50
-        total_time = timeit.timeit(run_bench, number=iters)
+        total_time = timeit.timeit(lambda: run_bench(raw_bytes), number=iters)
         avg_time = (total_time / iters) * 1000
-        res = run_bench()
+        res = run_bench(raw_bytes)
         
         print(f"  - Avg Speed: {avg_time:.4f} ms")
         print(f"  - Final Result[0,0]: {res:.4f}")
     else:
-        run_job()
+        run_count = None
+        for arg in sys.argv[1:]:
+            if arg.isdigit():
+                run_count = int(arg)
+                break
+        run_job(run_count)

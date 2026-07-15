@@ -28,15 +28,20 @@ def run_benchmark(label, cmd, env=None):
     
     max_mem = 0
     cpu_samples = []
-    proc = psutil.Process(p.pid)
     
-    full_output = ""
     try:
+        proc = psutil.Process(p.pid)
         while p.poll() is None:
             try:
-                m = proc.memory_info().rss / (1024 * 1024)
-                max_mem = max(max_mem, m)
-                cpu_samples.append(proc.cpu_percent(interval=None))
+                # Find all children (recursive) and sum their memory and CPU
+                children = proc.children(recursive=True)
+                procs = [proc] + children
+                
+                total_mem = sum(pr.memory_info().rss for pr in procs) / (1024 * 1024)
+                total_cpu = sum(pr.cpu_percent(interval=None) for pr in procs)
+                
+                max_mem = max(max_mem, total_mem)
+                cpu_samples.append(total_cpu)
             except: pass
             time.sleep(0.05)
     except:
@@ -93,6 +98,7 @@ def main():
     
     # 2. REPOOS RUN
     repoos_env = os.environ.copy()
+    repoos_env["REPOOS_ENV"] = "BENCHMARK"
     if mode == "inference":
         repoos_cmd = ["./repoos.sh", "inference", script, "--benchmark"]
         repoos_env["REPOOS_INFERENCE"] = "1"

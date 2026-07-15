@@ -158,6 +158,8 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                 return post_func(output_tensor, *args, **kwargs)
 
         except Exception as e:
+            if os.environ.get("REPOOS_ENV") in ("DEV", "BENCHMARK"):
+                raise RuntimeError(f"RepoOSRuntimeError: Execution failed: {e}")
             print(f"⚠️ RepoOS Execution Failed: {e}. Falling back.")
             return original_func(*args, **kwargs)
 

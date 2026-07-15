@@ -85,6 +85,14 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
     - CRITICAL: When using `RECORD_BOOL` or `RECORD_FLOAT`, you MUST attach the action DIRECTLY to the `on_sequence` transition that matches the key. DO NOT create intermediate states to wait for the value characters (e.g. do not wait for 't' or 'f' to trigger `RECORD_BOOL`). The C++ engine handles value parsing automatically.
     - CRITICAL: When writing the C++ code for `set_object_complete_action`, you MUST use the exact variable names you declared with `declare_bool` and `declare_float`. DO NOT append trailing underscores (e.g. use `is_vip` not `is_vip_`). The builder generates the variables exactly as you name them.
 
+    CRITICAL CONSTRAINTS FOR CONDITIONAL LOGIC:
+    - You must often evaluate multiple conditions before accumulating a value (e.g., checking if a user is VIP AND if their status is "PROCESSED").
+    - You MUST use `fsm.declare_bool()` to create a flag for EVERY condition you need to track.
+    - FATAL ERROR WARNING: For string enumerations (e.g. `order["status"] == "PROCESSED"`), you MUST match the FULL key-value pair sequence! Example: `fsm.on_sequence(S_STATE, '"status":"PROCESSED"', S_NEXT, action="RECORD_BOOL", target="is_processed")`. DO NOT just match the key `\"status\"`, otherwise you will falsely trigger on ALL statuses!
+    - DO NOT attempt to write inline C++ `if` statements inside `on_char` or `on_sequence` transitions.
+    - ALL compound logic (the actual math and accumulation) MUST happen inside the C++ string you pass to `fsm.set_object_complete_action()`. 
+    - You must reset your boolean flags back to `false` at the end of your `set_object_complete_action` C++ block so they are clean for the next JSON object in the array.
+
     OUTPUT FORMAT:
     You MUST output a single JSON object containing EXACTLY 3 keys: "eager", "lazy", and "balanced". Each key must contain the raw Python string of the `build_parser(fsm)` function for that strategy.
     """
@@ -104,10 +112,7 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
         elif clean_json.startswith("```"):
             clean_json = clean_json.split("```")[1].split("```")[0].strip()
             
-        # Fix LLM putting literal \n characters right after a closing quote
-        clean_json = re.sub(r"\"\\n\}", "\"\n}", clean_json)
-        clean_json = re.sub(r"\"\\n,", "\",\n", clean_json)
-            
+    
         variants_dict = json.loads(clean_json)
         return [variants_dict.get("eager", ""), variants_dict.get("lazy", ""), variants_dict.get("balanced", "")]
     except Exception as e:
