@@ -25,4 +25,4 @@ echo "Target Script: $SCRIPT"
 echo "Track Mode:    $MODE"
 echo "-------------------------------------"
 
-./build_venv/bin/python3 benchmark_collector.py "$MODE" "$SCRIPT" "$TARGET"
+./build_venv/bin/python3 benchmark_collector.py "$MODE" "$SCRIPT" "$TARGET" "${@:3}"

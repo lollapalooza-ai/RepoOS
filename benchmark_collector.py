@@ -85,25 +85,26 @@ def main():
     mode = sys.argv[1]
     script = sys.argv[2]
     target = sys.argv[3] if len(sys.argv) > 3 else ""
+    extra_args = sys.argv[4:] if len(sys.argv) > 4 else []
     
     # Pre-run RepoOS once to ensure compilation is cached
     if mode == "inference":
         print(f"   [Prep] Pre-compiling RepoOS kernels for {script}...")
-        subprocess.run(["./repoos.sh", "inference", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["./repoos.sh", "inference", script] + extra_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # 1. NATIVE RUN
     native_env = os.environ.copy()
     native_env["PYTHONPATH"] = os.getcwd()
-    native_res = run_benchmark("NATIVE", ["./build_venv/bin/python3", script, "--benchmark"], env=native_env)
+    native_res = run_benchmark("NATIVE", ["./build_venv/bin/python3", script] + extra_args, env=native_env)
     
     # 2. REPOOS RUN
     repoos_env = os.environ.copy()
     repoos_env["REPOOS_ENV"] = "BENCHMARK"
     if mode == "inference":
-        repoos_cmd = ["./repoos.sh", "inference", script, "--benchmark"]
+        repoos_cmd = ["./repoos.sh", "inference", script] + extra_args
         repoos_env["REPOOS_INFERENCE"] = "1"
     else:
-        repoos_cmd = ["./repoos.sh", script, target, "--skip-compile", "--benchmark"]
+        repoos_cmd = ["./repoos.sh", script, target, "--skip-compile"] + extra_args
         
     repoos_res = run_benchmark("REPOOS", repoos_cmd, env=repoos_env)
     

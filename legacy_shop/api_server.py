@@ -7,7 +7,7 @@ app = FastAPI()
 
 # Generate the massive payload once when the server boots
 print("Generating 500k E-Commerce Payload in memory...")
-MASSIVE_PAYLOAD = generate_payload(500)
+MASSIVE_PAYLOAD = generate_payload(10000)
 
 @app.get("/api/v1/orders")
 def get_orders():
