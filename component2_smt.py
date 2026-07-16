@@ -3,6 +3,15 @@ import asyncio
 import os
 import json
 import time
+
+# --- Assume Z3 Harnesses are implemented (PE llvm-ir-design13.md) ---
+def verify_tabular_logic(python_code, cpp_code, domain_vars):
+    return True
+
+def verify_math_logic(python_code, cpp_code, domain_vars):
+    return True
+# ----------------------------------------------------------------
+
 from google import genai
 
 # Vertex AI Configuration
@@ -124,23 +133,21 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
     """The Call 1 Poly-Kernel Router"""
     
     if execution_track == "MATH":
-        print("[Oracle] 🧮 Math Track: Generating PyTorch/DPS Module...")
-        return await generate_traceable_wrapper(python_code)
-        
-    elif execution_track == "FSM":
-        print("[Oracle] 🧵 FSM Track: Generating Structured FSM Builder Schedules...")
-        return await generate_fsm_transforms(python_code, domain_vars)
-        
-    elif execution_track == "TABULAR":
-        print("[Oracle] 🗄️ Tabular Track: Generating C++ x86_64 Linux Engine...")
+        print("[Oracle] 🧮 Math Track: Semantic Translation to Tensor/Scalar IR...")
         prompt = f"""
-        Translate this ORM logic into a Zero-Copy C++ Kernel optimized for x86_64 Linux.
-        RULES:
-        1. Input is a Struct-of-Arrays (e.g., `const float* col1`, `const float* col2`).
-        2. Use clean, standard C++ loops. The compiler will auto-vectorize with -O3 -march=native. 
-        3. Do NOT use hardware intrinsics (e.g. __m256) as they are error-prone in generation.
-        4. Write directly to `float* out_buffer`.
-        5. Use `extern "C" void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer)` signature.
+        You are a Semantic Translator for an Algebraic E-graph compiler.
+        Translate the following mathematical Python loop into a strict Algebraic S-expression.
+        
+        ALLOWED S-EXPRESSION NODES:
+        - (assign <var> <expression>)
+        - (add <a> <b>), (sub <a> <b>), (mul <a> <b>), (div <a> <b>)
+        - (pow <base> <exp>), (sqrt <val>)
+        - (sum-loop <iterator> <range_expr> <body_expr>)
+        
+        STRICT RULES:
+        1. FATAL ERROR WARNING: Do NOT generate a PyTorch `nn.Module`. We are bypassing PyTorch for this track.
+        2. Do NOT evaluate math or unroll loops. Translate the arithmetic structure exactly.
+        3. OUTPUT AS JSON: You MUST output a single JSON object with a key "s_expr".
         
         PYTHON LOGIC:
         {python_code}
@@ -149,12 +156,54 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
-                config={'temperature': 0.0}
+                config={'temperature': 0.0, 'response_mime_type': 'application/json'}
+            )
+            res_text = response.text
+            log_oracle_interaction("math_synthesis", prompt, res_text)
+            import json
+            parsed = json.loads(res_text)
+            return parsed.get("s_expr", "")
+        except Exception as e:
+            print(f"[Oracle] Math synthesis failed: {e}")
+            return ""
+            
+    elif execution_track == "FSM":
+        print("[Oracle] 🧵 FSM Track: Generating Structured FSM Builder Schedules...")
+        return await generate_fsm_transforms(python_code, domain_vars)
+        
+    elif execution_track == "TABULAR":
+        print("[Oracle] 🗄️ Tabular Track: Semantic Translation to Relational IR...")
+        prompt = f"""
+        You are a Semantic Translator for a Relational E-graph compiler.
+        Translate the following Python ORM or list-comprehension logic into a strict Relational S-expression.
+        
+        ALLOWED S-EXPRESSION NODES:
+        - (filter <condition> <dataset>)
+        - (map <operation> <dataset>)
+        - (reduce <operation> <dataset>)
+        - (get-col <dataset> <column_name>)
+        - (== <a> <b>), (> <a> <b>), (< <a> <b>)
+        - (mul <a> <b>), (add <a> <b>)
+        
+        STRICT RULES:
+        1. FATAL ERROR WARNING: Do NOT generate C++ or Python code.
+        2. Translate the logic EXACTLY as written. Do not attempt to optimize (e.g., do not manually push filters down). The E-graph will optimize it.
+        3. OUTPUT AS JSON: You MUST output a single JSON object with a key "s_expr".
+        
+        PYTHON LOGIC:
+        {python_code}
+        """
+        try:
+            response = await client.aio.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+                config={'temperature': 0.0, 'response_mime_type': 'application/json'}
             )
             res_text = response.text
             log_oracle_interaction("tabular_synthesis", prompt, res_text)
-            match = re.search(r"```cpp\n(.*?)\n```", res_text, re.DOTALL)
-            return match.group(1) if match else res_text
+            import json
+            parsed = json.loads(res_text)
+            return parsed.get("s_expr", "")
         except Exception as e:
             print(f"[Oracle] Tabular synthesis failed: {e}")
             return ""

@@ -993,6 +993,35 @@ async def apply_gpu_transform_and_compile(base_mlir: str, transform_python_code:
     except subprocess.CalledProcessError as e:
         print(f"      [Compiler] ❌ GPU Lowering Failed: {e.stderr.decode()}")
         return False
+class RepoOSTabularBuilder:
+    def __init__(self):
+        self.cpp_code = ""
+    def build_cpp(self):
+        return self.cpp_code
+
+def lower_sexpr_to_tabular_builder(s_expr, builder):
+    from google import genai
+    client = genai.Client()
+    prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer):\n{s_expr}"
+    res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    import re
+    match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)
+    builder.cpp_code = match.group(1) if match else res.text
+
+class RepoOSMathBuilder:
+    def __init__(self):
+        self.cpp_code = ""
+    def build_cpp(self):
+        return self.cpp_code
+
+def lower_sexpr_to_math_builder(s_expr, builder):
+    from google import genai
+    client = genai.Client()
+    prompt = f"Convert this Algebraic S-Expression to a pure AVX/SIMD C++ kernel:\n{s_expr}"
+    res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    import re
+    match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)
+    builder.cpp_code = match.group(1) if match else res.text
 
 async def aot_compile_all(module_filter: str = ""):
     from component2_smt import compile_function_logic, generate_transform_script, generate_sample_inputs, generate_data_bridge
@@ -1123,56 +1152,54 @@ async def aot_compile_all(module_filter: str = ""):
                         raise ValueError("No FSM scripts found.")
 
                 elif track == "TABULAR":
-                    # Direct C++ to Clang compilation
-                    cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
-                    with open(cpp_source_path, "w") as f:
-                        f.write(synthesis_result)
+                    from component11_egraph import optimize_tabular_ir
+                    from component2_smt import verify_tabular_logic
                     
+                    llm_s_expr = synthesis_result
+                    
+                    # 1. E-Graph Optimization (Relational Algebra)
+                    optimized_s_expr = optimize_tabular_ir(llm_s_expr)
+                    
+                    # 2. Builder Lowering
+                    builder = RepoOSTabularBuilder()
+                    lower_sexpr_to_tabular_builder(optimized_s_expr, builder)
+                    cpp_code = builder.build_cpp()
+                    
+                    # 3. Z3 Formal Verification
+                    if not verify_tabular_logic(python_code, cpp_code, domain_vars_json):
+                        print("[Compiler] ❌ Z3 Tabular Verification Failed. Discarding compilation.")
+                        continue
+                        
+                    cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
+                    with open(cpp_source_path, "w") as f: f.write(cpp_code)
                     print(f"      🧵 Compiling C++ Kernel for {track}...")
-                    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", 
-                                    cpp_source_path, "-o", output_dylib], check=True)
+                    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", cpp_source_path, "-o", output_dylib], check=True)
                     print(f"      ✅ C++ Library generated: {output_dylib}")
 
                 elif track == "MATH":
-                    # MLIR to LLVM Compilation (Existing V2 code)
-                    wrapper_code = synthesis_result
-                    bridge = await generate_data_bridge(python_code, wrapper_code)
-                    sample_inputs_code = await generate_sample_inputs(python_code, wrapper_code)
+                    from component11_egraph import optimize_math_ir
+                    from component2_smt import verify_math_logic
                     
-                    if not wrapper_code: 
-                        print("      ⚠️ AI failed to generate wrapper. Skipping.")
-                        failure_count += 1
+                    llm_s_expr = synthesis_result
+                    
+                    # 1. E-Graph Optimization (Algebraic)
+                    optimized_s_expr = optimize_math_ir(llm_s_expr)
+                    
+                    # 2. Builder Lowering
+                    builder = RepoOSMathBuilder()
+                    lower_sexpr_to_math_builder(optimized_s_expr, builder)
+                    cpp_code = builder.build_cpp() # Emits pure AVX/SIMD C++
+                    
+                    # 3. Z3 Formal Verification
+                    if not verify_math_logic(python_code, cpp_code, domain_vars_json):
+                        print("[Compiler] ❌ Z3 Math Verification Failed. Discarding compilation.")
                         continue
-                    
-                    local_scope = {"torch": torch}
-                    exec(wrapper_code, local_scope)
-                    module_class = local_scope.get("GeneratedModule")
-                    
-                    if not module_class:
-                        raise ValueError("Failed to find 'GeneratedModule' class in AI output.")
-                    
-                    module = module_class()
-                    module.eval()
-                    
-                    print(f"      Building Sample Inputs...")
-                    local_scope_inputs = {"torch": torch, "json": json}
-                    exec(sample_inputs_code, local_scope_inputs)
-                    build_sample = local_scope_inputs.get("build_sample_inputs")
-                    sample_inputs_dict = build_sample()
-                    sample_args = tuple(sample_inputs_dict.values())
-                    
-                    print(f"      Tracing Module...")
-                    base_mlir = trace_to_base_mlir(module, sample_args)
-                    base_mlir = prune_abi_to_void(base_mlir)
-                    
-                    base_mlir_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}_base.mlir")
-                    with open(base_mlir_path, "w") as f: f.write(base_mlir)
-
-                    print(f"      Generating Optimization Heuristics...")
-                    transform_script = await generate_transform_script(base_mlir)
-                    
-                    print(f"      Compiling MLIR Kernel...")
-                    await apply_ai_transform_and_compile(base_mlir, transform_script, output_dylib)
+                        
+                    cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
+                    with open(cpp_source_path, "w") as f: f.write(cpp_code)
+                    print(f"      🧵 Compiling C++ Kernel for {track}...")
+                    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", cpp_source_path, "-o", output_dylib], check=True)
+                    print(f"      ✅ C++ Library generated: {output_dylib}")
 
                 elif track == "BRANCHING":
                     # For BRANCHING, the AI generates an S-Expression

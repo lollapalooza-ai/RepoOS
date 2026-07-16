@@ -201,6 +201,13 @@ def process_file(file_path, forced_module_name=None, return_rewritten=False):
         module_name = forced_module_name
     else:
         module_name = normalize_fqn(file_path, "").rstrip(".")
+        
+    # Save the rewritten source to cache for the runtime hijacker
+    cache_dir = os.environ.get("REPOOS_CACHE_DIR", ".poly_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"rewritten_{module_name}.py")
+    with open(cache_path, "w", encoding="utf-8") as cache_f:
+        cache_f.write(rewritten_source)
     
     with driver.session() as session:
         session.run("""

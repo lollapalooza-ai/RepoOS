@@ -1,14 +1,18 @@
 import sys
 import os
-import ast
-import ctypes
-import inspect
 import importlib.util
 from importlib.abc import MetaPathFinder, Loader
 from importlib.machinery import ModuleSpec
 
-# Import our Poly-Kernel components
-from component1_ingest import process_file
+def load_rewritten_source(file_path, module_name):
+    cache_dir = os.environ.get("REPOOS_CACHE_DIR", ".poly_cache")
+    cache_path = os.path.join(cache_dir, f"rewritten_{module_name}.py")
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
 from component5_orchestrator import LazyCallManager
 
 class PolyKernelLoader(Loader):
@@ -21,10 +25,10 @@ class PolyKernelLoader(Loader):
 
     def exec_module(self, module):
         print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
-        print(f"[Hijacker] 1. Ingesting {self.file_path} to Semantic Graph...")
+        print(f"[Hijacker] 1. Fast AST Chunking (Skipping Neo4j overhead)...")
         
-        # 1. On-the-fly Neo4j Ingestion & AST Chunking
-        rewritten_source = process_file(self.file_path, forced_module_name=module.__name__, return_rewritten=True)
+        # 1. Fast AST Chunking (Skip Neo4j DB overhead)
+        rewritten_source = load_rewritten_source(self.file_path, module.__name__)
 
         # 2. Execute the rewritten module to get the objects in memory
         try:

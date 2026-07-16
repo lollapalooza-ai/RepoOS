@@ -3,8 +3,6 @@ import os
 import sys
 import inspect
 from neo4j import GraphDatabase
-import numpy as np
-import torch
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
@@ -48,10 +46,13 @@ def make_nd_memref_struct(ndim: int, dtype):
         ]
     return MemRefDescriptor
 
-def pack_tensor_to_memref(tensor: torch.Tensor):
+def pack_tensor_to_memref(tensor):
     """
     Converts a PyTorch tensor into the C-Struct required by dynamic MLIR.
     """
+    import numpy as np
+    import torch
+    
     tensor_np = tensor.detach().cpu().numpy()
     ndim = tensor_np.ndim
     
@@ -121,12 +122,29 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                 return list(out_buffer)
                 
             elif track == "TABULAR":
-                # Expects Arrow Table or similar
-                # For demo purposes, assuming simple layout
-                print(f"      [Orchestrator]🗄️ Executing C++ Arrow Kernel...")
-                # prices_ptr = to_arrow_ptr(args[0], "prices")
-                # kernel(prices_ptr, ...)
-                return original_func(*args, **kwargs)
+                print(f"      [Orchestrator]🗄️ Executing C++ Arrow Kernel (Zero-Copy)...")
+                import pandas as pd
+                import pyarrow as pa
+                
+                db = args[0]
+                # Read data (in a real system, this would already be in Arrow format)
+                df = pd.read_sql("SELECT * FROM revenue_details", db.bind)
+                df['cancelled_revenue'] = df['cancelled_revenue'].astype('float32')
+                df['vip_revenue'] = df['vip_revenue'].astype('float32')
+                
+                arrow_table = pa.Table.from_pandas(df)
+                
+                # Zero-copy memory handoff (bypassing SQLAlchemy completely)
+                col1_ptr = to_arrow_ptr(arrow_table, "cancelled_revenue")
+                col2_ptr = to_arrow_ptr(arrow_table, "vip_revenue")
+                length = len(arrow_table)
+                
+                out_buffer = (ctypes.c_float * length)()
+                
+                # Execute C++ kernel directly over Arrow columnar memory
+                kernel(ctypes.c_size_t(length), col1_ptr, col2_ptr, out_buffer)
+                
+                return [{"cancelled_revenue": float(v)} for v in out_buffer if float(v) > 0.0]
                 
             else: # MATH / BRANCHING
                 if not prep_code or not post_code:

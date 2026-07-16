@@ -1,9 +1,11 @@
 from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
 from typing import List
-
-from . import models
-from .database import engine, get_db
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from revenue_app import models
+from revenue_app.database import engine, get_db
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -13,3 +15,26 @@ app = FastAPI()
 def get_revenue(db: Session = Depends(get_db)):
     results = db.query(models.RevenueDetails).filter(models.RevenueDetails.cancelled_revenue > 20).all()
     return results
+
+if __name__ == "__main__":
+    import sys
+    run_count = next((int(arg) for arg in sys.argv if arg.isdigit()), None)
+    
+    if run_count is not None:
+        import time
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        
+        # Warmup
+        client.get("/api/v2/revenue")
+        
+        start = time.perf_counter()
+        for _ in range(run_count):
+            client.get("/api/v2/revenue")
+        duration = time.perf_counter() - start
+        
+        print(f"  - Final Result[0,0]: {duration}")
+        print(f"  - Avg Speed: {duration * 1000 / run_count:.4f} ms")
+    else:
+        import uvicorn
+        uvicorn.run(app, host="127.0.0.1", port=8000)
