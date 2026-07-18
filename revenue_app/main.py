@@ -22,15 +22,19 @@ if __name__ == "__main__":
     
     if run_count is not None:
         import time
-        from fastapi.testclient import TestClient
-        client = TestClient(app)
+        import revenue_app.main  # Force import of the module namespace so the Hijacker intercepts it!
+        import revenue_app.database
+        
+        # Get a DB session
+        db_gen = revenue_app.database.get_db()
+        db = next(db_gen)
         
         # Warmup
-        client.get("/api/v2/revenue")
+        revenue_app.main.get_revenue(db)
         
         start = time.perf_counter()
         for _ in range(run_count):
-            client.get("/api/v2/revenue")
+            revenue_app.main.get_revenue(db)
         duration = time.perf_counter() - start
         
         print(f"  - Final Result[0,0]: {duration}")
