@@ -103,27 +103,48 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
     - You must reset your boolean flags back to `false` at the end of your `set_object_complete_action` C++ block so they are clean for the next JSON object in the array.
 
     OUTPUT FORMAT:
-    You MUST output a single JSON object containing EXACTLY 3 keys: "eager", "lazy", and "balanced". Each key must contain the raw Python string of the `build_parser(fsm)` function for that strategy.
+    You MUST output exactly 3 markdown Python blocks. Do NOT output JSON. 
+    Separate them with the exact headers:
+    ### EAGER
+    ```python
+    ...
+    ```
+    ### LAZY
+    ```python
+    ...
+    ```
+    ### BALANCED
+    ```python
+    ...
+    ```
     """
     try:
         response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config={'response_mime_type': 'application/json', 'temperature': 0.0}
+            config={'temperature': 0.0}
         )
         res_text = response.text
         log_oracle_interaction("fsm_transform_synthesis", prompt, res_text)
         
-        # Strip markdown json blocks if the model wrapped it
-        clean_json = res_text
-        if clean_json.startswith("```json"):
-            clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-        elif clean_json.startswith("```"):
-            clean_json = clean_json.split("```")[1].split("```")[0].strip()
+        # Parse the 3 python blocks using regex
+        import re
+        eager_match = re.search(r'### EAGER\s*```python\n(.*?)\n```', res_text, re.DOTALL)
+        lazy_match = re.search(r'### LAZY\s*```python\n(.*?)\n```', res_text, re.DOTALL)
+        balanced_match = re.search(r'### BALANCED\s*```python\n(.*?)\n```', res_text, re.DOTALL)
+        
+        eager_code = eager_match.group(1).strip() if eager_match else ""
+        lazy_code = lazy_match.group(1).strip() if lazy_match else ""
+        balanced_code = balanced_match.group(1).strip() if balanced_match else ""
+        
+        if not eager_code or not lazy_code or not balanced_code:
+            print("[Oracle] Warning: Failed to extract all 3 FSM variants via regex. Falling back to naive block extraction.")
+            blocks = re.findall(r'```python\n(.*?)\n```', res_text, re.DOTALL)
+            eager_code = blocks[0].strip() if len(blocks) > 0 else ""
+            lazy_code = blocks[1].strip() if len(blocks) > 1 else ""
+            balanced_code = blocks[2].strip() if len(blocks) > 2 else ""
             
-    
-        variants_dict = json.loads(clean_json)
-        return [variants_dict.get("eager", ""), variants_dict.get("lazy", ""), variants_dict.get("balanced", "")]
+        return [eager_code, lazy_code, balanced_code]
     except Exception as e:
         import traceback
         print(f"[Oracle] FSM synthesis failed: {repr(e)}\n{traceback.format_exc()}")
@@ -159,8 +180,8 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
                 config={'temperature': 0.0, 'response_mime_type': 'application/json'}
             )
             res_text = response.text
+            res_text = response.text
             log_oracle_interaction("math_synthesis", prompt, res_text)
-            import json
             parsed = json.loads(res_text)
             return parsed.get("s_expr", "")
         except Exception as e:
@@ -200,8 +221,8 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
                 config={'temperature': 0.0, 'response_mime_type': 'application/json'}
             )
             res_text = response.text
+            res_text = response.text
             log_oracle_interaction("tabular_synthesis", prompt, res_text)
-            import json
             parsed = json.loads(res_text)
             return parsed.get("s_expr", "")
         except Exception as e:

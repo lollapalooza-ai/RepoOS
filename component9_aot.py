@@ -12,16 +12,17 @@ from component11_egraph import optimize_branching_ir
 from component2_smt import verify_branching_logic
 from component2_smt import generate_transform_script
 
-def lower_sexpr_to_builder(s_expr: str, builder) -> None:
+def lower_sexpr_to_builder(s_expr: str, builder, target_fqn: str) -> None:
     """
     Stub for the deterministic recursive parser.
     Lowers optimized S-expression to C++ Builder logic.
     """
     print("[Parser] ⚙️ Lowering S-Expression to C++...")
     # Mock implementation that creates a generic C++ function returning dummy values
-    builder.declare_struct("Revenues", ["float", "float"])
-    builder.begin_function("calculate_status_revenues", ["void*"], ["Revenues"])
-    builder.emit_op("    Revenues rev = {1.0f, 2.0f};")
+    func_name = target_fqn.split('.')[-1]
+    builder.declare_struct("MockStruct", ["float", "float"])
+    builder.begin_function(func_name, ["void*"], ["MockStruct"])
+    builder.emit_op("    MockStruct rev = {1.0f, 2.0f};")
     builder.emit_op("    return rev;")
     builder.end_function()
 
@@ -31,7 +32,7 @@ def compile_branching_track(target_fqn: str, python_code: str, llm_s_expr: str, 
     
     # 2. Lower the optimized S-expression to C++ using our safe Builder API
     builder = RepoOSBranchingBuilder()
-    lower_sexpr_to_builder(optimized_s_expr, builder) # (Deterministic recursive parser)
+    lower_sexpr_to_builder(optimized_s_expr, builder, target_fqn) # (Deterministic recursive parser)
     cpp_code = builder.build_cpp()
     
     # 3. Z3 Formal Verification (The Safety Net)
@@ -503,10 +504,16 @@ def safe_execute_fsm_schedule(ai_generated_python_code: str, fsm_builder: RepoOS
     compiled_code = compile(tree, filename="<ast>", mode="exec")
     exec(compiled_code, {}, local_scope)
     
-    if "build_parser" not in local_scope:
+    parser_func = None
+    for name, obj in local_scope.items():
+        if name.startswith("build_parser") and callable(obj):
+            parser_func = obj
+            break
+            
+    if not parser_func:
         raise ValueError("AI failed to generate 'build_parser' function.")
         
-    local_scope["build_parser"](fsm_builder)
+    parser_func(fsm_builder)
 
 def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoOSSchedule):
     """Safely parses and executes the AI schedule via AST whitelist."""
