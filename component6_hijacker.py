@@ -33,6 +33,7 @@ class PolyKernelLoader(Loader):
         # 2. Execute the rewritten module to get the objects in memory
         try:
             code = compile(rewritten_source, self.file_path, 'exec')
+            module.__dict__['__file__'] = self.file_path
             exec(code, module.__dict__)
         except KeyError as e:
             # Handle libraries that perform strict one-time registration in global registries

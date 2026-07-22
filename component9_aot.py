@@ -1007,8 +1007,7 @@ class RepoOSTabularBuilder:
         return self.cpp_code
 
 def lower_sexpr_to_tabular_builder(s_expr, builder):
-    from google import genai
-    client = genai.Client()
+    from component2_smt import client
     prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer):\n{s_expr}"
     res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
@@ -1022,8 +1021,7 @@ class RepoOSMathBuilder:
         return self.cpp_code
 
 def lower_sexpr_to_math_builder(s_expr, builder):
-    from google import genai
-    client = genai.Client()
+    from component2_smt import client
     prompt = f"Convert this Algebraic S-Expression to a pure AVX/SIMD C++ kernel:\n{s_expr}"
     res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
