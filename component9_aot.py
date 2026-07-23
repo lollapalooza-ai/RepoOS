@@ -1022,7 +1022,7 @@ class RepoOSMathBuilder:
 
 def lower_sexpr_to_math_builder(s_expr, builder):
     from component2_smt import client
-    prompt = f"Convert this Algebraic S-Expression to a pure AVX/SIMD C++ kernel:\n{s_expr}"
+    prompt = f"Convert this Algebraic S-Expression to a pure standard C++ kernel without architecture-specific intrinsics (rely on compiler auto-vectorization):\n{s_expr}"
     res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
     match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)

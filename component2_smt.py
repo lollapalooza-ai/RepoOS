@@ -101,6 +101,7 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
     - DO NOT attempt to write inline C++ `if` statements inside `on_char` or `on_sequence` transitions.
     - ALL compound logic (the actual math and accumulation) MUST happen inside the C++ string you pass to `fsm.set_object_complete_action()`. 
     - You must reset your boolean flags back to `false` at the end of your `set_object_complete_action` C++ block so they are clean for the next JSON object in the array.
+    - FATAL ERROR WARNING: Python DOES NOT support character subtraction like `'0'-'9'`. If you need to match numbers, you MUST use a loop in Python, e.g., `for i in range(10): fsm.on_char(state, str(i), next_state)`. Do NOT write `'0'-'9'` anywhere in the Python script!
 
     OUTPUT FORMAT:
     You MUST output exactly 3 markdown Python blocks. Do NOT output JSON. 
