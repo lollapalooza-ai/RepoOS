@@ -206,10 +206,16 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         - (get-col <dataset> <column_name>)
         - (== <a> <b>), (> <a> <b>), (< <a> <b>)
         - (mul <a> <b>), (add <a> <b>)
+
+        CRITICAL ABI CHANGE:
+        The C++ kernel lowering this S-expression MUST be generated with the signature:
+        `extern "C" void _mlir_ciface_tabular_stream_main(int socket_fd, float* out_buffer)`
+        
+        The kernel must include a lightweight wire-protocol decoder that reads tabular bytes directly from `socket_fd` into contiguous Struct-of-Arrays (SoA) memory before executing the Relational logic.
         
         STRICT RULES:
-        1. FATAL ERROR WARNING: Do NOT generate C++ or Python code.
-        2. Translate the logic EXACTLY as written. Do not attempt to optimize (e.g., do not manually push filters down). The E-graph will optimize it.
+        1. FATAL ERROR WARNING: Do NOT generate C++ or Python code yourself.
+        2. Translate the logic EXACTLY as written. Do not attempt to optimize.
         3. OUTPUT AS JSON: You MUST output a single JSON object with a key "s_expr".
         
         PYTHON LOGIC:

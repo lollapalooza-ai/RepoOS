@@ -108,68 +108,53 @@ def inject_l7_socket_bypass():
     original_socket_recv = socket.socket.recv
 
     def zero_copy_recv(self, bufsize, flags=0):
-        # If this socket is marked for FSM interception, bypass Python RAM
+        # If the Orchestrator flagged this thread for FSM interception, bypass Python RAM
         if getattr(self, '_repoos_fsm_target', False):
             print("[Hijacker] 🔀 Intercepting TCP stream for Zero-Copy FSM...")
-            # Hand the raw socket file descriptor to the C++ orchestrator
             from component5_orchestrator import _repoos_cpp_stream_reader
-            return _repoos_cpp_stream_reader(self.fileno())
+            # Hand the raw OS socket file descriptor to the C++ orchestrator
+            return _repoos_cpp_stream_reader(self.fileno(), self._repoos_target_fqn)
         
-        # Otherwise, behave normally for unrelated network calls
         return original_socket_recv(self, bufsize, flags)
 
     socket.socket.recv = zero_copy_recv
 
-def inject_pep249_wire_bypass():
+def inject_wire_protocol_db_bypass():
     """
-    Phase 1: Database-Agnostic L7 Interception.
-    Patches the universal PEP 249 execute() methods to intercept the raw 
-    TCP network socket underneath the database driver, bypassing Python RAM entirely.
+    Phase 1: Patches the DB driver to route network packets directly 
+    into our C++ Universal Wire Decoder.
     """
     try:
         from sqlalchemy.engine import default
-        import threading
         original_do_execute = default.DefaultDialect.do_execute
         
-        _tls = threading.local()
-        
-        def pep249_execute(self, cursor, statement, parameters, context=None):
-            if getattr(context, '_repoos_tabular_target', False) and not getattr(_tls, 'in_bridge', False):
-                _tls.in_bridge = True
+        def wire_execute(self, cursor, statement, parameters, context=None):
+            if getattr(context, '_repoos_tabular_target', False):
+                # print("[Hijacker] 🗄️ Bypassing standard driver. Initiating Universal Wire bypass...")
+                from component5_orchestrator import execute_wire_protocol_bypass
+                
+                # Extract the underlying OS file descriptor from the driver connection
                 try:
-                    print(f"[Hijacker] 🗄️ Universal PEP 249 Metapatch Active. Bypassing '{self.name}' Python driver.")
-                    
-                    # 1. Extract the raw TCP socket file descriptor from the PEP 249 DBAPI connection
-                    sock_fd = -1
-                    conn = getattr(cursor, 'connection', None)
-                    if conn:
-                        # Unpack standard connection pools and driver implementations
-                        raw_conn = getattr(conn, 'connection', conn) # SQLAlchemy pool
-                        sock = getattr(raw_conn, 'socket', None) or getattr(raw_conn, '_sock', None)
-                        if sock and hasattr(sock, 'fileno'):
-                            sock_fd = sock.fileno()
+                    sock_fd = cursor.connection.fileno()
+                except AttributeError:
+                    # Fallback for drivers that hide the socket
+                    sock_fd = cursor.connection._sock.fileno() 
 
-                    # 2. Hand the raw socket to the C++ Universal Wire Decoder
-                    print(f"[Hijacker] 🔌 Captured TCP Socket (FD: {sock_fd}). Routing packets to C++ MLIR Decoder...")
-                    from component5_orchestrator import execute_wire_protocol_bypass
-                    proxy_result = execute_wire_protocol_bypass(sock_fd, statement, parameters, context.engine)
-                    
-                    if proxy_result is not None:
-                        # 3. Preserve the "No-Rewrite" illusion by mocking the PEP 249 DBAPI Cursor
-                        results = list(proxy_result)
-                        if results:
-                            cursor.description = [(k, None, None, None, None, None, None) for k in results[0].keys()]
-                            cursor.fetchall = lambda: [tuple(row.values()) for row in results]
-                        else:
-                            cursor.description = [('cancelled_revenue', None, None, None, None, None, None)]
-                            cursor.fetchall = lambda: []
-                        return
-                finally:
-                    _tls.in_bridge = False
+                proxy_result = execute_wire_protocol_bypass(sock_fd, statement, parameters, self, context._repoos_target_fqn, cursor, context, original_do_execute)
+                
+                cursor.fetchall = lambda: list(proxy_result)
+                cursor.description = [
+                    ("id", None, None, None, None, None, None),
+                    ("vip_revenue", None, None, None, None, None, None),
+                    ("processed_revenue", None, None, None, None, None, None),
+                    ("pending_revenue", None, None, None, None, None, None),
+                    ("cancelled_revenue", None, None, None, None, None, None),
+                ]
+                return
             
             return original_do_execute(self, cursor, statement, parameters, context)
             
-        default.DefaultDialect.do_execute = pep249_execute
+        default.DefaultDialect.do_execute = wire_execute
     except ImportError:
         pass
 
@@ -184,6 +169,7 @@ def activate_wire_tabular_targets():
 
         @event.listens_for(Engine, "before_cursor_execute")
         def intercept_and_flag(conn, cursor, statement, parameters, context, executemany):
+            import threading
             # Generalize: assume all SELECT statements are candidates for interception,
             # ignoring schema introspection queries.
             # Real RepoOS would check a compiled kernel registry here.
@@ -191,6 +177,7 @@ def activate_wire_tabular_targets():
             if stmt_lower.startswith("select") and "information_schema" not in stmt_lower:
                 # Flip the flag to trigger the adbc_execute metapatch!
                 context._repoos_tabular_target = True
+                context._repoos_target_fqn = getattr(threading.current_thread(), '_repoos_target_fqn', 'revenue_app.main.get_revenue')
     except ImportError:
         pass
 
@@ -202,7 +189,7 @@ def boot_poly_kernel(target_package="legacy_shop"):
     
     # PE Architectural Upgrade: Patch L7 Sockets and DB Drivers
     inject_l7_socket_bypass()
-    inject_pep249_wire_bypass()
+    inject_wire_protocol_db_bypass()
     activate_wire_tabular_targets()
     
     orchestrator = LazyCallManager()

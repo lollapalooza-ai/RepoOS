@@ -418,6 +418,7 @@ class RepoOSFSMBuilder:
         cpp_template = f"""
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/socket.h>
 
 // Custom float parser (Zero-Allocation)
 static float parse_float_from_stream(const char*& ptr, const char* end) {{
@@ -445,33 +446,39 @@ static float parse_float_from_stream(const char*& ptr, const char* end) {{
     return is_negative ? -value : value;
 }}
 
-extern "C" void _mlir_ciface_main(const char* data, size_t len, float* out) {{
+extern "C" void _mlir_ciface_stream_main(int socket_fd, float* out) {{
     enum State {{
         {enum_defs}
     }};
     
     State state = STATE_{init_state_name};
-    const char* ptr = data;
-    const char* end = data + len;
     
     // Domain-agnostic variables
     {' '.join(f'bool {var} = false;' for var in self.bool_vars)}
     {' '.join(f'float {var} = 0.0f;' for var in self.float_vars)}
 
-    // FSM execution loop
-    while (ptr < end) {{
-        switch (state) {{
+    // Phase 2: Fixed 64KB unmanaged ring buffer (Zero-Allocation)
+    char buffer[65536]; 
+    ssize_t bytes_read;
+    
+    // Phase 3: Stream Fusion (Compute-on-the-fly)
+    while ((bytes_read = recv(socket_fd, buffer, sizeof(buffer), 0)) > 0) {{
+        const char* ptr = buffer;
+        const char* end = buffer + bytes_read;
+
+        while (ptr < end) {{
+            switch (state) {{
 {switch_cases}
-            default:
-                ptr++;
-                break;
+                default:
+                    ptr++;
+                    break;
+            }}
         }}
     }}
     
-    // Final check for the last object if EOF reached without '}}'
+    // Final check for the last object if EOF reached
     {self.object_complete_action}
     
-    // Direct output write
     out[0] = {self.return_variable};
 }}
 """
@@ -1008,7 +1015,7 @@ class RepoOSTabularBuilder:
 
 def lower_sexpr_to_tabular_builder(s_expr, builder):
     from component2_smt import client
-    prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer):\n{s_expr}"
+    prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_tabular_stream_main(int socket_fd, float* out_buffer):\n{s_expr}"
     res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
     match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)

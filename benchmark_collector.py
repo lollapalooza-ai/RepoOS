@@ -47,11 +47,8 @@ def run_benchmark(label, cmd, env=None):
     except:
         pass
         
-    p.wait()
+    full_output, full_err = p.communicate()
     end_time = time.perf_counter()
-    full_output = p.stdout.read()
-    
-    # 2. Extract Internal "Pure" Execution Time and Result if available
     # Looking for: "  - Avg Speed: 0.0090 ms" and "  - Final Result[0,0]: 3.2804"
     pure_time = None
     final_res = None
