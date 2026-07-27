@@ -111,7 +111,7 @@ def _repoos_cpp_stream_reader(socket_fd: int, target_fqn: str):
     
     return float(out_buffer[0])
 
-def execute_wire_protocol_bypass(sock_fd_ignored: int, query: str, params: dict, dialect, target_fqn: str, cursor=None, context=None, original_do_execute=None):
+def execute_wire_protocol_bypass(sock_fd: int, query: str, params: dict, dialect, target_fqn: str, cursor=None, context=None, original_do_execute=None):
     """
     Phase 2 & 3: C++ Wire Decoder & Compute-on-the-Fly.
     Eliminates all Python tuples and Pandas overhead. Data flows directly 
@@ -120,7 +120,6 @@ def execute_wire_protocol_bypass(sock_fd_ignored: int, query: str, params: dict,
     import ctypes
     import os
     import time
-    import struct
     
     t0 = time.perf_counter()
     
@@ -132,36 +131,22 @@ def execute_wire_protocol_bypass(sock_fd_ignored: int, query: str, params: dict,
     CACHE_DIR = os.getenv("REPOOS_CACHE_DIR", "./.poly_cache")
     dylib_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.dylib")
     
-    import socket
-    import threading
-    r_sock, w_sock = socket.socketpair()
-    r_fd = r_sock.fileno()
-    w_fd = w_sock.fileno()
-    
-    def writer_thread():
-        try:
-            if original_do_execute and cursor and context:
-                original_do_execute(dialect, cursor, query, params, context)
-                records = cursor.fetchall()
-                
-                for row in records:
-                    buf = struct.pack('iffi', 0, 0.0, float(row[4] if row[4] else 0.0), 0)
-                    os.write(w_fd, buf)
-        finally:
-            w_sock.close()
-
-    writer = threading.Thread(target=writer_thread)
-    writer.start()
+    if original_do_execute and cursor and context:
+        print("[Orchestrator] Sending query over raw socket...")
+        mogrified_query = cursor.mogrify(query, params)
+        import pymysql.constants.COMMAND
+        cursor.connection._execute_command(pymysql.constants.COMMAND.COM_QUERY, mogrified_query)
+        print("[Orchestrator] Query sent. Handing socket to C++ Kernel...")
     
     try:
         kernel = ctypes.CDLL(dylib_path)._mlir_ciface_tabular_stream_main
-        kernel(r_fd, out_buffer)
+        # Execute bare-metal SIMD kernel over the active network socket
+        print("[Orchestrator] Entering C++ Kernel...")
+        kernel(sock_fd, out_buffer)
+        print("[Orchestrator] C++ Kernel returned successfully!")
     except OSError as e:
         print(f"⚠️ Tabular Kernel failed to load: {e}")
         raise
-    finally:
-        r_sock.close()
-        writer.join()
         
     t1 = time.perf_counter()
     # print(f"      📊 Universal Wire Decoder Benchmark:")
@@ -178,8 +163,8 @@ def _build_generic_proxy_result_arrow(c_array_buffer):
         # A value of exactly 0.0 acts as our EOF / null terminator from the C++ kernel
         if val == 0.0:
             break
-        # Return a tuple matching the 5 columns of RevenueDetails: (id, vip, processed, pending, cancelled)
-        yield ("mock_id", 0.0, 0.0, 0.0, float(val))
+        # The target column schema is injected dynamically by the LLM Translation phase
+        yield (None, None, None, None, float(val))
 
 def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, post_code, track="MATH"):
     """

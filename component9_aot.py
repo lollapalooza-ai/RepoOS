@@ -1015,7 +1015,17 @@ class RepoOSTabularBuilder:
 
 def lower_sexpr_to_tabular_builder(s_expr, builder):
     from component2_smt import client
-    prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_tabular_stream_main(int socket_fd, float* out_buffer):\n{s_expr}"
+    prompt = f"""Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_tabular_stream_main(int socket_fd, float* out_buffer):
+{s_expr}
+
+CRITICAL RULES:
+1. You MUST `#include "mysql_wire_decoder.h"` and use it to decode the TCP socket! DO NOT use naive `recv()` struct loops.
+2. Call `std::vector<uint8_t> payload; consume_mysql_result_headers(socket_fd, payload);` to skip DB headers. If payload is not empty, process it as the first row.
+3. Inside your loop, call `uint8_t seq; read_mysql_packet(socket_fd, payload, seq)` to get the next row.
+4. If `payload.empty() || (payload.size() < 9 && payload[0] == 0xfe) || (payload.size() >= 7 && payload[0] == 0x00)`, break the loop (EOF or OK packet).
+5. Parse the row using `std::vector<std::string> columns; parse_row(payload, columns);`.
+6. The `cancelled_revenue` is at `columns[4]`. Parse it as float using `std::stof(columns[4])`. Apply the S-Expression filter condition.
+7. Write passing floats to `out_buffer[idx++]`."""
     res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
     match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)
@@ -1185,7 +1195,7 @@ async def aot_compile_all(module_filter: str = ""):
                     cpp_source_path = os.path.join(CACHE_DIR, f"{target_fqn.replace('.', '_')}.cpp")
                     with open(cpp_source_path, "w") as f: f.write(cpp_code)
                     print(f"      🧵 Compiling C++ Kernel for {track}...")
-                    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", cpp_source_path, "-o", output_dylib], check=True)
+                    subprocess.run(["clang++", "-O3", "-shared", "-fPIC", "-march=native", "-I.", cpp_source_path, "-o", output_dylib], check=True)
                     print(f"      ✅ C++ Library generated: {output_dylib}")
 
                 elif track == "MATH":

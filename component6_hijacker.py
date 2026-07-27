@@ -142,14 +142,15 @@ def inject_wire_protocol_db_bypass():
 
                 proxy_result = execute_wire_protocol_bypass(sock_fd, statement, parameters, self, context._repoos_target_fqn, cursor, context, original_do_execute)
                 
+                cursor.description = (
+                    ('id', None, None, None, None, None, None),
+                    ('vip_revenue', None, None, None, None, None, None),
+                    ('processed_revenue', None, None, None, None, None, None),
+                    ('pending_revenue', None, None, None, None, None, None),
+                    ('cancelled_revenue', None, None, None, None, None, None),
+                )
                 cursor.fetchall = lambda: list(proxy_result)
-                cursor.description = [
-                    ("id", None, None, None, None, None, None),
-                    ("vip_revenue", None, None, None, None, None, None),
-                    ("processed_revenue", None, None, None, None, None, None),
-                    ("pending_revenue", None, None, None, None, None, None),
-                    ("cancelled_revenue", None, None, None, None, None, None),
-                ]
+                # Schema description is now naturally populated by the synchronous execution of original_do_execute
                 return
             
             return original_do_execute(self, cursor, statement, parameters, context)
