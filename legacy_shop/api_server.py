@@ -1,6 +1,6 @@
 # legacy_shop/api_server.py
 from fastapi import FastAPI
-from .ecommerce import generate_payload
+from legacy_shop.ecommerce import generate_payload
 import uvicorn
 
 app = FastAPI()

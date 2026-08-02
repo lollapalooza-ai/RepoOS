@@ -61,7 +61,9 @@ def optimize_tabular_ir(s_expr_ir: str) -> str:
         )
     ]
     runner = egg.Runner(rewrite_rules)
-    best_cost, optimized_s_expr = egg.Extractor(runner.run(s_expr_ir), cost_function="memory_reads").extract()
+    root_id = runner.add_expr(s_expr_ir)
+    runner.run()
+    best_cost, optimized_s_expr = egg.Extractor(runner, cost_function="memory_reads").extract(root_id)
     return optimized_s_expr
 
 def optimize_math_ir(s_expr_ir: str) -> str:
@@ -84,5 +86,7 @@ def optimize_math_ir(s_expr_ir: str) -> str:
         )
     ]
     runner = egg.Runner(rewrite_rules)
-    best_cost, optimized_s_expr = egg.Extractor(runner.run(s_expr_ir), cost_function="cpu_cycles").extract()
+    root_id = runner.add_expr(s_expr_ir)
+    runner.run()
+    best_cost, optimized_s_expr = egg.Extractor(runner, cost_function="cpu_cycles").extract(root_id)
     return optimized_s_expr

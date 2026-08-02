@@ -1,10 +1,13 @@
 import subprocess
+print("DEBUG: component9_aot.py imported")
 import os
 import sys
 import asyncio
 import shutil
 import re
+print("DEBUG: about to import neo4j")
 from neo4j import GraphDatabase
+print("DEBUG: imported neo4j")
 import torch
 import torch._dynamo as dynamo
 
@@ -157,6 +160,27 @@ class RepoOSSchedule:
         )
         return gen_op
 
+    def vectorize(self, target_var: str) -> str:
+        """
+        Forces SIMD vectorization to overcome pointer aliasing pessimism.
+        """
+        vec_op = self._next_var()
+        self.instructions.append(
+            ("vectorize", vec_op, target_var)
+        )
+        self.vectorize_requested = True
+        return vec_op
+
+    def pack(self, target_var: str, packed_sizes: list[int]) -> str:
+        """
+        Projects memory into a Struct of Arrays (SoA) layout.
+        """
+        pack_op = self._next_var()
+        self.instructions.append(
+            ("pack", pack_op, target_var, packed_sizes)
+        )
+        return pack_op
+
     def build_mlir(self) -> str:
         """Compiles the Python instructions into a valid Transform Dialect block."""
         formatted_instructions = []
@@ -177,6 +201,17 @@ class RepoOSSchedule:
                 _, gen_op, target_var = inst
                 formatted_instructions.append(
                     f"    {gen_op} = transform.structured.generalize {target_var} : (!transform.any_op) -> !transform.any_op"
+                )
+            elif isinstance(inst, tuple) and inst[0] == "vectorize":
+                _, vec_op, target_var = inst
+                formatted_instructions.append(
+                    f"    {vec_op} = transform.structured.vectorize {target_var} : (!transform.any_op) -> !transform.any_op"
+                )
+            elif isinstance(inst, tuple) and inst[0] == "pack":
+                _, pack_op, target_var, packed_sizes = inst
+                sizes_str = ", ".join(map(str, packed_sizes))
+                formatted_instructions.append(
+                    f"    {pack_op} = transform.structured.pack {target_var} packed_sizes = [{sizes_str}] : (!transform.any_op) -> !transform.any_op"
                 )
             else:
                 formatted_instructions.append(inst)
@@ -999,11 +1034,10 @@ class RepoOSTabularBuilder:
     def build_cpp(self):
         return self.cpp_code
 
-def lower_sexpr_to_tabular_builder(s_expr, builder):
-    from google import genai
-    client = genai.Client()
+async def lower_sexpr_to_tabular_builder(s_expr, builder):
+    from component2_smt import get_client
     prompt = f"Convert this Relational S-Expression to a C++ kernel with signature extern 'C' void _mlir_ciface_main(int64_t length, const float* col1, const float* col2, float* out_buffer):\n{s_expr}"
-    res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    res = await get_client().aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
     match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)
     builder.cpp_code = match.group(1) if match else res.text
@@ -1014,21 +1048,24 @@ class RepoOSMathBuilder:
     def build_cpp(self):
         return self.cpp_code
 
-def lower_sexpr_to_math_builder(s_expr, builder):
-    from google import genai
-    client = genai.Client()
+async def lower_sexpr_to_math_builder(s_expr, builder):
+    from component2_smt import get_client
     prompt = f"Convert this Algebraic S-Expression to a pure AVX/SIMD C++ kernel:\n{s_expr}"
-    res = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    res = await get_client().aio.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     import re
     match = re.search(r"```cpp\n(.*?)\n```", res.text, re.DOTALL)
     builder.cpp_code = match.group(1) if match else res.text
 
 async def aot_compile_all(module_filter: str = ""):
+    print("DEBUG: Inside aot_compile_all, importing component2_smt")
     from component2_smt import compile_function_logic, generate_transform_script, generate_sample_inputs, generate_data_bridge
+    print("DEBUG: Importing component1b_tracer")
     from component1b_tracer import trace_to_base_mlir
+    print("DEBUG: Importing torch")
     import torch
     import json
     
+    print("DEBUG: Connecting to Neo4j")
     driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
     print(f"\n--- 🚀 Milestone 6: Poly-Kernel Architecture V3 ---")
     
@@ -1162,7 +1199,7 @@ async def aot_compile_all(module_filter: str = ""):
                     
                     # 2. Builder Lowering
                     builder = RepoOSTabularBuilder()
-                    lower_sexpr_to_tabular_builder(optimized_s_expr, builder)
+                    await lower_sexpr_to_tabular_builder(optimized_s_expr, builder)
                     cpp_code = builder.build_cpp()
                     
                     # 3. Z3 Formal Verification
@@ -1187,7 +1224,7 @@ async def aot_compile_all(module_filter: str = ""):
                     
                     # 2. Builder Lowering
                     builder = RepoOSMathBuilder()
-                    lower_sexpr_to_math_builder(optimized_s_expr, builder)
+                    await lower_sexpr_to_math_builder(optimized_s_expr, builder)
                     cpp_code = builder.build_cpp() # Emits pure AVX/SIMD C++
                     
                     # 3. Z3 Formal Verification

@@ -21,12 +21,16 @@ LOCATION = "us-central1"
 # Session-wide timestamp for grouping logs
 SESSION_TIMESTAMP = int(time.time() * 1000)
 
-# Primary Client: Vertex AI (GA)
-client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location=LOCATION
-)
+_client = None
+def get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(
+            vertexai=True,
+            project=PROJECT_ID,
+            location=LOCATION
+        )
+    return _client
 
 def log_oracle_interaction(stage: str, prompt: str, response: str):
     """Logs the full prompt and response for debugging and transparency."""
@@ -106,7 +110,8 @@ async def generate_fsm_transforms(python_code: str, domain_vars: str = "{}"):
     You MUST output a single JSON object containing EXACTLY 3 keys: "eager", "lazy", and "balanced". Each key must contain the raw Python string of the `build_parser(fsm)` function for that strategy.
     """
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-flash',
             contents=prompt,
             config={'response_mime_type': 'application/json', 'temperature': 0.0}
@@ -153,7 +158,8 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         {python_code}
         """
         try:
-            response = await client.aio.models.generate_content(
+            response = await asyncio.to_thread(
+            get_client().models.generate_content,
                 model='gemini-2.5-flash',
                 contents=prompt,
                 config={'temperature': 0.0, 'response_mime_type': 'application/json'}
@@ -194,7 +200,8 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         {python_code}
         """
         try:
-            response = await client.aio.models.generate_content(
+            response = await asyncio.to_thread(
+            get_client().models.generate_content,
                 model='gemini-2.5-flash',
                 contents=prompt,
                 config={'temperature': 0.0, 'response_mime_type': 'application/json'}
@@ -233,7 +240,9 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         {python_code}
         """
         try:
-            response = await client.aio.models.generate_content(
+            import json
+            response = await asyncio.to_thread(
+            get_client().models.generate_content,
                 model='gemini-2.5-flash', 
                 contents=prompt,
                 config={'response_mime_type': 'application/json', 'temperature': 0.0}
@@ -306,7 +315,8 @@ async def generate_inference_transforms(base_mlir_text: str, target_device: str 
     """
     
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro', 
             config={'response_mime_type': 'application/json', 'temperature': 0.0},
             contents=prompt
@@ -389,7 +399,8 @@ async def generate_traceable_wrapper(python_code: str) -> str:
     """
     
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro',
             contents=prompt,
             config={'temperature': 0.0}
@@ -433,7 +444,8 @@ async def generate_data_bridge(python_code: str, wrapper_code: str) -> dict:
     """
     
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro',
             config={'response_mime_type': 'application/json'},
             contents=prompt
@@ -464,7 +476,8 @@ async def generate_sample_inputs(python_code: str, wrapper_code: str = "") -> st
     """
     
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro',
             contents=prompt,
             config={'temperature': 0.0}
@@ -528,7 +541,8 @@ async def generate_transform_script(base_mlir_text: str, target_arch: str = "x86
     """
     
     try:
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro',
             contents=prompt,
             config={'temperature': 0.0}
@@ -578,7 +592,8 @@ async def fix_transform_syntax_with_ai(broken_script: str, compiler_error: str) 
     
     try:
         print("[Oracle] Analyzing compiler error and attempting self-heal...")
-        response = await client.aio.models.generate_content(
+        response = await asyncio.to_thread(
+            get_client().models.generate_content,
             model='gemini-2.5-pro',
             contents=prompt,
             config={'temperature': 0.0}
