@@ -23,6 +23,54 @@ class PolyKernelLoader(Loader):
     def create_module(self, spec):
         return None 
 
+    def get_filename(self, fullname):
+        return self.file_path
+
+    def get_code(self, fullname):
+        # Allow runpy to execute this module as __main__
+        try:
+            import inspect
+            print(f"[Hijacker Debug] get_code called with fullname={fullname}")
+            rewritten = load_rewritten_source(self.file_path, fullname)
+            
+            # INJECT BOOTSTRAP BEFORE execution of main block
+            injection = f"""
+import inspect
+import sys
+from component6_hijacker import boot_poly_kernel
+_orch = boot_poly_kernel('{fullname.split(".")[0]}')
+_mod_dict = globals()
+print(f"[Injection Debug] Scanning globals for functions. Looking for {fullname}.get_revenue")
+for _name, _obj in list(_mod_dict.items()):
+    if inspect.isfunction(_obj) or inspect.isclass(_obj):
+        print(f"  [Injection Debug] Found {{_name}}")
+        _trampoline = _orch.wrap("{fullname}." + _name, _obj)
+        if _trampoline and _trampoline is not _obj:
+            print(f"  [Injection Debug] Successfully wrapped {{_name}}")
+            _mod_dict[_name] = _trampoline
+            
+            # Patch FastAPI app routes if 'app' is in globals
+            if 'app' in _mod_dict and hasattr(_mod_dict['app'], 'routes'):
+                for _route in _mod_dict['app'].routes:
+                    if getattr(_route, 'endpoint', None) is _obj:
+                        print(f"  [Injection Debug] Patching FastAPI route for {{_name}}")
+                        _route.endpoint = _trampoline
+                        if hasattr(_route, 'dependant'):
+                            _route.dependant.call = _trampoline
+"""
+            # Replace the main guard with the injection + main guard
+            if 'if __name__ == "__main__":' in rewritten:
+                rewritten = rewritten.replace('if __name__ == "__main__":', injection + '\nif __name__ == "__main__":')
+            elif "if __name__ == '__main__':" in rewritten:
+                rewritten = rewritten.replace("if __name__ == '__main__':", injection + "\nif __name__ == '__main__':")
+            else:
+                rewritten = rewritten + "\n" + injection
+                
+            return compile(rewritten, self.file_path, 'exec')
+        except:
+            with open(self.file_path, 'r') as f:
+                return compile(f.read(), self.file_path, 'exec')
+
     def exec_module(self, module):
         print(f"\n[Hijacker] 🕵️ Intercepted loading of module: {module.__name__}")
         print(f"[Hijacker] 1. Fast AST Chunking (Skipping Neo4j overhead)...")
@@ -55,7 +103,6 @@ class PolyKernelLoader(Loader):
                     setattr(module, name, trampoline)
                     
                     # B. GLOBAL MRO HACK: Search all loaded modules for stale aliases
-                    # This ensures things like 'from networkx import pagerank' are also accelerated
                     for mod_name, mod in list(sys.modules.items()):
                         if mod and mod_name != module.__name__:
                             try:
@@ -63,9 +110,19 @@ class PolyKernelLoader(Loader):
                                 for attr_name, attr_obj in inspect.getmembers(mod):
                                     if attr_obj is obj:
                                         setattr(mod, attr_name, trampoline)
-                                        # print(f"      [Global Patch] Swapped {attr_name} in {mod_name}")
                             except Exception:
                                 pass
+                                
+                        # C. FastAPI Router Patching
+                        try:
+                            if hasattr(mod, 'app') and hasattr(mod.app, 'routes'):
+                                for route in mod.app.routes:
+                                    if hasattr(route, 'endpoint') and route.endpoint is obj:
+                                        route.endpoint = trampoline
+                                        if hasattr(route, 'dependant'):
+                                            route.dependant.call = trampoline
+                        except Exception:
+                            pass
                 
         print(f"[Hijacker] 2. Attached SHADOW JIT Trampolines to '{module.__name__}'.\n")
 
@@ -88,7 +145,9 @@ class PolyKernelFinder(MetaPathFinder):
                 if spec and spec.origin and spec.origin.endswith('.py'):
                     # Return our custom spec with our loader
                     is_package = spec.submodule_search_locations is not None
+                    from importlib.machinery import ModuleSpec
                     new_spec = ModuleSpec(fullname, PolyKernelLoader(spec.origin, self.orchestrator), is_package=is_package)
+                    new_spec.origin = spec.origin
                     if is_package:
                         new_spec.submodule_search_locations = spec.submodule_search_locations
                     return new_spec

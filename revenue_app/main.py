@@ -26,7 +26,8 @@ if __name__ == "__main__":
         client = TestClient(app)
         
         # Warmup
-        client.get("/api/v2/revenue")
+        res = client.get("/api/v2/revenue").json()
+        print(f"  - [Benchmark Debug] Length of result: {len(res) if isinstance(res, list) else res}")
         
         start = time.perf_counter()
         for _ in range(run_count):

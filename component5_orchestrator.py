@@ -2,6 +2,8 @@ import ctypes
 import os
 import sys
 import inspect
+import torch
+import numpy as np
 from neo4j import GraphDatabase
 
 NEO4J_URI = "bolt://localhost:7687"
@@ -94,27 +96,48 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
     try:
         lib = ctypes.CDLL(dylib_path)
         # Unified entry point for all tracks
-        kernel = lib._mlir_ciface_main
+        _cached_kernel = getattr(lib, "main_kernel", getattr(lib, "_mlir_ciface_main", None))
+        if not _cached_kernel:
+            raise RuntimeError("Kernel entry point not found in dylib")
     except Exception as e:
         print(f"⚠️ Orchestrator: Failed to load native kernel {dylib_path}: {e}")
         return original_func
 
+    # 0. Compile the Data Bridge ONCE during load time to eliminate runtime overhead
+    local_scope = {"ctypes": ctypes, "torch": torch, "np": np}
+    try: import networkx as nx; local_scope["nx"] = nx
+    except: pass
+    
+    prep_func = None
+    post_func = None
+    
+    if prep_code:
+        exec(prep_code, local_scope)
+        prep_func = local_scope.get("prep_inputs")
+    if post_code:
+        exec(post_code, local_scope)
+        post_func = local_scope.get("post_process")
+
+    is_bench = os.environ.get("REPOOS_ENV") == "BENCHMARK"
+    
+    import functools
+    @functools.wraps(original_func)
     def trampoline_trap(*args, **kwargs):
-        print(f"\n--- 🚀 [Orchestrator] Intercepted execution of {target_fqn} [{track}] ---")
+        if not is_bench:
+            print(f"\n--- 🚀 [Orchestrator] Intercepted execution of {target_fqn} [{track}] ---")
         
         try:
             if track == "CRYPTO":
-                # For demo, we just print and return. 
-                # Real implementation would link libsodium.
-                print(f"      [Orchestrator]🔐 Bypassing AI. Executing native libsodium kernel...")
+                if not is_bench:
+                    print(f"      [Orchestrator]🔐 Bypassing AI. Executing native libsodium kernel...")
                 return original_func(*args, **kwargs)
                 
             elif track == "FSM":
-                # Expects bytes as first argument
                 byte_ptr, length = to_byte_ptr(args[0])
-                out_buffer = (ctypes.c_float * 10)() # Pre-allocate output buffer
-                print(f"      [Orchestrator]🧵 Executing C++ FSM Kernel...")
-                kernel(byte_ptr, ctypes.c_size_t(length), out_buffer)
+                out_buffer = (ctypes.c_float * 10)()
+                if not is_bench:
+                    print(f"      [Orchestrator]🧵 Executing C++ FSM Kernel...")
+                _cached_kernel(byte_ptr, ctypes.c_size_t(length), out_buffer)
                 
                 sig = inspect.signature(original_func)
                 if sig.return_annotation in (float, 'float'):
@@ -122,42 +145,82 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                 return list(out_buffer)
                 
             elif track == "TABULAR":
-                print(f"      [Orchestrator]🗄️ Executing C++ Arrow Kernel (Zero-Copy)...")
-                import pandas as pd
-                import pyarrow as pa
+                if not is_bench:
+                    print(f"      [Orchestrator]🗄️ Executing L7 Zero-Copy Interceptor (TCP Socket)...")
+                import ctypes
+                db_session = args[0] if args else list(kwargs.values())[0]
                 
-                db = args[0]
-                # Read data (in a real system, this would already be in Arrow format)
-                df = pd.read_sql("SELECT * FROM revenue_details", db.bind)
-                df['cancelled_revenue'] = df['cancelled_revenue'].astype('float32')
-                df['vip_revenue'] = df['vip_revenue'].astype('float32')
+                # 1. Deep Hijack: Extract Socket
+                try:
+                    dbapi_conn = db_session.connection().connection
+                    pymysql_conn = getattr(dbapi_conn, "connection", dbapi_conn)
+                    sock = getattr(pymysql_conn, "socket", getattr(pymysql_conn, "_sock", None))
+                    fd = sock.fileno()
+                except Exception as e:
+                    fd = -1
                 
-                arrow_table = pa.Table.from_pandas(df)
+                # 2. Invoke Bridge to generate raw binary query
+                sql_bytes, out_buffers, out_len = prep_func(*args, **kwargs)
                 
-                # Zero-copy memory handoff (bypassing SQLAlchemy completely)
-                col1_ptr = to_arrow_ptr(arrow_table, "cancelled_revenue")
-                col2_ptr = to_arrow_ptr(arrow_table, "vip_revenue")
-                length = len(arrow_table)
+                # Send Query and Read Response using Python
+                response_bytes = bytearray()
+                if fd > 0:
+                    length = len(sql_bytes) + 1
+                    header = bytes([length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF, 0, 3])
+                    sock.sendall(header + sql_bytes)
+                    try:
+                        # MySQL Text Resultset:
+                        # 1. Column count packet
+                        # 2. Column definition packets
+                        # 3. EOF packet
+                        # 4. Row packets
+                        # 5. EOF packet
+                        eof_count = 0
+                        while eof_count < 2:
+                            pkt_header = b""
+                            while len(pkt_header) < 4:
+                                chunk = sock.recv(4 - len(pkt_header))
+                                if not chunk: break
+                                pkt_header += chunk
+                            if len(pkt_header) < 4: break
+                            response_bytes.extend(pkt_header)
+                            
+                            pkt_len = pkt_header[0] | (pkt_header[1] << 8) | (pkt_header[2] << 16)
+                            payload = b""
+                            while len(payload) < pkt_len:
+                                chunk = sock.recv(pkt_len - len(payload))
+                                if not chunk: break
+                                payload += chunk
+                            response_bytes.extend(payload)
+                            
+                            if pkt_len > 0 and payload[0] == 0xfe and pkt_len < 9:
+                                eof_count += 1
+                                
+                    except Exception as e:
+                        print(f"      [Orchestrator]⚠️ Socket recv error: {e}")
+                response_bytes = bytes(response_bytes)
                 
-                out_buffer = (ctypes.c_float * length)()
+                print(f"      [Orchestrator Debug] Received {len(response_bytes)} bytes on FD {fd}")
                 
-                # Execute C++ kernel directly over Arrow columnar memory
-                kernel(ctypes.c_size_t(length), col1_ptr, col2_ptr, out_buffer)
+                # 3. Dynamic Kernel Invocation (N-Arity)
+                c_bytes_read = ctypes.c_int(len(response_bytes))
                 
-                return [{"cancelled_revenue": float(v)} for v in out_buffer if float(v) > 0.0]
+                _cached_kernel(response_bytes, c_bytes_read, *out_buffers, ctypes.byref(out_len))
+                
+                if not is_bench:
+                    print(f"      [Orchestrator] Parsed rows: {out_len.value}")
+                
+                # 4. Bridge Post-Process: convert buffers to ORM objects
+                return list(post_func(out_buffers, out_len.value))
                 
             else: # MATH / BRANCHING
                 if not prep_code or not post_code:
                     print(f"      ⚠️ No Data Bridge. Falling back to Python.")
                     return original_func(*args, **kwargs)
 
-                print(f"      [Orchestrator] Bridging Data via AI Python Script...")
-                local_scope = {"torch": torch, "np": np, "args": args, "kwargs": kwargs}
-                try: import networkx as nx; local_scope["nx"] = nx
-                except: pass
-
-                exec(prep_code, local_scope)
-                prep_func = local_scope.get("prep_inputs")
+                if not is_bench:
+                    print(f"      [Orchestrator] Bridging Data via AI Python Script...")
+                
                 tensors = prep_func(*args, **kwargs)
 
                 kernel_args = []
@@ -167,12 +230,11 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
                     numpy_arrays.append(arr)
                     kernel_args.append(ctypes.byref(pack_tensor_to_memref(t)))
 
-                print(f"--- 🚀 [RepoOS] Invoking Bare-Metal Kernel for {target_fqn} ---")
-                kernel(*kernel_args)
+                if not is_bench:
+                    print(f"--- 🚀 [RepoOS] Invoking Bare-Metal Kernel for {target_fqn} ---")
+                _cached_kernel(*kernel_args)
 
                 output_tensor = torch.from_numpy(numpy_arrays[0]) 
-                exec(post_code, local_scope)
-                post_func = local_scope.get("post_process")
                 return post_func(output_tensor, *args, **kwargs)
 
         except Exception as e:
@@ -211,6 +273,11 @@ class LazyCallManager:
         # Ask the object for its true physical identity.
         true_fqn = get_true_fqn(func)
         
+        # If the function was executed in __main__, its true module is lost.
+        # Fallback to the FQN provided by the hijacker.
+        if true_fqn.startswith('__main__.'):
+            true_fqn = fqn
+            
         # ==============================================================
         # FAST FAIL: The $O(1)$ Bypass. 
         # If the AI hasn't compiled it, don't touch it. Zero database overhead.

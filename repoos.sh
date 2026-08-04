@@ -94,4 +94,4 @@ echo -e "\n--- 🚀 RepoOS: Stage 3 (Drop-in Hijack & Execution) ---"
 echo "Running: $FILENAME"
 # Extract root package (e.g. 'networkx') for the hijacker
 ROOT_PACKAGE=$(echo $TARGET | cut -d'.' -f1)
-./build_venv/bin/python3 -c "import sys; sys.argv = ['$FILENAME'] + sys.argv[1:]; from component6_hijacker import boot_poly_kernel; boot_poly_kernel('$ROOT_PACKAGE'); import runpy; runpy.run_path('$FILENAME', run_name='__main__')" "${@:3}"
+./build_venv/bin/python3 -c "import sys; sys.argv = ['$FILENAME'] + sys.argv[1:]; from component6_hijacker import boot_poly_kernel; boot_poly_kernel('$ROOT_PACKAGE'); import runpy; import os; mod = '$FILENAME'.replace('.py', '').replace('/', '.'); runpy.run_module(mod, run_name='__main__')" "${@:3}"

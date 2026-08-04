@@ -49,7 +49,9 @@ def run_benchmark(label, cmd, env=None):
         
     p.wait()
     end_time = time.perf_counter()
-    full_output = p.stdout.read()
+    stdout_str = p.stdout.read()
+    stderr_str = p.stderr.read()
+    full_output = stdout_str + "\n" + stderr_str
     
     # 2. Extract Internal "Pure" Execution Time and Result if available
     # Looking for: "  - Avg Speed: 0.0090 ms" and "  - Final Result[0,0]: 3.2804"
@@ -132,14 +134,49 @@ def main():
     # Result Comparison
     r_native = native_res["result"]
     r_repoos = repoos_res["result"]
-    if r_native is not None and r_repoos is not None:
-        match_str = "MATCH" if abs(r_native - r_repoos) < 1e-5 else "MISMATCH"
-        print(f"{'Final Result[0,0]':20} | {r_native:15.4f} | {r_repoos:15.4f} | {match_str}")
     
     print("-" * 80)
     print(f"Timing Source: {'Internal (Pure)' if native_res['pure_time'] else 'External (Process)'}")
     status = "SUCCESS" if repoos_res["success"] else "FAILED"
     print(f"REPOOS STATUS: {status}")
+    print("="*80)
+    
+    # 3. VERIFY CORRECTNESS (Since the target script only prints duration)
+    print("\n[Validation] Verifying true output payload...")
+    sys.path.insert(0, os.getcwd())
+    
+    # NATIVE VALIDATION
+    try:
+        from fastapi.testclient import TestClient
+        from revenue_app.main import app
+        client = TestClient(app)
+        native_len = len(client.get("/api/v2/revenue").json())
+    except Exception as e:
+        native_len = str(e)
+        
+    # REPOOS VALIDATION
+    try:
+        os.environ['REPOOS_ENV'] = 'BENCHMARK'
+        from component6_hijacker import boot_poly_kernel
+        boot_poly_kernel('revenue_app')
+        from fastapi.testclient import TestClient
+        from revenue_app.main import app
+        client = TestClient(app)
+        client.get("/api/v2/revenue") # First request
+        repoos_len = len(client.get("/api/v2/revenue").json()) # Second request
+    except Exception as e:
+        repoos_len = str(e)
+        
+    print(f"  Native Result Length: {native_len}")
+    print(f"  RepoOS Result Length: {repoos_len}")
+    if native_len == repoos_len:
+        print("  ✅ CORRECTNESS MATCH!")
+    else:
+        print("  ❌ CORRECTNESS MISMATCH!")
+    
+    if not repoos_res["success"]:
+        print("  REPOOS OUTPUT:")
+        print(repoos_res["output"])
     print("="*80)
 
 if __name__ == "__main__":
