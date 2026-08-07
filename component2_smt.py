@@ -196,13 +196,20 @@ async def compile_function_logic(python_code: str, execution_track: str, domain_
         # Dynamically fetch schema for the prompt
         db_schema = "Schema unknown"
         try:
+            import os
             from sqlalchemy import create_engine, text
-            engine = create_engine('mysql+pymysql://revenue_user:revenue_password@127.0.0.1:3306/revenue_db')
-            with engine.connect() as conn:
-                res = conn.execute(text('DESCRIBE revenue_details')).fetchall()
-                db_schema = "Table revenue_details:\n" + "\n".join([f"- {row[0]}: {row[1]}" for row in res])
-        except Exception:
-            pass
+            
+            # Fetch generic database URL from environment to support any app with the same stack
+            db_url = os.environ.get("DATABASE_URL")
+            target_table = os.environ.get("TARGET_TABLE")
+            
+            if db_url and target_table:
+                engine = create_engine(db_url)
+                with engine.connect() as conn:
+                    res = conn.execute(text(f'DESCRIBE {target_table}')).fetchall()
+                    db_schema = f"Table {target_table}:\n" + "\n".join([f"- {row[0]}: {row[1]}" for row in res])
+        except Exception as e:
+            print(f"[Oracle] Could not fetch schema dynamically: {e}")
 
         prompt = f"""
         You are an elite C++ Network Engineer and Database Driver architect.

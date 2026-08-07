@@ -293,3 +293,19 @@ To run and validate the revenue validation application on CPU, follow these 5 st
    ```bash
    ./build_venv/bin/uvicorn revenue_app.main:app --host 127.0.0.1 --port 8000
    ```
+
+## 🚀 Compiling and Benchmarking with RepoOS
+
+To test the RepoOS dynamic compiler and benchmarking tool on the `revenue_app`, you can use the provided bash scripts.
+
+**1. Compile the application via RepoOS:**
+Provide the database credentials and target table via environment variables so the Oracle can infer the schema dynamically, then run the compiler:
+```bash
+DATABASE_URL="mysql+pymysql://revenue_user:revenue_password@127.0.0.1:3306/revenue_db" TARGET_TABLE="revenue_details" ./repoos.sh revenue_app/main.py revenue_app.main.get_revenue
+```
+
+**2. Run the Benchmark Tool (e.g., 100 iterations):**
+This script will execute the original Python function natively and then run it through the compiled RepoOS zero-overhead L7 interceptor kernel to display performance differences:
+```bash
+./benchmark.sh revenue_app/main.py revenue_app.main.get_revenue 100
+```

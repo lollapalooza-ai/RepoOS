@@ -1268,13 +1268,43 @@ async def aot_compile_all(module_filter: str = ""):
                     cpp_loop = llm_json.get("cpp_loop", "*out_len = 0;")
                     columns = llm_json.get("columns", ["cancelled_revenue", "vip_revenue"])
                     
-                    # 1. Dynamically generate Data Bridge (Prep & Post Scripts)
+                    # 1. Dynamically generate Data Bridge (Prep & Post Scripts) using mmap Arena
                     prep_script = f"""
 import ctypes
-# Allocate buffers ONCE globally
+import mmap
+import sys
+import platform
+
 sql_bytes = {repr(sql_query)}.encode('utf-8')
-global_out_buffers = [(ctypes.c_float * 65536)() for _ in range({len(columns)})]
 global_out_len = ctypes.c_int(0)
+
+# The Virtual Memory Arena (1GB Virtual Memory, Zero Physical RAM until touched)
+# 65536 rows * 4 bytes/float * {len(columns)} columns = ~1MB, but we map 64MB just in case
+ARENA_SIZE = 64 * 1024 * 1024
+arena_fd = -1
+if sys.platform == "darwin":
+    # MAP_ANON | MAP_PRIVATE
+    arena_mmap = mmap.mmap(-1, ARENA_SIZE, mmap.MAP_PRIVATE)
+else:
+    arena_mmap = mmap.mmap(-1, ARENA_SIZE, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+
+# We need the raw pointer address of the mmap buffer
+# ctypes can access it safely via from_buffer
+c_arena = (ctypes.c_char * ARENA_SIZE).from_buffer(arena_mmap)
+arena_ptr = ctypes.addressof(c_arena)
+
+# Pre-compute column pointer offsets
+global_out_buffers = []
+col_stride = 65536 * 4 # 65536 rows * 4 bytes (float)
+for i in range({len(columns)}):
+    col_ptr = ctypes.cast(arena_ptr + (i * col_stride), ctypes.POINTER(ctypes.c_float))
+    global_out_buffers.append(col_ptr)
+
+# Find madvise in libc for Zero-Cost reclamation
+libc = ctypes.CDLL("libc.dylib" if sys.platform == "darwin" else "libc.so.6")
+MADV_DONTNEED = 4 # Linux and Darwin share 4 for DONTNEED (or FREE is 5 on Darwin)
+if sys.platform == "darwin":
+    MADV_DONTNEED = 5 # MADV_FREE is preferred on macOS to avoid forcing immediate unmap, but DONTNEED works. Let's use FREE (5).
 
 def prep_inputs(*args, **kwargs):
     global_out_len.value = 0
@@ -1291,6 +1321,9 @@ def post_process(out_buffers, length):
     # Yield native dictionaries for FastAPI serialization
     for i in range(length):
         yield {{ col: cols_data[col_idx][i] for col_idx, col in enumerate(columns) }}
+        
+    # THE RECLAMATION: Tell the OS to drop the physical memory pages, preserving the virtual mapping
+    libc.madvise(ctypes.c_void_p(arena_ptr), ARENA_SIZE, MADV_DONTNEED)
 """
                     
                     # 2. Builder Lowering (Dynamic C++ signature based on N columns)
@@ -1375,6 +1408,17 @@ extern "C" {{
                 prep_script = bridge.get("prep") if track in ["MATH", "BRANCHING", "TABULAR"] else ""
                 post_script = bridge.get("post") if track in ["MATH", "BRANCHING", "TABULAR"] else ""
                 
+                # Capture for the local JSON manifest
+                if "manifest" not in locals():
+                    manifest = {}
+                manifest[target_fqn] = {
+                    "full_fqn": target_fqn,
+                    "path": os.path.abspath(output_dylib),
+                    "prep": prep_script,
+                    "post": post_script,
+                    "track": track
+                }
+
                 session.run("""
                     MATCH (f:Function {fqn: $fqn}) 
                     SET f.optimized_dylib_path = $dylib_path, 
@@ -1391,6 +1435,13 @@ extern "C" {{
 
     driver.close()
     
+    # Export the localized manifest for zero-database runtime
+    if "manifest" in locals() and manifest:
+        manifest_path = os.path.join(CACHE_DIR, "orchestrator_manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"      ✅ Exported runtime manifest to {manifest_path}")
+
     if not found_any:
         print(f"⚠️ Warning: No functions found matching filter '{module_filter}'")
         sys.exit(1)

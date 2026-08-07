@@ -2,12 +2,7 @@ import ctypes
 import os
 import sys
 import inspect
-import torch
-import numpy as np
-from neo4j import GraphDatabase
-
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", "password")
+import json
 
 def get_true_fqn(func):
     """
@@ -104,7 +99,13 @@ def get_orchestrated_kernel(target_fqn, dylib_path, original_func, prep_code, po
         return original_func
 
     # 0. Compile the Data Bridge ONCE during load time to eliminate runtime overhead
-    local_scope = {"ctypes": ctypes, "torch": torch, "np": np}
+    local_scope = {"ctypes": ctypes}
+    if track == "MATH":
+        import torch
+        import numpy as np
+        local_scope["torch"] = torch
+        local_scope["np"] = np
+        
     try: import networkx as nx; local_scope["nx"] = nx
     except: pass
     
@@ -250,23 +251,24 @@ class LazyCallManager:
     
     def __init__(self):
         self.orchestrated_funcs = {}
-        self._driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
-        
-        # --- NEW: The In-Memory Manifest ---
-        self.known_compiled_targets = {} # FQN -> Track
+        self.manifest_path = os.path.join(os.getenv("REPOOS_CACHE_DIR", "./.poly_cache"), "orchestrator_manifest.json")
+        self.manifest_data = {}
+        self.known_compiled_targets = {}
         self._preload_registry()
 
     def _preload_registry(self):
         """Fetches the list of all compiled functions ONCE at boot to avoid DB spanning."""
-        print("[Orchestrator] 🚀 Booting Zero-Overhead Registry...")
-        with self._driver.session() as session:
-            # Only pull functions that actually have a compiled .dylib
-            query = "MATCH (f:Function) WHERE f.optimized_dylib_path IS NOT NULL AND f.optimized_dylib_path <> '' RETURN f.fqn as fqn, f.execution_track as track"
-            result = session.run(query)
-            for record in result:
-                self.known_compiled_targets[record["fqn"]] = record.get("track", "MATH")
+        print("[Orchestrator] 🚀 Booting Zero-Overhead Registry from JSON Manifest...")
+        if os.path.exists(self.manifest_path):
+            with open(self.manifest_path, "r") as f:
+                self.manifest_data = json.load(f)
                 
-        print(f"[Orchestrator] ✅ Pre-loaded {len(self.known_compiled_targets)} accelerated targets into memory.")
+            for fqn, record in self.manifest_data.items():
+                self.known_compiled_targets[fqn] = record.get("track", "MATH")
+                
+            print(f"[Orchestrator] ✅ Pre-loaded {len(self.known_compiled_targets)} accelerated targets into memory.")
+        else:
+            print("[Orchestrator] ⚠️ Manifest not found. No targets loaded.")
 
     def wrap(self, fqn, func):
         # NORMALIZATION: Ignore the alias FQN passed by the hijacker. 
@@ -290,31 +292,21 @@ class LazyCallManager:
             return self.orchestrated_funcs[true_fqn]
 
         track = self.known_compiled_targets[true_fqn]
-        # ONLY if it's a guaranteed hit do we query Neo4j for the actual file paths
         print(f"--- 🚀 [RepoOS] Accelerated Target Detected: {true_fqn} [{track}] ---")
         
-        with self._driver.session() as session:
-            # We can now do a STRICT, FAST EXACT MATCH. No fuzzy logic required.
-            query = """
-            MATCH (f:Function {fqn: $fqn}) 
-            RETURN f.fqn as full_fqn, f.optimized_dylib_path as path, 
-                   f.prep_script as prep, f.post_script as post
-            """
-            result = session.run(query, fqn=true_fqn)
-            record = result.single()
-            
-            if record and record["path"] and os.path.exists(record["path"]):
-                print(f"      [Orchestrator] Binding C-ABI for {record['full_fqn']}")
-                orchestrated = get_orchestrated_kernel(
-                    record['full_fqn'], 
-                    record["path"], 
-                    func, 
-                    record["prep"], 
-                    record["post"],
-                    track=track
-                )
-                self.orchestrated_funcs[true_fqn] = orchestrated
-                return orchestrated
+        record = self.manifest_data.get(true_fqn)
+        if record and record.get("path") and os.path.exists(record["path"]):
+            print(f"      [Orchestrator] Binding C-ABI for {record['full_fqn']}")
+            orchestrated = get_orchestrated_kernel(
+                record['full_fqn'], 
+                record["path"], 
+                func, 
+                record.get("prep", ""), 
+                record.get("post", ""),
+                track=track
+            )
+            self.orchestrated_funcs[true_fqn] = orchestrated
+            return orchestrated
 
         return None
 
