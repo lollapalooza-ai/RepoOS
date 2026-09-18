@@ -538,10 +538,16 @@ def safe_execute_fsm_schedule(ai_generated_python_code: str, fsm_builder: RepoOS
     compiled_code = compile(tree, filename="<ast>", mode="exec")
     exec(compiled_code, {}, local_scope)
     
-    if "build_parser" not in local_scope:
-        raise ValueError("AI failed to generate 'build_parser' function.")
+    parser_func = None
+    for name, obj in local_scope.items():
+        if name.startswith("build_parser") and callable(obj):
+            parser_func = obj
+            break
+            
+    if not parser_func:
+        raise ValueError("AI failed to generate a 'build_parser' function.")
         
-    local_scope["build_parser"](fsm_builder)
+    parser_func(fsm_builder)
 
 def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoOSSchedule):
     """Safely parses and executes the AI schedule via AST whitelist."""

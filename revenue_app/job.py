@@ -29,6 +29,12 @@ def run_job(run_count=None):
             print(f"Reached run-count of {run_count}. Exiting loop.")
             break
         count += 1
+        
+        import psutil
+        process = psutil.Process(os.getpid())
+        start_time = time.perf_counter()
+        start_cpu_time = time.process_time()
+        
         try:
             print("Fetching orders from /api/v1/orders...")
             response = requests.get("http://127.0.0.1:8080/api/v1/orders")
@@ -69,6 +75,20 @@ def run_job(run_count=None):
                 print(f"Failed to fetch orders, status code: {response.status_code}")
         except Exception as e:
             print(f"Job encountered an error: {e}")
+            
+        end_time = time.perf_counter()
+        end_cpu_time = time.process_time()
+        processing_time_ms = (end_time - start_time) * 1000
+        cpu_time_ms = (end_cpu_time - start_cpu_time) * 1000
+        memory_mb = process.memory_info().rss / (1024 * 1024)
+        
+        print("\n" + "="*40)
+        print("📊 run_job - Metrics")
+        print("="*40)
+        print(f"⏱️  Processing Time : {processing_time_ms:.2f} ms")
+        print(f"💻 CPU Time        : {cpu_time_ms:.2f} ms")
+        print(f"🧠 Memory Usage    : {memory_mb:.2f} MB")
+        print("="*40 + "\n")
             
         time.sleep(30)
 
