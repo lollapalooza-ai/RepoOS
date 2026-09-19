@@ -3,7 +3,7 @@ import torch
 import os
 
 # Load the compiled Mega-UKernel
-dylib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mega_ukernel.so")
+dylib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native", "mega_ukernel.so")
 ukernel_lib = ctypes.CDLL(dylib_path)
 
 # Define the C-function signature

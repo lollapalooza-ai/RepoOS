@@ -4,21 +4,7 @@ RepoOS is an AI-driven, formally verified compiler toolchain that bridges Python
 
 ---
 
-## ⚖️ Core Engineering Principles
-
-To ensure RepoOS functions as a truly generic, enterprise-grade acceleration layer, all contributions MUST adhere to these foundational rules:
-
-1.  **Zero Hardcoding (Generalization Mandate):** Never hardcode function-specific checks, names, or specialized logic into core files. RepoOS must remain agnostic of the target codebase. All algorithm-specific behavior (e.g., scaling, normalization, structural mapping) must be driven by generic metadata (`config` field in `VerifiedMLIR`).
-2.  **Universal Applicability:** Logic must be designed to handle arbitrary codebases and functions. This applies to all core components (1 thru 9), the AI Oracle, and the Orchestrator. The system should function as a **drop-in agent** that autonomously adapts to the provided Python context.
-3.  **Autonomous Contract Synthesis:** Future expansions should prioritize AI-driven inference for memory and execution contracts instead of manual configuration bridges.
-4.  **Mandatory Triple-Verification:** Once a benchmark or test completes successfully, you MUST triple-check that the RepoOS bare-metal kernel was actually executed. 
-    *   **Audit logs:** Ensure "Invoking Bare-Metal Kernel" appears in the output.
-    *   **Fallback Detection:** Verify the system did not silently fallback to native Python.
-
----
-
-## 🛠 Prerequisites
- & Environment
+## 🛠 Prerequisites & Environment
 
 All commands must be run from the project root: `/Users/yeshr/Applications/Program1` using the specialized build environment.
 
@@ -222,13 +208,13 @@ export PYTHONPATH=/home/yeshr/repoos/projectrepo/torch-mlir/build/tools/torch-ml
 ```
 
 ### Benchmarking and Validation
-We provide a specialized tool, `run_mlir.py`, to compare the AI's raw output against fixed/corrected versions.
+We provide a specialized tool, `debug/run_mlir.py`, to compare the AI's raw output against fixed/corrected versions.
 
 **Usage:**
 ```bash
-./build_venv/bin/python3 run_mlir.py <function_name>
+./build_venv/bin/python3 debug/run_mlir.py <function_name>
 ```
-Example: `./build_venv/bin/python3 run_mlir.py fsm_hotspot`
+Example: `./build_venv/bin/python3 debug/run_mlir.py fsm_hotspot`
 
 **Folder: `generated/`**
 This folder contains the code fragments used for comparison:

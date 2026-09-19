@@ -11,9 +11,9 @@ print("DEBUG: imported neo4j")
 import torch
 import torch._dynamo as dynamo
 
-from component11_egraph import optimize_branching_ir
-from component2_smt import verify_branching_logic
-from component2_smt import generate_transform_script
+from repo_os.analysis.component11_egraph import optimize_branching_ir
+from repo_os.analysis.component2_smt import verify_branching_logic
+from repo_os.analysis.component2_smt import generate_transform_script
 
 def lower_sexpr_to_builder(s_expr: str, builder) -> None:
     """
@@ -682,7 +682,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
 
     # --- STAGE 2: The AI Optimization Schedule ---
     if transform_mlir.strip():
-        from component2_smt import fix_transform_syntax_with_ai
+        from repo_os.analysis.component2_smt import fix_transform_syntax_with_ai
         payload_path = "temp_payload.mlir"
         optimized_tensors_path = "optimized_tensors.mlir"
         
@@ -735,7 +735,7 @@ async def apply_ai_transform_and_compile(base_mlir: str, transform_mlir: str, ou
                     if healed_python != python_script:
                         try:
                             # Local import to prevent circular dependency
-                            from component9_aot import safe_execute_schedule, RepoOSSchedule
+                            from repo_os.compiler.component9_aot import safe_execute_schedule, RepoOSSchedule
                             schedule = RepoOSSchedule()
                             safe_execute_schedule(healed_python, schedule)
                             current_transform = schedule.build_mlir()
@@ -1134,9 +1134,9 @@ extern "C" void _mlir_ciface_main(float* out_buffer) {{
 
 async def aot_compile_all(module_filter: str = ""):
     print("DEBUG: Inside aot_compile_all, importing component2_smt")
-    from component2_smt import compile_function_logic, generate_transform_script, generate_sample_inputs, generate_data_bridge
+    from repo_os.analysis.component2_smt import compile_function_logic, generate_transform_script, generate_sample_inputs, generate_data_bridge
     print("DEBUG: Importing component1b_tracer")
-    from component1b_tracer import trace_to_base_mlir
+    from repo_os.ingest.component1b_tracer import trace_to_base_mlir
     print("DEBUG: Importing torch")
     import torch
     import json
@@ -1265,8 +1265,8 @@ async def aot_compile_all(module_filter: str = ""):
                         raise ValueError("No FSM scripts found.")
 
                 elif track == "TABULAR":
-                    from component11_egraph import optimize_tabular_ir
-                    from component2_smt import verify_tabular_logic
+                    from repo_os.analysis.component11_egraph import optimize_tabular_ir
+                    from repo_os.analysis.component2_smt import verify_tabular_logic
                     
                     llm_json = synthesis_result
                     
@@ -1367,8 +1367,8 @@ extern "C" {{
                     bridge = {"prep": prep_script, "post": post_script}
 
                 elif track == "MATH":
-                    from component11_egraph import optimize_math_ir
-                    from component2_smt import verify_math_logic
+                    from repo_os.analysis.component11_egraph import optimize_math_ir
+                    from repo_os.analysis.component2_smt import verify_math_logic
                     
                     llm_s_expr = synthesis_result
                     

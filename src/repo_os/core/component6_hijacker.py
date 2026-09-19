@@ -13,7 +13,7 @@ def load_rewritten_source(file_path, module_name):
     with open(file_path, 'r', encoding='utf-8') as f:
         return f.read()
 
-from component5_orchestrator import LazyCallManager
+from repo_os.core.component5_orchestrator import LazyCallManager
 
 class PolyKernelLoader(Loader):
     def __init__(self, file_path: str, orchestrator: LazyCallManager):
@@ -37,7 +37,7 @@ class PolyKernelLoader(Loader):
             injection = f"""
 import inspect
 import sys
-from component6_hijacker import boot_poly_kernel
+from repo_os.core.component6_hijacker import boot_poly_kernel
 _orch = boot_poly_kernel('{fullname.split(".")[0]}')
 _mod_dict = globals()
 print(f"[Injection Debug] Scanning globals for functions. Looking for {fullname}.get_revenue")

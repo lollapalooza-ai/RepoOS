@@ -16,7 +16,7 @@ if [ "$1" == "inference" ]; then
     PROJECT_ROOT=$(pwd)
     export REPOOS_CACHE_DIR="./.poly_cache"
     export REPOOS_INFERENCE="1"
-    export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PROJECT_ROOT"
+    export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PROJECT_ROOT"
     
     echo "--- 🧠 RepoOS: Inference Track (Programmatic Dynamo Capture) ---"
     echo "Running: $FILENAME"
@@ -25,7 +25,7 @@ if [ "$1" == "inference" ]; then
     ./build_venv/bin/python3 -c "
 import torch
 import torch._dynamo
-from component10_dynamo import repoos_inference_backend
+from repo_os.compiler.component10_dynamo import repoos_inference_backend
 import runpy
 import os
 
@@ -61,9 +61,9 @@ export REPOOS_CACHE_DIR="./.poly_cache"
 export REPOOS_MANUAL_CACHE_DIR="./.poly_cache_manual"
 
 # MLIR Core & Project Root
-export PYTHONPATH="$PROJECT_ROOT/llvm-project/build/tools/mlir/python_packages/mlir_core:$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/llvm-project/build/tools/mlir/python_packages/mlir_core:$PROJECT_ROOT"
 # Torch-MLIR (for Tracing)
-export PYTHONPATH="$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PYTHONPATH"
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:$PYTHONPATH"
 # Dynamic Libraries
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$PROJECT_ROOT/llvm-project/build/lib"
 export DYLD_LIBRARY_PATH="/opt/homebrew/opt/expat/lib:$PROJECT_ROOT/llvm-project/build/lib"
@@ -71,7 +71,7 @@ export DYLD_LIBRARY_PATH="/opt/homebrew/opt/expat/lib:$PROJECT_ROOT/llvm-project
 if [ "$SKIP_COMPILE" != "--skip-compile" ]; then
     echo "--- 🛠 RepoOS: Stage 1 (Semantic Ingestion) ---"
     echo "Targeting: $TARGET"
-    ./build_venv/bin/python3 component1_ingest.py "$TARGET"
+    ./build_venv/bin/python3 -m repo_os.ingest.component1_ingest "$TARGET"
 
     if [ $? -ne 0 ]; then
         echo "❌ Semantic Ingestion failed."
@@ -80,7 +80,7 @@ if [ "$SKIP_COMPILE" != "--skip-compile" ]; then
 
     echo -e "\n--- 🛠 RepoOS: Stage 2 (AOT Trace-Optimize-Compile) ---"
     echo "Target Module/FQN: $TARGET"
-    ./build_venv/bin/python3 component9_aot.py "$TARGET"
+    ./build_venv/bin/python3 -m repo_os.compiler.component9_aot "$TARGET"
 
     if [ $? -ne 0 ]; then
         echo "❌ AOT Compilation failed."
@@ -94,4 +94,4 @@ echo -e "\n--- 🚀 RepoOS: Stage 3 (Drop-in Hijack & Execution) ---"
 echo "Running: $FILENAME"
 # Extract root package (e.g. 'networkx') for the hijacker
 ROOT_PACKAGE=$(echo $TARGET | cut -d'.' -f1)
-./build_venv/bin/python3 -c "import sys; sys.argv = ['$FILENAME'] + sys.argv[1:]; from component6_hijacker import boot_poly_kernel; boot_poly_kernel('$ROOT_PACKAGE'); import runpy; import os; mod = '$FILENAME'.replace('.py', '').replace('/', '.'); runpy.run_module(mod, run_name='__main__')" "${@:3}"
+./build_venv/bin/python3 -c "import sys; sys.argv = ['$FILENAME'] + sys.argv[1:]; from repo_os.core.component6_hijacker import boot_poly_kernel; boot_poly_kernel('$ROOT_PACKAGE'); import runpy; import os; mod = '$FILENAME'.replace('.py', '').replace('/', '.'); runpy.run_module(mod, run_name='__main__')" "${@:3}"

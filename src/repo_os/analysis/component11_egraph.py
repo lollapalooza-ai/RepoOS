@@ -1,4 +1,4 @@
-import repoos_egg_bindings as egg
+import repo_os.utils.repoos_egg_bindings as egg
 
 def optimize_branching_ir(s_expr_ir: str) -> str:
     """

@@ -10,8 +10,8 @@ PROJECT_ROOT = "/Users/yeshr/Applications/Program1"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import component0_mlir_bootstrap
-from component5_orchestrator import LazyCallManager
+import repo_os.core.component0_mlir_bootstrap as component0_mlir_bootstrap
+from repo_os.core.component5_orchestrator import LazyCallManager
 from legacy_shop.ecommerce import calculate_vip_revenue, generate_payload
 from legacy_shop.utils import calculate_tax, dynamic_pricing
 from legacy_shop.heavy_math import compute_gravity
