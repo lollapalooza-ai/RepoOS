@@ -135,7 +135,7 @@ def run_macro_benchmark():
         shutil.copy(best_dylib, official_path)
         
         from neo4j import GraphDatabase
-        driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+        driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "<YOUR_NEO4J_PASSWORD>"))
         with driver.session() as session:
             session.run("""
                 MATCH (f:Function {fqn: 'legacy_shop.ecommerce.calculate_vip_revenue'})

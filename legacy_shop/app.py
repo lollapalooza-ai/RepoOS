@@ -13,8 +13,8 @@ import auth
 app = Flask(__name__)
 
 # SECURITY WARNING: DO NOT COMMIT THIS KEY (oops)
-app.secret_key = "super_secret_key_12345"
-STRIPE_API_KEY = "sk_test_4eC39HqLyjWDarjtT1zdp7dc"
+app.secret_key = "<YOUR_FLASK_SECRET_KEY>"
+STRIPE_API_KEY = "<YOUR_STRIPE_API_KEY>"
 
 def get_db():
     conn = sqlite3.connect('legacy_shop.db')

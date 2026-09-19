@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from neo4j import GraphDatabase
 
 app = FastAPI()
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "password"))
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "<YOUR_NEO4J_PASSWORD>"))
 
 @app.get("/api/semantic_projection/{func_name}")
 def get_business_logic(func_name: str):

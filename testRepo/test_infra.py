@@ -4,7 +4,7 @@ import psycopg2
 
 def create_user_record(user_data):
     # Simulating a database insert
-    conn = psycopg2.connect(database="mydb", user="user", password="password", host="127.0.0.1", port="5432")
+    conn = psycopg2.connect(database="mydb", user="user", password="<YOUR_DB_PASSWORD>", host="127.0.0.1", port="5432")
     cur = conn.cursor()
     cur.execute(f"INSERT INTO users (name, email) VALUES ('{user_data['name']}', '{user_data['email']}')")
     conn.commit()
