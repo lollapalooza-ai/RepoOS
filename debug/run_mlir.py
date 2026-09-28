@@ -155,7 +155,7 @@ class RepoOSRunner:
     def run_mlir(self, code):
         tmp = "temp.mlir"
         with open(tmp, "w") as f: f.write(code)
-        mlir_opt = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin/mlir-opt"
+        mlir_opt = os.environ.get("MLIR_OPT", "./torch-mlir/build/bin/mlir-opt")
         
         start = time.perf_counter_ns()
         res = subprocess.run([mlir_opt, tmp], capture_output=True, text=True)

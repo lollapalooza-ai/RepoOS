@@ -6,7 +6,7 @@ from rich.console import Console
 from rich.table import Table
 
 # Setup Environment and Bootstrap
-PROJECT_ROOT = "/Users/yeshr/Applications/Program1"
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", ".")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 

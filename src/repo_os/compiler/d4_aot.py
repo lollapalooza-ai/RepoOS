@@ -401,10 +401,10 @@ def safe_execute_schedule(ai_generated_python_code: str, schedule_builder: RepoO
     local_scope["apply_schedule"](schedule_builder)
 
 # Compiler Paths
-MLIR_DIR = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin"
+MLIR_DIR = os.environ.get("MLIR_DIR", "./torch-mlir/build/bin")
 MLIR_OPT = os.path.join(MLIR_DIR, "mlir-opt")
 MLIR_TRANSLATE = os.path.join(MLIR_DIR, "mlir-translate")
-TORCH_MLIR_OPT = "/home/yeshr/repoos/projectrepo/torch-mlir/build/bin/torch-mlir-opt"
+TORCH_MLIR_OPT = os.environ.get("TORCH_MLIR_OPT", os.path.join(MLIR_DIR, "torch-mlir-opt"))
 CLANG = "clang"
 
 os.makedirs(CACHE_DIR, exist_ok=True)

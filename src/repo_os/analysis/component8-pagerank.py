@@ -13,7 +13,7 @@ from rich.table import Table
 # --- 1. BOOTSTRAP ENVIRONMENT ---
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "password")
-PROJECT_ROOT = "/Users/yeshr/Applications/Program1"
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", ".")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
