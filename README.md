@@ -173,6 +173,19 @@ Here is the step-by-step breakdown of how RepoOS optimizes that specific FastAPI
 
   This is why the benchmark tool reports a 2x execution speedup and drops the Avg CPU from 87.0% down to 0.0% (because the heavy lifting is offloaded entirely to the C++ kernel and OS-level memory mapping).
 
+  ### How AI Oracle Works?
+
+  Once the endpoint's code is analyzed and routed to the TABULAR execution track, the AI Oracle generates three highly specialized components to optimize the execution:
+
+  1. Raw SQL Generation: Instead of relying on SQLAlchemy at runtime to build queries, the AI Oracle pre-computes the raw SQL string (e.g., SELECT cancelled_revenue, vip_revenue FROM revenue_details WHERE
+  cancelled_revenue > 20).
+  2. Zero-Copy Memory Arena: The AI writes a prep_inputs bridge script that allocates a massive 64MB Virtual Memory Arena using Python's mmap. This provides zero-cost physical RAM overhead (as pages are mapped
+  virtually) and assigns direct C-pointers to this arena for efficient columnar data storage.
+  3. The C++ Parser Loop: The AI Oracle writes a custom C++ main_kernel designed to parse raw network socket bytes (the raw response from the database) directly into the columnar mmap arrays. This generated
+  code is then compiled into a shared native library (.dylib/.so).
+
+  By performing these steps, the AI enables RepoOS to completely skip SQLAlchemy ORM object instantiation, SQL string compilation, Python packet deserialization, and Python Garbage Collection at runtime.
+
 We provide a specialized tool, `debug/run_mlir.py`, to manually verify and compare the AI's raw MLIR output against fixed versions.
 
 ## FAQ
